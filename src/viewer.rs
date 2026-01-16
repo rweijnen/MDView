@@ -135,11 +135,15 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
 
                         // Get webview
                         if let Ok(webview) = controller.CoreWebView2() {
-                            // Configure settings
+                            // Configure settings for a secure, read-only viewer
                             if let Ok(settings) = webview.Settings() {
-                                let _ = settings.SetIsScriptEnabled(true);
-                                let _ = settings.SetAreDefaultContextMenusEnabled(true);
-                                let _ = settings.SetIsStatusBarEnabled(false);
+                                let _ = settings.SetIsScriptEnabled(true); // needed for Ctrl+click and ESC handling
+                                let _ = settings.SetAreDefaultContextMenusEnabled(false); // disable right-click menu
+                                let _ = settings.SetAreDevToolsEnabled(false); // disable F12 dev tools
+                                let _ = settings.SetIsStatusBarEnabled(false); // disable status bar
+                                let _ = settings.SetIsBuiltInErrorPageEnabled(false); // disable error pages
+                                let _ = settings.SetAreDefaultScriptDialogsEnabled(false); // disable alert/confirm/prompt
+                                // Zoom control left enabled for accessibility (Ctrl+scroll)
                             }
 
                             // Navigate to HTML directly
