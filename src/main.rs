@@ -1,4 +1,5 @@
 mod markdown;
+mod terminal;
 
 use std::cell::RefCell;
 use std::env;
@@ -14,24 +15,32 @@ fn print_usage() {
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --gui        Open in GUI window (default if file specified interactively)");
+    eprintln!("  --term       Output with terminal colors/formatting (default for piped output)");
     eprintln!("  --html       Output full HTML document to stdout");
     eprintln!("  --body       Output HTML body only (no wrapper)");
-    eprintln!("  --text       Output plain text");
-    eprintln!("  --dark       Use dark mode colors");
+    eprintln!("  --text       Output plain text (no formatting)");
+    eprintln!("  --dark       Use dark mode colors (GUI and HTML only)");
     eprintln!("  -h, --help   Show this help message");
     eprintln!();
     eprintln!("If no FILE is specified, reads from stdin (CLI mode only).");
     eprintln!();
+    eprintln!("Terminal output features (Windows Terminal, modern terminals):");
+    eprintln!("  - Clickable hyperlinks (OSC 8)");
+    eprintln!("  - True color syntax highlighting");
+    eprintln!("  - Unicode box drawing for tables");
+    eprintln!("  - Bold, italic, strikethrough formatting");
+    eprintln!();
     eprintln!("Examples:");
     eprintln!("  mdview README.md              # Open in GUI window");
+    eprintln!("  mdview --term README.md       # Output with terminal colors");
+    eprintln!("  cat doc.md | mdview           # Piped input, terminal output");
     eprintln!("  mdview --html README.md       # Output HTML to stdout");
-    eprintln!("  mdview --text README.md       # Output plain text");
-    eprintln!("  cat doc.md | mdview --html    # Read from stdin, output HTML");
 }
 
 #[derive(Default)]
 struct Options {
     gui_mode: bool,
+    terminal_mode: bool,
     html_full: bool,
     html_body: bool,
     plain_text: bool,
@@ -50,6 +59,7 @@ fn parse_args() -> Result<Options, String> {
                 std::process::exit(0);
             }
             "--gui" => opts.gui_mode = true,
+            "--term" | "--terminal" => opts.terminal_mode = true,
             "--html" => opts.html_full = true,
             "--body" => opts.html_body = true,
             "--text" => opts.plain_text = true,
@@ -67,17 +77,17 @@ fn parse_args() -> Result<Options, String> {
     }
 
     // Validate mutually exclusive options
-    let cli_format_count = opts.html_full as u8 + opts.html_body as u8 + opts.plain_text as u8;
+    let cli_format_count = opts.html_full as u8 + opts.html_body as u8 + opts.plain_text as u8 + opts.terminal_mode as u8;
     if cli_format_count > 1 {
-        return Err("Options --html, --body, and --text are mutually exclusive".to_string());
+        return Err("Options --term, --html, --body, and --text are mutually exclusive".to_string());
     }
 
-    // Default behavior: GUI if file specified and running interactively, otherwise CLI
+    // Default behavior: GUI if file specified and running interactively, otherwise terminal output
     if !opts.gui_mode && cli_format_count == 0 {
         if opts.file_path.is_some() && atty::is(atty::Stream::Stdout) {
             opts.gui_mode = true;
         } else {
-            opts.html_full = true;
+            opts.terminal_mode = true; // Default to terminal output for piped mode
         }
     }
 
@@ -151,7 +161,10 @@ fn main() {
         }
     } else {
         // CLI mode - output to stdout
-        let output = if opts.plain_text {
+        let output = if opts.terminal_mode {
+            let caps = terminal::TerminalCaps::detect();
+            terminal::render_to_terminal(&markdown_content, &caps)
+        } else if opts.plain_text {
             markdown::markdown_to_plain_text(&markdown_content)
         } else if opts.html_body {
             markdown::markdown_to_html(&markdown_content)
