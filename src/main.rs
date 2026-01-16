@@ -9,7 +9,9 @@ use std::path::Path;
 use std::rc::Rc;
 
 fn print_usage() {
-    eprintln!("MDView - Markdown Viewer");
+    eprintln!("MDView - Markdown Viewer v{}", env!("CARGO_PKG_VERSION"));
+    eprintln!("Copyright 2026 Remko Weijnen - Mozilla Public License 2.0");
+    eprintln!("https://github.com/rweijnen/MDView");
     eprintln!();
     eprintln!("Usage: mdview [OPTIONS] [FILE]");
     eprintln!();
