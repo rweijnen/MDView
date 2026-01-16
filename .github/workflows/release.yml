@@ -51,14 +51,15 @@ jobs:
             $patch = [int]$matches[3]
             $currentVersion = "$major.$minor.$patch"
 
-            # Rollover versioning: increment minor, reset patch
-            # When minor reaches X9, roll to (X+1)0
-            if ($minor % 10 -eq 9) {
+            # Rollover versioning: increment patch, rollover minor at 10
+            # Example: 0.1.9 -> 0.1.10 -> 0.2.0
+            $newPatch = $patch + 1
+            $newMinor = $minor
+            if ($newPatch -gt 10) {
               $newMinor = $minor + 1
-            } else {
-              $newMinor = $minor + 1
+              $newPatch = 0
             }
-            $newVersion = "$major.$newMinor.0"
+            $newVersion = "$major.$newMinor.$newPatch"
 
             echo "current=$currentVersion" >> $env:GITHUB_OUTPUT
             echo "new=$newVersion" >> $env:GITHUB_OUTPUT
