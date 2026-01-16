@@ -113,6 +113,24 @@ fn is_terminal_environment() -> bool {
     }
 }
 
+/// Enable ANSI/Virtual Terminal Processing on Windows console
+/// This allows legacy cmd.exe to process ANSI escape codes
+fn enable_virtual_terminal_processing() {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, SetConsoleMode, GetStdHandle,
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        if let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
+            let mut mode = CONSOLE_MODE::default();
+            if GetConsoleMode(handle, &mut mode).is_ok() {
+                let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+        }
+    }
+}
+
 fn read_input(file_path: Option<&str>) -> io::Result<String> {
     match file_path {
         Some(path) => {
@@ -181,6 +199,8 @@ fn main() {
     } else {
         // CLI mode - output to stdout
         let output = if opts.terminal_mode {
+            // Enable ANSI processing on Windows console
+            enable_virtual_terminal_processing();
             let caps = terminal::TerminalCaps::detect();
             terminal::render_to_terminal(&markdown_content, &caps)
         } else if opts.plain_text {

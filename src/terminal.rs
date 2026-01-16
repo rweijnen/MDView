@@ -16,6 +16,9 @@ impl TerminalCaps {
     /// Detect terminal capabilities from environment
     pub fn detect() -> Self {
         let is_windows_terminal = env::var("WT_SESSION").is_ok();
+        let is_vscode = env::var("VSCODE_INJECTION").is_ok()
+            || env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode");
+        let is_conemu = env::var("ConEmuPID").is_ok();
         let colorterm = env::var("COLORTERM").unwrap_or_default();
         let term = env::var("TERM").unwrap_or_default();
 
@@ -29,23 +32,45 @@ impl TerminalCaps {
             };
         }
 
+        // VS Code terminal
+        if is_vscode {
+            return Self {
+                true_color: true,
+                hyperlinks: true,
+                unicode: true,
+                basic_ansi: true,
+            };
+        }
+
+        // ConEmu/Cmder
+        if is_conemu {
+            return Self {
+                true_color: true,
+                hyperlinks: true,
+                unicode: true,
+                basic_ansi: true,
+            };
+        }
+
         // Check for true color support
         let true_color = colorterm == "truecolor" || colorterm == "24bit"
-            || term.contains("256color") || term.contains("truecolor");
+            || term.contains("256color") || term.contains("truecolor")
+            || cfg!(windows); // Windows Terminal and modern Windows consoles support true color
 
         // Most modern terminals support hyperlinks (OSC 8)
-        // Conservative: only enable for known-good terminals
-        let hyperlinks = is_windows_terminal
-            || term.contains("xterm")
+        // On Windows 10+, assume hyperlinks work (worst case: terminal ignores OSC 8)
+        let hyperlinks = term.contains("xterm")
             || term.contains("vte")
             || term.contains("kitty")
-            || term.contains("iterm");
+            || term.contains("iterm")
+            || cfg!(windows);
 
         // Unicode support - assume yes for most modern terminals
-        let unicode = !term.is_empty() || is_windows_terminal;
+        let unicode = !term.is_empty() || cfg!(windows);
 
-        // Basic ANSI - almost universal
-        let basic_ansi = !term.is_empty() || is_windows_terminal || cfg!(windows);
+        // Basic ANSI - almost universal on modern systems
+        // On Windows, assume ANSI support (Windows 10+ has it by default)
+        let basic_ansi = !term.is_empty() || cfg!(windows);
 
         Self {
             true_color,
@@ -222,16 +247,7 @@ impl TerminalRenderer {
                     };
                     self.output.push_str(color);
                 }
-                // Add heading prefix
-                let prefix = match level {
-                    HeadingLevel::H1 => "# ",
-                    HeadingLevel::H2 => "## ",
-                    HeadingLevel::H3 => "### ",
-                    HeadingLevel::H4 => "#### ",
-                    HeadingLevel::H5 => "##### ",
-                    HeadingLevel::H6 => "###### ",
-                };
-                self.output.push_str(prefix);
+                // No prefix - just colored/bold text
             }
             Tag::Paragraph => {
                 if !self.output.is_empty() && !self.output.ends_with('\n') {
