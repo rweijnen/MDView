@@ -1,5 +1,7 @@
 # MDView
 
+[![Build](https://github.com/rweijnen/MDView/actions/workflows/release.yml/badge.svg)](https://github.com/rweijnen/MDView/actions/workflows/release.yml)
+
 A fast, lightweight Markdown viewer for Windows. Available as a Total Commander Lister plugin and standalone executable with rich terminal output.
 
 ## Total Commander Plugin
