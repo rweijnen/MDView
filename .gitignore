@@ -1,0 +1,29 @@
+# Rust build artifacts
+/target
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# WebView2 cache
+*.WebView2/
+
+# Build artifacts in root (distributed via releases)
+/*.exe
+/*.dll
+/*.wlx
+/*.wlx64
+
+# Test outputs
+test.html
+test.md

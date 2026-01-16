@@ -1,0 +1,130 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          targets: x86_64-pc-windows-msvc, i686-pc-windows-msvc
+
+      - name: Build x64
+        run: cargo build --release
+
+      - name: Build x86
+        run: cargo build --release --target i686-pc-windows-msvc
+
+      - name: Run tests
+        run: cargo test --release
+
+      - name: Get current version
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content Cargo.toml -Raw
+          if ($content -match 'version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+            $major = [int]$matches[1]
+            $minor = [int]$matches[2]
+            $patch = [int]$matches[3]
+            $currentVersion = "$major.$minor.$patch"
+
+            # Rollover versioning: increment minor, reset patch
+            # When minor reaches X9, roll to (X+1)0
+            if ($minor % 10 -eq 9) {
+              $newMinor = $minor + 1
+            } else {
+              $newMinor = $minor + 1
+            }
+            $newVersion = "$major.$newMinor.0"
+
+            echo "current=$currentVersion" >> $env:GITHUB_OUTPUT
+            echo "new=$newVersion" >> $env:GITHUB_OUTPUT
+            echo "Current version: $currentVersion"
+            echo "New version: $newVersion"
+          }
+
+      - name: Create release directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release
+
+          # Copy x64 standalone exe
+          Copy-Item "target\release\mdview.exe" "release\mdview.exe"
+
+          # Copy x64 plugin (rename dll to wlx64)
+          Copy-Item "target\release\mdview_wlx.dll" "release\mdview.wlx64"
+
+          # Copy x86 plugin (rename dll to wlx)
+          Copy-Item "target\i686-pc-windows-msvc\release\mdview_wlx.dll" "release\mdview.wlx"
+
+          # Copy documentation
+          Copy-Item "pluginst.inf" "release\"
+          Copy-Item "README.md" "release\"
+          Copy-Item "LICENSE" "release\"
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "release\*" -DestinationPath "MDView-v${{ steps.version.outputs.current }}.zip"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.current }}
+          name: MDView v${{ steps.version.outputs.current }}
+          body: |
+            ## MDView v${{ steps.version.outputs.current }}
+
+            Markdown viewer for Windows - Total Commander Lister plugin and standalone executable.
+
+            ### Installation
+
+            **Total Commander Plugin:**
+            1. Download the ZIP file
+            2. Open it in Total Commander
+            3. Follow the plugin installation prompts
+
+            **Standalone:**
+            Extract `mdview.exe` and run it from command line or associate with `.md` files.
+
+            ### Contents
+            - `mdview.exe` - Standalone viewer (x64)
+            - `mdview.wlx` - Total Commander plugin (x86)
+            - `mdview.wlx64` - Total Commander plugin (x64)
+            - `pluginst.inf` - Plugin installer configuration
+          files: |
+            MDView-v${{ steps.version.outputs.current }}.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump version in Cargo.toml
+        shell: pwsh
+        run: |
+          $content = Get-Content Cargo.toml -Raw
+          $newContent = $content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', "version = `"${{ steps.version.outputs.new }}`""
+          Set-Content -Path Cargo.toml -Value $newContent -NoNewline
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml
+          git commit -m "Bump version to ${{ steps.version.outputs.new }}"
+          git push
