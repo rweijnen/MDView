@@ -21,7 +21,6 @@ fn print_usage() {
     eprintln!("  --html       Output full HTML document to stdout");
     eprintln!("  --body       Output HTML body only (no wrapper)");
     eprintln!("  --text       Output plain text (no formatting)");
-    eprintln!("  --dark       Use dark mode colors (GUI and HTML only)");
     eprintln!("  -h, --help   Show this help message");
     eprintln!();
     eprintln!("If no FILE is specified, reads from stdin (CLI mode only).");
@@ -46,7 +45,6 @@ struct Options {
     html_full: bool,
     html_body: bool,
     plain_text: bool,
-    dark_mode: bool,
     file_path: Option<String>,
 }
 
@@ -65,7 +63,6 @@ fn parse_args() -> Result<Options, String> {
             "--html" => opts.html_full = true,
             "--body" => opts.html_body = true,
             "--text" => opts.plain_text = true,
-            "--dark" => opts.dark_mode = true,
             s if s.starts_with('-') => {
                 return Err(format!("Unknown option: {}", s));
             }
@@ -111,6 +108,43 @@ fn is_terminal_environment() -> bool {
         let hwnd = GetConsoleWindow();
         !hwnd.is_invalid()
     }
+}
+
+/// Detect if Windows is using dark mode (apps theme)
+fn is_windows_dark_mode() -> bool {
+    use windows::Win32::System::Registry::{
+        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+            .encode_utf16().collect();
+
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), Some(0), KEY_READ, &mut hkey).is_ok() {
+            let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+            let mut data: u32 = 1;
+            let mut data_size: u32 = std::mem::size_of::<u32>() as u32;
+            let mut data_type: REG_VALUE_TYPE = REG_VALUE_TYPE::default();
+
+            let result = RegQueryValueExW(
+                hkey,
+                PCWSTR(value_name.as_ptr()),
+                None,
+                Some(&mut data_type),
+                Some(&mut data as *mut u32 as *mut u8),
+                Some(&mut data_size),
+            );
+
+            let _ = RegCloseKey(hkey);
+
+            if result.is_ok() {
+                return data == 0; // 0 = dark mode, 1 = light mode
+            }
+        }
+    }
+    false // Default to light mode
 }
 
 /// Enable ANSI/Virtual Terminal Processing on Windows console
@@ -185,7 +219,8 @@ fn main() {
     if opts.gui_mode {
         // GUI mode - open window with WebView2
         let html_body = markdown::markdown_to_html(&markdown_content);
-        let full_html = markdown::wrap_html(&html_body, opts.dark_mode);
+        let dark_mode = is_windows_dark_mode();
+        let full_html = markdown::wrap_html(&html_body, dark_mode);
         let title = opts
             .file_path
             .as_ref()
@@ -209,7 +244,8 @@ fn main() {
             markdown::markdown_to_html(&markdown_content)
         } else {
             let html_body = markdown::markdown_to_html(&markdown_content);
-            markdown::wrap_html(&html_body, opts.dark_mode)
+            let dark_mode = is_windows_dark_mode();
+            markdown::wrap_html(&html_body, dark_mode)
         };
 
         if let Err(e) = io::stdout().write_all(output.as_bytes()) {
@@ -231,6 +267,10 @@ use webview2_com::{
 use widestring::U16CString;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -292,6 +332,35 @@ fn run_gui_inner(title: &str, html: &str) -> windows::core::Result<()> {
             Some(hinstance.into()),
             None,
         )?;
+
+        // Set dark mode title bar if Windows is in dark mode
+        if is_windows_dark_mode() {
+            let use_dark_mode: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &use_dark_mode as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+        }
+
+        // Enable rounded corners on Windows 11
+        let corner_preference = DWMWCP_ROUND.0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_preference as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+
+        // Enable Mica backdrop for modern look (Windows 11)
+        let backdrop_type = DWMSBT_MAINWINDOW.0;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &backdrop_type as *const i32 as *const std::ffi::c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
 
         // Initialize WebView2
         init_webview2_gui(hwnd, html)?;

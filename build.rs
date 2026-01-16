@@ -22,6 +22,11 @@ fn main() {
             res.set_icon("assets/mdview.ico");
         }
 
+        // Add manifest for modern visual styles and DPI awareness
+        if std::path::Path::new("assets/mdview.manifest").exists() {
+            res.set_manifest_file("assets/mdview.manifest");
+        }
+
         if let Err(e) = res.compile() {
             eprintln!("cargo:warning=Failed to compile Windows resource: {}", e);
         }

@@ -9,6 +9,7 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 ## Features
 
 - **WebView2 rendering** - Modern HTML rendering with full Markdown support (GUI mode)
+- **Auto dark mode** - Follows Windows appearance settings (GUI mode)
 - **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
 - **Ctrl+click links** - Open external links in your default browser
 - **ESC to close** - Quick keyboard navigation
@@ -64,7 +65,6 @@ Options:
   --html       Output full HTML document to stdout
   --body       Output HTML body only (no wrapper)
   --text       Output plain text (no formatting)
-  --dark       Use dark mode colors (GUI and HTML only)
   -h, --help   Show help message
 ```
 
