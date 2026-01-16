@@ -1,12 +1,15 @@
 # MDView
 
-A fast, lightweight Markdown viewer for Windows. Available as a Total Commander Lister plugin and standalone executable.
+A fast, lightweight Markdown viewer for Windows. Available as a Total Commander Lister plugin and standalone executable with rich terminal output.
 
-![MDView Screenshot](assets/screenshot.png)
+## Total Commander Plugin
+
+![MDView in Total Commander](assets/screenshot.png)
 
 ## Features
 
-- **WebView2 rendering** - Modern HTML rendering with full Markdown support
+- **WebView2 rendering** - Modern HTML rendering with full Markdown support (GUI mode)
+- **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
 - **Ctrl+click links** - Open external links in your default browser
 - **ESC to close** - Quick keyboard navigation
 - **Syntax highlighting** - Code blocks with proper formatting
@@ -28,9 +31,26 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 2. Place it anywhere in your PATH or desired location
 3. Associate `.md` files with `mdview.exe` or run from command line
 
-## Usage
+## Standalone Executable
 
-### Command Line
+The standalone `mdview.exe` automatically detects its environment:
+
+- **From terminal** (cmd.exe, PowerShell, Windows Terminal): Renders markdown with ANSI formatting
+- **Double-clicked** or no console: Opens GUI window with WebView2
+
+### Windows Terminal
+
+Full support for modern terminal features including clickable hyperlinks (OSC 8), true color, and unicode box drawing for tables.
+
+![MDView in Windows Terminal](assets/screenshot-wt.png)
+
+### Legacy cmd.exe
+
+ANSI escape processing is automatically enabled for color support in legacy consoles.
+
+![MDView in cmd.exe](assets/screenshot-cmd.png)
+
+### Command Line Options
 
 ```
 mdview [OPTIONS] [FILE]
@@ -39,24 +59,42 @@ Arguments:
   [FILE]  Markdown file to view (reads from stdin if not provided)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+  --gui        Force GUI window mode
+  --term       Force terminal output mode
+  --html       Output full HTML document to stdout
+  --body       Output HTML body only (no wrapper)
+  --text       Output plain text (no formatting)
+  --dark       Use dark mode colors (GUI and HTML only)
+  -h, --help   Show help message
 ```
 
 ### Examples
 
 ```bash
-# View a markdown file
+# Auto-detect: terminal output when run from console
 mdview README.md
 
 # Pipe content from another command
 cat notes.md | mdview
 
-# View with explicit file
-mdview --file documentation.md
+# Force GUI window
+mdview --gui README.md
+
+# Output HTML for further processing
+mdview --html README.md > output.html
 ```
 
-### Keyboard Shortcuts
+### Terminal Features
+
+| Feature | Windows Terminal | Legacy cmd.exe |
+|---------|-----------------|----------------|
+| ANSI colors | Yes | Yes |
+| Bold/Italic | Yes | Yes |
+| Clickable hyperlinks | Yes | No (text only) |
+| Unicode tables | Yes | Yes |
+| True color (24-bit) | Yes | Limited |
+
+### Keyboard Shortcuts (GUI mode)
 
 | Key | Action |
 |-----|--------|
