@@ -84,16 +84,33 @@ fn parse_args() -> Result<Options, String> {
         return Err("Options --term, --html, --body, and --text are mutually exclusive".to_string());
     }
 
-    // Default behavior: GUI if file specified and running interactively, otherwise terminal output
+    // Default behavior based on environment detection
     if !opts.gui_mode && cli_format_count == 0 {
-        if opts.file_path.is_some() && atty::is(atty::Stream::Stdout) {
-            opts.gui_mode = true;
+        if opts.file_path.is_some() {
+            // File specified: use terminal if in a terminal environment, GUI otherwise
+            if is_terminal_environment() {
+                opts.terminal_mode = true;
+            } else {
+                opts.gui_mode = true;
+            }
         } else {
-            opts.terminal_mode = true; // Default to terminal output for piped mode
+            // No file: terminal output (for piped input)
+            opts.terminal_mode = true;
         }
     }
 
     Ok(opts)
+}
+
+/// Detect if we're running in a console/terminal (vs double-clicked GUI launch)
+fn is_terminal_environment() -> bool {
+    use windows::Win32::System::Console::GetConsoleWindow;
+
+    // GetConsoleWindow returns the console window handle, or null if no console
+    unsafe {
+        let hwnd = GetConsoleWindow();
+        !hwnd.is_invalid()
+    }
 }
 
 fn read_input(file_path: Option<&str>) -> io::Result<String> {
