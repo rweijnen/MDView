@@ -57,13 +57,12 @@ impl TerminalCaps {
             || term.contains("256color") || term.contains("truecolor")
             || cfg!(windows); // Windows Terminal and modern Windows consoles support true color
 
-        // Most modern terminals support hyperlinks (OSC 8)
-        // On Windows 10+, assume hyperlinks work (worst case: terminal ignores OSC 8)
+        // Hyperlinks (OSC 8) - only enable for known-good terminals
+        // On legacy cmd.exe, show URL in parentheses so user can see/copy it
         let hyperlinks = term.contains("xterm")
             || term.contains("vte")
             || term.contains("kitty")
-            || term.contains("iterm")
-            || cfg!(windows);
+            || term.contains("iterm");
 
         // Unicode support - assume yes for most modern terminals
         let unicode = !term.is_empty() || cfg!(windows);
