@@ -2,6 +2,8 @@
 
 A fast, lightweight Markdown viewer for Windows. Available as a Total Commander Lister plugin and standalone executable.
 
+![MDView Screenshot](assets/screenshot.png)
+
 ## Features
 
 - **WebView2 rendering** - Modern HTML rendering with full Markdown support

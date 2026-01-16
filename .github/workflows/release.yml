@@ -3,6 +3,12 @@ name: Build and Release
 on:
   push:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/**'
 
 env:
   CARGO_TERM_COLOR: always
