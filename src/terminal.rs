@@ -714,7 +714,8 @@ mod tests {
     fn test_basic_rendering() {
         let caps = TerminalCaps::basic();
         let output = render_to_terminal("# Hello\n\nWorld", &caps);
-        assert!(output.contains("# Hello"));
+        // Headings render without # prefix, just bold text
+        assert!(output.contains("Hello"));
         assert!(output.contains("World"));
     }
 
