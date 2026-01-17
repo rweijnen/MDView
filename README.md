@@ -133,6 +133,27 @@ After building, copy the following files for distribution:
 | `target/release/mdview_wlx.dll` | Rename to `mdview.wlx64` for TC plugin (x64) |
 | `target/i686-pc-windows-msvc/release/mdview_wlx.dll` | Rename to `mdview.wlx` for TC plugin (x86) |
 
+## Troubleshooting
+
+### Debug Logging
+
+If the plugin hangs or doesn't work correctly, enable debug logging:
+
+1. Set environment variable: `set MDVIEW_DEBUG=1`
+2. Start Total Commander from that command prompt
+3. Try to view a markdown file
+4. Check log file: `%TEMP%\mdview_debug.log`
+
+The log shows WebView2 initialization steps and helps identify where issues occur.
+
+### Common Issues
+
+| Issue | Solution |
+|-------|----------|
+| Plugin hangs | WebView2 has a 30-second timeout; check debug log |
+| Blank display | Ensure WebView2 Runtime is installed |
+| F3 opens WebView search | Update to latest version (F3 now passed to TC) |
+
 ## Requirements
 
 - Windows 10 version 1803 or later

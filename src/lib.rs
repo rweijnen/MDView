@@ -83,26 +83,64 @@ fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
 
 // Additional optional exports for enhanced functionality
 
+// Search parameter flags
+const LP_FORWARDONLY: c_int = 2;
+const LP_WHOLEWORDS: c_int = 4;
+const LP_MATCHCASE: c_int = 8;
+
 /// Search for text in the document
 #[unsafe(no_mangle)]
 pub extern "system" fn ListSearchText(
-    _list_win: HWND,
-    _search_string: *const c_char,
-    _search_parameter: c_int,
+    list_win: HWND,
+    search_string: *const c_char,
+    search_parameter: c_int,
 ) -> c_int {
-    // TODO: Implement search via WebView2 JavaScript
-    0 // LISTPLUGIN_OK
+    let search_str = unsafe {
+        match CStr::from_ptr(search_string).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return 1, // LISTPLUGIN_ERROR
+        }
+    };
+    do_search(list_win, &search_str, search_parameter)
 }
 
 /// Search for text (Unicode version)
 #[unsafe(no_mangle)]
 pub extern "system" fn ListSearchTextW(
-    _list_win: HWND,
-    _search_string: *const u16,
-    _search_parameter: c_int,
+    list_win: HWND,
+    search_string: *const u16,
+    search_parameter: c_int,
 ) -> c_int {
-    // TODO: Implement search via WebView2 JavaScript
-    0
+    let search_str = unsafe {
+        match U16CStr::from_ptr_str(search_string).to_string() {
+            Ok(s) => s,
+            Err(_) => return 1, // LISTPLUGIN_ERROR
+        }
+    };
+    do_search(list_win, &search_str, search_parameter)
+}
+
+fn do_search(list_win: HWND, search_string: &str, search_parameter: c_int) -> c_int {
+    let case_sensitive = (search_parameter & LP_MATCHCASE) != 0;
+    let whole_word = (search_parameter & LP_WHOLEWORDS) != 0;
+    let forward_only = (search_parameter & LP_FORWARDONLY) != 0;
+
+    // Escape quotes in search string for JavaScript
+    let escaped = search_string.replace('\\', "\\\\").replace('"', "\\\"");
+
+    // Use window.find() for search
+    // window.find(string, caseSensitive, backwards, wrapAround, wholeWord, searchInFrames, showDialog)
+    let script = format!(
+        "window.find(\"{}\", {}, {}, {}, {}, false, false)",
+        escaped,
+        case_sensitive,
+        false, // backwards (we search forward)
+        !forward_only, // wrapAround
+        whole_word
+    );
+
+    viewer::execute_script(list_win, &script);
+    0 // LISTPLUGIN_OK
 }
 
 /// Handle commands (copy, select all, etc.)

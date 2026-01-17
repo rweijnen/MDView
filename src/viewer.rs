@@ -1,7 +1,27 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+/// Simple debug logging to file (only in debug builds or when MDVIEW_DEBUG env is set)
+#[allow(dead_code)]
+fn log_debug(msg: &str) {
+    if cfg!(debug_assertions) || env::var("MDVIEW_DEBUG").is_ok() {
+        if let Ok(temp) = env::var("TEMP") {
+            let log_path = format!("{}\\mdview_debug.log", temp);
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = writeln!(file, "[{}] {}", timestamp, msg);
+            }
+        }
+    }
+}
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
     pwstr_from_str, CreateCoreWebView2ControllerCompletedHandler,
@@ -86,6 +106,8 @@ fn register_window_class() -> windows::core::Result<()> {
 }
 
 fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
+    log_debug(&format!("init_webview2_sync started, hwnd={:?}", hwnd.0));
+
     let html_owned = html.to_string();
     let controller_result: Rc<RefCell<Option<ICoreWebView2Controller>>> = Rc::new(RefCell::new(None));
     let error_result: Rc<RefCell<Option<windows::core::Error>>> = Rc::new(RefCell::new(None));
@@ -96,16 +118,20 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     let completed_clone = completed.clone();
 
     // Create the environment first
+    log_debug("Creating environment handler");
     let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
-        move |_error_code, environment| {
+        move |error_code, environment| {
+            log_debug(&format!("Environment callback fired, error_code={:?}", error_code));
             let environment = match environment {
                 Some(env) => env,
                 None => {
+                    log_debug("Environment is None, failing");
                     *error_clone.borrow_mut() = Some(windows::core::Error::from(E_FAIL));
                     *completed_clone.borrow_mut() = true;
                     return Ok(());
                 }
             };
+            log_debug("Environment created successfully");
 
             let controller_inner = controller_clone.clone();
             let error_inner = error_clone.clone();
@@ -113,16 +139,20 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
             let html_for_nav = html_owned.clone();
 
             // Create the controller
+            log_debug("Creating controller handler");
             let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
-                move |_error_code, controller| {
+                move |error_code, controller| {
+                    log_debug(&format!("Controller callback fired, error_code={:?}", error_code));
                     let controller = match controller {
                         Some(ctrl) => ctrl,
                         None => {
+                            log_debug("Controller is None, failing");
                             *error_inner.borrow_mut() = Some(windows::core::Error::from(E_FAIL));
                             *completed_inner.borrow_mut() = true;
                             return Ok(());
                         }
                     };
+                    log_debug("Controller created successfully");
 
                     unsafe {
                         // Make controller visible
@@ -185,17 +215,64 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let mut token: i64 = 0;
                             let _ = webview.add_WebMessageReceived(&handler, &mut token);
                         }
+
+                        // Add accelerator key handler to pass F3, F5, F7 etc. to parent (TC)
+                        let accel_parent = hwnd;
+                        let accel_handler = webview2_com::AcceleratorKeyPressedEventHandler::create(
+                            Box::new(move |_controller, args| {
+                                if let Some(args) = args {
+                                    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+                                    let mut key: u32 = 0;
+                                    let mut key_event_kind: COREWEBVIEW2_KEY_EVENT_KIND = COREWEBVIEW2_KEY_EVENT_KIND::default();
+
+                                    if args.VirtualKey(&mut key).is_ok() && args.KeyEventKind(&mut key_event_kind).is_ok() {
+                                        // Only handle key down events
+                                        if key_event_kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                                            || key_event_kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                                        {
+                                            // Pass F3, F5, F7, N keys to parent (Total Commander)
+                                            let pass_to_parent = matches!(
+                                                VIRTUAL_KEY(key as u16),
+                                                VK_F3 | VK_F5 | VK_F7 | VK_N
+                                            );
+
+                                            if pass_to_parent {
+                                                // Mark as handled so WebView2 doesn't process it
+                                                let _ = args.SetHandled(true);
+                                                // Forward to parent window
+                                                if let Ok(parent) = GetParent(accel_parent) {
+                                                    if !parent.is_invalid() {
+                                                        let _ = PostMessageW(
+                                                            Some(parent),
+                                                            WM_KEYDOWN,
+                                                            WPARAM(key as usize),
+                                                            LPARAM(0),
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(())
+                            }),
+                        );
+                        let mut accel_token: i64 = 0;
+                        let _ = controller.add_AcceleratorKeyPressed(&accel_handler, &mut accel_token);
                     }
 
+                    log_debug("Storing controller and marking complete");
                     *controller_inner.borrow_mut() = Some(controller);
                     *completed_inner.borrow_mut() = true;
                     Ok(())
                 },
             ));
 
+            log_debug("Calling CreateCoreWebView2Controller");
             unsafe {
                 let _ = environment.CreateCoreWebView2Controller(hwnd, &ctrl_handler);
             }
+            log_debug("CreateCoreWebView2Controller returned");
             Ok(())
         },
     ));
@@ -204,23 +281,50 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     let user_data_folder = env::var("TEMP")
         .map(|p| format!("{}\\MDView_WebView2", p))
         .unwrap_or_else(|_| ".".to_string());
+    log_debug(&format!("User data folder: {}", user_data_folder));
     let user_data_wide = pwstr_from_str(&user_data_folder);
+    log_debug("Calling CreateCoreWebView2EnvironmentWithOptions");
     unsafe {
         let _ = CreateCoreWebView2EnvironmentWithOptions(None, PCWSTR(user_data_wide.as_ptr()), None, &env_handler);
     }
+    log_debug("CreateCoreWebView2EnvironmentWithOptions returned, entering message loop");
 
-    // Pump messages until completion
+    // Pump messages until completion (with timeout)
+    let timeout = Duration::from_secs(30);
+    let start = Instant::now();
+    let mut loop_count = 0u32;
     unsafe {
         while !*completed.borrow() {
+            loop_count += 1;
+
+            // Check timeout
+            if start.elapsed() > timeout {
+                log_debug("TIMEOUT waiting for WebView2 initialization");
+                *error_result.borrow_mut() = Some(windows::core::Error::from(E_FAIL));
+                break;
+            }
+
+            // Log every 100 iterations
+            if loop_count % 100 == 0 {
+                log_debug(&format!("Message loop iteration {}, elapsed={:?}", loop_count, start.elapsed()));
+            }
+
             let mut msg = MSG::default();
-            if GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Use PeekMessage with timeout to avoid blocking forever
+            if PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    log_debug("Received WM_QUIT");
+                    break;
+                }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             } else {
-                break;
+                // No message, sleep briefly to avoid spinning CPU
+                std::thread::sleep(Duration::from_millis(10));
             }
         }
     }
+    log_debug(&format!("Message loop exited, completed={}, loop_count={}", *completed.borrow(), loop_count));
 
     // Check for errors
     if let Some(err) = error_result.borrow_mut().take() {
