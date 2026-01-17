@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Document with folded corner -->
+  <path d="M 40 16 L 168 16 L 216 64 L 216 240 L 40 240 Z" fill="#4a90d9" stroke="#2d5a87" stroke-width="4"/>
+
+  <!-- Folded corner -->
+  <path d="M 168 16 L 168 64 L 216 64 Z" fill="#2d5a87"/>
+  <path d="M 168 16 L 168 64 L 216 64" fill="none" stroke="#2d5a87" stroke-width="4" stroke-linejoin="round"/>
+
+  <!-- Letter M -->
+  <text x="128" y="140" font-family="Arial, sans-serif" font-size="80" font-weight="bold" fill="white" text-anchor="middle">M</text>
+
+  <!-- Down arrow -->
+  <path d="M 128 160 L 128 210 M 100 185 L 128 215 L 156 185" fill="none" stroke="white" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

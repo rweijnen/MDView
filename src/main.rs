@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod dark_menu;
 mod markdown;
 mod terminal;
 
@@ -982,6 +983,11 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             // Enable dark mode for menus via undocumented uxtheme API
             set_preferred_app_mode_dark();
 
+            // Enable dark mode menu bar drawing
+            DARK_MENU_BAR.with(|dmb| {
+                dmb.borrow_mut().enable(hwnd);
+            });
+
             // Enable non-client rendering
             let ncrp = DWMNCRP_ENABLED;
             let _ = DwmSetWindowAttribute(
@@ -1072,6 +1078,7 @@ thread_local! {
     static MENU_HANDLE: RefCell<Option<HMENU>> = const { RefCell::new(None) };
     static ACCEL_HANDLE: RefCell<Option<HACCEL>> = const { RefCell::new(None) };
     static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
+    static DARK_MENU_BAR: RefCell<dark_menu::DarkMenuBar> = RefCell::new(dark_menu::DarkMenuBar::new());
 }
 
 fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
@@ -1219,6 +1226,14 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // Handle dark mode menu bar messages
+    let dark_handled = DARK_MENU_BAR.with(|dmb| {
+        dmb.borrow().handle_message(hwnd, msg, wparam, lparam)
+    });
+    if let Some(result) = dark_handled {
+        return result;
+    }
+
     match msg {
         WM_SIZE => {
             CONTROLLER.with(|c| {
