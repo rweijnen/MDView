@@ -80,6 +80,7 @@ impl TerminalCaps {
     }
 
     /// Force basic mode (no colors, no unicode)
+    #[cfg(test)]
     pub fn basic() -> Self {
         Self {
             true_color: false,
@@ -91,6 +92,7 @@ impl TerminalCaps {
 }
 
 /// ANSI escape codes
+#[allow(dead_code)]
 mod ansi {
     pub const RESET: &str = "\x1b[0m";
     pub const BOLD: &str = "\x1b[1m";

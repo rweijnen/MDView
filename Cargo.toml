@@ -21,6 +21,8 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Dwm",
     "Win32_System_Console",
@@ -30,6 +32,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_Com",
     "Win32_System_WinRT",
+    "Win32_Security",
 ] }
 webview2-com = "0.38"
 once_cell = "1.20"
