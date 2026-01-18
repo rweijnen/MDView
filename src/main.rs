@@ -341,15 +341,16 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
     DwmDefWindowProc, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_ENABLED,
     DWMWA_NCRENDERING_POLICY, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DWMWCP_ROUND, DWMWA_BORDER_COLOR,
 };
-use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::Controls::{MARGINS, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU, ODS_SELECTED, ODS_GRAYED};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ,
@@ -415,6 +416,19 @@ const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
+
+// Owner-drawn menu item data
+#[derive(Clone)]
+struct MenuItemData {
+    id: u32,
+    text: String,
+    is_separator: bool,
+}
+
+// Storage for menu item data (needs to live as long as menu exists)
+thread_local! {
+    static MENU_ITEM_DATA: RefCell<Vec<Box<MenuItemData>>> = const { RefCell::new(Vec::new()) };
+}
 
 // Registry key for settings
 const REGISTRY_KEY: &str = "Software\\MDView";
@@ -484,35 +498,99 @@ fn refresh_immersive_color_policy() {
     }
 }
 
+/// Helper to create owner-drawn menu item data and return the pointer
+fn create_menu_item_data(id: u32, text: &str, is_separator: bool) -> usize {
+    let item_data = Box::new(MenuItemData {
+        id,
+        text: text.to_string(),
+        is_separator,
+    });
+    let item_ptr = Box::into_raw(item_data) as usize;
+
+    // Store pointer so we can free it later
+    MENU_ITEM_DATA.with(|data| {
+        data.borrow_mut().push(unsafe { Box::from_raw(item_ptr as *mut MenuItemData) });
+    });
+
+    // Get the pointer again (it's still valid, just also stored)
+    MENU_ITEM_DATA.with(|data| {
+        let items = data.borrow();
+        items.last().map(|b| b.as_ref() as *const MenuItemData as usize).unwrap_or(0)
+    })
+}
+
+/// Helper to add an owner-drawn menu item (append)
+fn add_owner_drawn_item(menu: HMENU, id: u32, text: &str, is_separator: bool) -> windows::core::Result<()> {
+    unsafe {
+        let ptr = create_menu_item_data(id, text, is_separator);
+
+        if is_separator {
+            AppendMenuW(menu, MF_OWNERDRAW | MF_SEPARATOR, 0, PCWSTR(ptr as *const u16))?;
+        } else {
+            AppendMenuW(menu, MF_OWNERDRAW, id as usize, PCWSTR(ptr as *const u16))?;
+        }
+        Ok(())
+    }
+}
+
+/// Helper to insert an owner-drawn menu item at a position
+fn insert_owner_drawn_item(menu: HMENU, position: u32, id: u32, text: &str, is_grayed: bool) -> windows::core::Result<()> {
+    unsafe {
+        let ptr = create_menu_item_data(id, text, false);
+        let flags = if is_grayed {
+            MF_BYPOSITION | MF_OWNERDRAW | MF_GRAYED
+        } else {
+            MF_BYPOSITION | MF_OWNERDRAW
+        };
+        InsertMenuW(menu, position, flags, id as usize, PCWSTR(ptr as *const u16))?;
+        Ok(())
+    }
+}
+
+/// Configure popup menu with dark theme background
+fn configure_dark_popup_menu(menu: HMENU) {
+    unsafe {
+        // Create dark background brush for popup menu
+        let dark_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
+
+        let mut mi = MENUINFO {
+            cbSize: std::mem::size_of::<MENUINFO>() as u32,
+            fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
+            dwStyle: MENUINFO_STYLE::default(),
+            cyMax: 0,
+            hbrBack: dark_brush,
+            dwContextHelpID: 0,
+            dwMenuData: 0,
+        };
+        let _ = SetMenuInfo(menu, &mi);
+    }
+}
+
 /// Create the application menu bar
 fn create_menu() -> windows::core::Result<HMENU> {
     unsafe {
+        // Clear any existing menu item data
+        MENU_ITEM_DATA.with(|data| data.borrow_mut().clear());
+
         let menu_bar = CreateMenu()?;
         let file_menu = CreatePopupMenu()?;
         let help_menu = CreatePopupMenu()?;
 
-        // File menu items
-        let open_text: Vec<u16> = "&Open\tCtrl+O\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_OPEN as usize, PCWSTR(open_text.as_ptr()))?;
+        // Configure popup menus with dark background
+        configure_dark_popup_menu(file_menu);
+        configure_dark_popup_menu(help_menu);
 
-        // Separator before recent files
-        AppendMenuW(file_menu, MF_SEPARATOR, 0, None)?;
+        // File menu items (owner-drawn)
+        add_owner_drawn_item(file_menu, IDM_FILE_OPEN, "&Open\tCtrl+O", false)?;
+        add_owner_drawn_item(file_menu, 0, "", true)?; // Separator
+        add_owner_drawn_item(file_menu, 0, "Recent Files", false)?; // Placeholder
+        add_owner_drawn_item(file_menu, 0, "", true)?; // Separator
+        add_owner_drawn_item(file_menu, IDM_FILE_EXIT, "E&xit", false)?;
 
-        // Recent files placeholder - will be populated later
-        let recent_text: Vec<u16> = "Recent Files\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING | MF_GRAYED, 0, PCWSTR(recent_text.as_ptr()))?;
+        // Help menu items (owner-drawn)
+        add_owner_drawn_item(help_menu, IDM_HELP_ABOUT, "&About MDView", false)?;
 
-        // Separator before exit
-        AppendMenuW(file_menu, MF_SEPARATOR, 0, None)?;
-
-        let exit_text: Vec<u16> = "E&xit\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_EXIT as usize, PCWSTR(exit_text.as_ptr()))?;
-
-        // Help menu items
-        let about_text: Vec<u16> = "&About MDView\0".encode_utf16().collect();
-        AppendMenuW(help_menu, MF_STRING, IDM_HELP_ABOUT as usize, PCWSTR(about_text.as_ptr()))?;
-
-        // Add submenus to menu bar
+        // Add submenus to menu bar (these stay as MF_POPUP)
         let file_text: Vec<u16> = "&File\0".encode_utf16().collect();
         AppendMenuW(menu_bar, MF_POPUP, file_menu.0 as usize, PCWSTR(file_text.as_ptr()))?;
 
@@ -733,30 +811,22 @@ fn update_recent_files_menu() {
                 RECENT_FILES.with(|files| {
                     let files = files.borrow();
                     if files.is_empty() {
-                        // Show disabled placeholder
-                        let text: Vec<u16> = "(No Recent Files)\0".encode_utf16().collect();
-                        let _ = InsertMenuW(
-                            file_menu,
-                            2,
-                            MF_BYPOSITION | MF_STRING | MF_GRAYED,
-                            0,
-                            PCWSTR(text.as_ptr()),
-                        );
+                        // Show disabled placeholder (owner-drawn)
+                        let _ = insert_owner_drawn_item(file_menu, 2, 0, "(No Recent Files)", true);
                     } else {
-                        // Add recent files
+                        // Add recent files (owner-drawn)
                         for (i, path) in files.iter().enumerate() {
                             let filename = Path::new(path)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| path.clone());
-                            let text: Vec<u16> =
-                                format!("&{} {}\0", i + 1, filename).encode_utf16().collect();
-                            let _ = InsertMenuW(
+                            let text = format!("&{} {}", i + 1, filename);
+                            let _ = insert_owner_drawn_item(
                                 file_menu,
                                 2 + i as u32,
-                                MF_BYPOSITION | MF_STRING,
-                                (IDM_FILE_RECENT_BASE + i as u32) as usize,
-                                PCWSTR(text.as_ptr()),
+                                IDM_FILE_RECENT_BASE + i as u32,
+                                &text,
+                                false,
                             );
                         }
                     }
@@ -1054,7 +1124,8 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             None,
         )?;
 
-        // Store menu handle for popup menus
+        // Store menu handle for manual popup display
+        // (We don't use SetMenu because our custom NCCALCSIZE conflicts with Windows' menu bar)
         MENU_HANDLE.with(|m| {
             *m.borrow_mut() = Some(menu);
         });
@@ -1655,7 +1726,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            // Handle menu clicks
+            // Handle menu clicks manually (since we can't use SetMenu with our custom NCCALCSIZE)
             unsafe {
                 let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
@@ -1665,29 +1736,27 @@ unsafe extern "system" fn window_proc(
                 let title_bar_height = get_title_bar_height(dpi);
                 let nc_height = get_nc_height(dpi);
                 let menu_item_width = scale_for_dpi(56, dpi);
-                let menu_padding = scale_for_dpi(8, dpi);
 
                 // Check if click is in menu bar area
                 if y >= title_bar_height && y < nc_height {
                     MENU_HANDLE.with(|menu| {
                         if let Some(hmenu) = menu.borrow().as_ref() {
-                            // Determine which menu was clicked and show popup
-                            // Position popup at left edge of window (like Notepad)
-                            let (popup, menu_x) = if x >= menu_padding && x < menu_padding + menu_item_width {
-                                // File menu - popup at left edge
+                            // Determine which menu was clicked
+                            let (popup, menu_x) = if x >= 0 && x < menu_item_width {
+                                // File menu
                                 (GetSubMenu(*hmenu, 0), 0)
-                            } else if x >= menu_padding + menu_item_width && x < menu_padding + menu_item_width * 2 {
-                                // Help menu - popup at left edge of Help item area
-                                (GetSubMenu(*hmenu, 1), menu_padding + menu_item_width)
+                            } else if x >= menu_item_width && x < menu_item_width * 2 {
+                                // Help menu
+                                (GetSubMenu(*hmenu, 1), menu_item_width)
                             } else {
                                 (HMENU::default(), 0)
                             };
 
                             if !popup.is_invalid() {
-                                // Position popup at bottom of menu bar, left-aligned with menu item
                                 let mut pt = POINT { x: menu_x, y: nc_height };
                                 let _ = ClientToScreen(hwnd, &mut pt);
-                                TrackPopupMenu(
+
+                                let _ = TrackPopupMenu(
                                     popup,
                                     TPM_LEFTALIGN | TPM_TOPALIGN,
                                     pt.x,
@@ -1703,6 +1772,131 @@ unsafe extern "system" fn window_proc(
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MEASUREITEM => {
+            // Owner-drawn menu: provide item dimensions (DPI-aware)
+            unsafe {
+                let mis = lparam.0 as *mut MEASUREITEMSTRUCT;
+                if (*mis).CtlType == ODT_MENU {
+                    let item_data = (*mis).itemData as *const MenuItemData;
+                    if !item_data.is_null() {
+                        let data = &*item_data;
+                        let dpi = get_dpi_for_window(hwnd);
+                        let scale = dpi as f32 / 96.0;
+
+                        if data.is_separator {
+                            // Separator: thin line (DPI-scaled)
+                            (*mis).itemHeight = (9.0 * scale) as u32;
+                            (*mis).itemWidth = 0;
+                        } else {
+                            // Regular item: match Notepad's ~36px at 96 DPI
+                            (*mis).itemHeight = (36.0 * scale) as u32;
+                            (*mis).itemWidth = (250.0 * scale) as u32;
+                        }
+                    }
+                }
+            }
+            LRESULT(1) // TRUE = we handled it
+        }
+        WM_DRAWITEM => {
+            // Owner-drawn menu: draw the item
+            unsafe {
+                let dis = lparam.0 as *const DRAWITEMSTRUCT;
+                if (*dis).CtlType == ODT_MENU {
+                    let item_data = (*dis).itemData as *const MenuItemData;
+                    if !item_data.is_null() {
+                        let data = &*item_data;
+                        let hdc = (*dis).hDC;
+                        let rc = (*dis).rcItem;
+                        let is_selected = ((*dis).itemState.0 & ODS_SELECTED.0) != 0;
+                        let is_disabled = ((*dis).itemState.0 & ODS_GRAYED.0) != 0;
+
+                        // Background color - dark gray, lighter when selected
+                        let bg_color = if is_selected {
+                            COLORREF(0x00404040) // Lighter for hover
+                        } else {
+                            COLORREF(0x002D2D2D) // Dark background like Notepad
+                        };
+                        let brush = CreateSolidBrush(bg_color);
+                        FillRect(hdc, &rc, brush);
+                        let _ = DeleteObject(brush.into());
+
+                        if data.is_separator {
+                            // Draw separator line (DPI-aware)
+                            let dpi = get_dpi_for_window(hwnd);
+                            let scale = dpi as f32 / 96.0;
+                            let margin = (12.0 * scale) as i32;
+                            let sep_brush = CreateSolidBrush(COLORREF(0x00505050));
+                            let sep_rc = RECT {
+                                left: rc.left + margin,
+                                top: (rc.top + rc.bottom) / 2,
+                                right: rc.right - margin,
+                                bottom: (rc.top + rc.bottom) / 2 + 1,
+                            };
+                            FillRect(hdc, &sep_rc, sep_brush);
+                            let _ = DeleteObject(sep_brush.into());
+                        } else {
+                            // Draw text (DPI-aware)
+                            let dpi = get_dpi_for_window(hwnd);
+                            let scale = dpi as f32 / 96.0;
+
+                            let text_color = if is_disabled {
+                                COLORREF(0x00808080) // Gray for disabled
+                            } else {
+                                COLORREF(0x00FFFFFF) // White
+                            };
+
+                            let old_bk = SetBkMode(hdc, TRANSPARENT);
+                            let old_color = SetTextColor(hdc, text_color);
+
+                            // Create font (DPI-scaled, ~12pt at 96 DPI)
+                            let font_height = (-14.0 * scale) as i32;
+                            let font = CreateFontW(
+                                font_height, 0, 0, 0,
+                                FW_NORMAL.0 as i32,
+                                0, 0, 0,
+                                DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS,
+                                CLEARTYPE_QUALITY,
+                                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
+                                windows::core::w!("Segoe UI")
+                            );
+                            let old_font = SelectObject(hdc, font.into());
+
+                            // Split text and shortcut (separated by \t)
+                            let parts: Vec<&str> = data.text.split('\t').collect();
+                            let label = parts.first().unwrap_or(&"");
+                            let shortcut = parts.get(1);
+
+                            // Draw label (left aligned with DPI-scaled padding)
+                            let padding = (16.0 * scale) as i32;
+                            let mut text_rc = RECT {
+                                left: rc.left + padding,
+                                top: rc.top,
+                                right: rc.right - padding,
+                                bottom: rc.bottom,
+                            };
+                            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
+                            DrawTextW(hdc, &mut label_wide, &mut text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                            // Draw shortcut (right aligned, slightly dimmer)
+                            if let Some(sc) = shortcut {
+                                let shortcut_color = COLORREF(0x00A0A0A0); // Dimmer white
+                                SetTextColor(hdc, shortcut_color);
+                                let mut sc_wide: Vec<u16> = sc.encode_utf16().collect();
+                                DrawTextW(hdc, &mut sc_wide, &mut text_rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                            }
+
+                            SelectObject(hdc, old_font);
+                            let _ = DeleteObject(font.into());
+                            SetTextColor(hdc, old_color);
+                            SetBkMode(hdc, BACKGROUND_MODE(old_bk as u32));
+                        }
+                    }
+                }
+            }
+            LRESULT(1) // TRUE = we handled it
         }
         WM_COMMAND => {
             let cmd_id = (wparam.0 & 0xFFFF) as u32;
