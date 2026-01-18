@@ -334,6 +334,7 @@ use webview2_com::{
     pwstr_from_str, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler,
 };
+use windows::core::Interface;
 use widestring::U16CString;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
@@ -917,6 +918,9 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         let class_name_wide: Vec<u16> = WINDOW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
         let hinstance = GetModuleHandleW(None)?;
 
+        // Load application icon from resources
+        let icon = LoadIconW(Some(hinstance.into()), PCWSTR(1 as *const u16)).ok();
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
@@ -925,6 +929,8 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             hCursor: LoadCursorW(None, IDC_ARROW)?,
             hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as _),
             lpszClassName: PCWSTR(class_name_wide.as_ptr()),
+            hIcon: icon.unwrap_or_default(),
+            hIconSm: icon.unwrap_or_default(),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -1123,6 +1129,11 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let mut rect = RECT::default();
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
+
+                        // Disable external drop so our WM_DROPFILES handler works
+                        if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
+                            let _ = controller4.SetAllowExternalDrop(false);
+                        }
 
                         if let Ok(webview) = controller.CoreWebView2() {
                             if let Ok(settings) = webview.Settings() {
