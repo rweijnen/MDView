@@ -134,8 +134,8 @@ impl DarkMenuBar {
             let mut rc = RECT::default();
             GetClipBox(uah_menu.hdc, &mut rc);
 
-            // Use Windows 10/11 dark mode color: #202020
-            let brush = CreateSolidBrush(COLORREF(0x00202020));
+            // Use dark mode color matching menu bar
+            let brush = CreateSolidBrush(COLORREF(crate::DARK_MENUBAR_ACTIVE));
             FillRect(uah_menu.hdc, &rc, brush);
             let _ = DeleteObject(brush.into());
         }
@@ -159,7 +159,7 @@ impl DarkMenuBar {
             let bg_color = if is_hot || is_selected {
                 COLORREF(0x00404040) // Lighter gray for hover
             } else {
-                COLORREF(0x00202020) // Dark gray background
+                COLORREF(crate::DARK_MENUBAR_ACTIVE) // Use same color as menu bar
             };
             let brush = CreateSolidBrush(bg_color);
             FillRect(hdc, &rc, brush);
