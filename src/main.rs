@@ -365,8 +365,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const WINDOW_CLASS: &str = "MDViewWindow";
 
 // Custom window chrome base values (at 96 DPI)
-const TITLE_BAR_HEIGHT_BASE: i32 = 32;  // Base height of custom title bar
-const MENU_BAR_HEIGHT_BASE: i32 = 28;   // Base height of custom menu bar
+const TITLE_BAR_HEIGHT_BASE: i32 = 40;  // Base height of custom title bar (matches Notepad)
+const MENU_BAR_HEIGHT_BASE: i32 = 33;   // Base height of custom menu bar (matches Notepad)
 const BUTTON_WIDTH_BASE: i32 = 46;      // Base width of window buttons
 
 // Helper functions to get DPI-scaled dimensions
@@ -1016,7 +1016,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             lpfnWndProc: Some(window_proc),
             hInstance: hinstance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as _),
+            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as _), // Standard window background
             lpszClassName: PCWSTR(class_name_wide.as_ptr()),
             hIcon: icon.unwrap_or_default(),
             hIconSm: icon.unwrap_or_default(),
@@ -1102,6 +1102,16 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
                 &use_dark_mode as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+
+            // Enable Mica backdrop for Windows 11 (attribute 38)
+            // DWMSBT_MAINWINDOW = 2 (Mica), DWMSBT_TABBEDWINDOW = 4 (Mica Alt)
+            const DWMSBT_MAINWINDOW: i32 = 2; // Mica
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(38), // DWMWA_SYSTEMBACKDROP_TYPE
+                &DWMSBT_MAINWINDOW as *const i32 as *const std::ffi::c_void,
                 std::mem::size_of::<i32>() as u32,
             );
 
@@ -1383,6 +1393,30 @@ unsafe extern "system" fn window_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_ERASEBKGND => {
+            // Fill title bar area with dark color to prevent white flash
+            // Mica will paint over this for active windows
+            unsafe {
+                let hdc = HDC(wparam.0 as *mut _);
+                let dpi = get_dpi_for_window(hwnd);
+                let title_bar_height = get_title_bar_height(dpi);
+
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+
+                // Fill title bar area with dark color
+                let rc_titlebar = RECT {
+                    left: 0,
+                    top: 0,
+                    right: rc.right,
+                    bottom: title_bar_height,
+                };
+                let brush = CreateSolidBrush(COLORREF(DARK_TITLEBAR_ACTIVE)); // Use black
+                FillRect(hdc, &rc_titlebar, brush);
+                let _ = DeleteObject(brush.into());
+            }
+            LRESULT(1) // Return non-zero to indicate we handled it
+        }
         WM_NCCALCSIZE => {
             // Custom NC area: extend client area to include title bar and menu bar
             if wparam.0 != 0 {
@@ -1473,13 +1507,12 @@ unsafe extern "system" fn window_proc(
                 if ps.rcPaint.top < nc_height {
                     // Get active state for color selection
                     let is_active = WINDOW_ACTIVE.with(|a| *a.borrow());
-                    let titlebar_color = if is_active { DARK_TITLEBAR_ACTIVE } else { DARK_TITLEBAR_INACTIVE };
                     let menubar_color = if is_active { DARK_MENUBAR_ACTIVE } else { DARK_MENUBAR_INACTIVE };
 
-                    let titlebar_brush = CreateSolidBrush(COLORREF(titlebar_color));
                     let menubar_brush = CreateSolidBrush(COLORREF(menubar_color));
 
-                    // Draw title bar background
+                    // Always paint title bar black - Mica blends with it for active windows
+                    let titlebar_brush = CreateSolidBrush(COLORREF(DARK_TITLEBAR_ACTIVE));
                     let rc_titlebar = RECT {
                         left: 0,
                         top: 0,
@@ -1487,6 +1520,7 @@ unsafe extern "system" fn window_proc(
                         bottom: title_bar_height,
                     };
                     FillRect(hdc, &rc_titlebar, titlebar_brush);
+                    let _ = DeleteObject(titlebar_brush.into());
 
                     // Draw application icon in title bar (DPI-scaled)
                     let icon_size = scale_for_dpi(16, dpi);
@@ -1613,7 +1647,6 @@ unsafe extern "system" fn window_proc(
                     // Clean up GDI objects
                     let _ = DeleteObject(title_font.into());
                     let _ = DeleteObject(menu_font.into());
-                    let _ = DeleteObject(titlebar_brush.into());
                     let _ = DeleteObject(menubar_brush.into());
                 }
 
