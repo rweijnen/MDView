@@ -182,7 +182,7 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
                     ).is_ok() {
                         // Scale up font height to match popup menu (lfHeight is negative)
                         let mut lf = ncm.lfMenuFont;
-                        lf.lfHeight = (lf.lfHeight as f32 * 1.15) as i32;
+                        lf.lfHeight = (lf.lfHeight as f32 * 1.12) as i32;
                         CreateFontIndirectW(&lf)
                     } else {
                         // Fallback to hardcoded font if system call fails
