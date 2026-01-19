@@ -339,18 +339,15 @@ use widestring::U16CString;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmDefWindowProc, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMNCRP_ENABLED,
-    DWMWA_NCRENDERING_POLICY, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND, DWMWA_BORDER_COLOR,
+    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND,
 };
-use windows::Win32::UI::Controls::{MARGINS, DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODT_MENU, ODS_SELECTED, ODS_GRAYED};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ,
@@ -365,51 +362,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 const WINDOW_CLASS: &str = "MDViewWindow";
 
-// Custom window chrome base values (at 96 DPI)
-const TITLE_BAR_HEIGHT_BASE: i32 = 40;  // Base height of custom title bar (matches Notepad)
-const MENU_BAR_HEIGHT_BASE: i32 = 33;   // Base height of custom menu bar (matches Notepad)
-const BUTTON_WIDTH_BASE: i32 = 46;      // Base width of window buttons
-
-// Helper functions to get DPI-scaled dimensions
-fn get_dpi_for_window(hwnd: HWND) -> i32 {
-    unsafe {
-        let hdc = GetDC(Some(hwnd));
-        let dpi = GetDeviceCaps(Some(hdc), LOGPIXELSY);
-        ReleaseDC(Some(hwnd), hdc);
-        if dpi > 0 { dpi } else { 96 }
-    }
-}
-
-fn scale_for_dpi(value: i32, dpi: i32) -> i32 {
-    value * dpi / 96
-}
-
-fn get_title_bar_height(dpi: i32) -> i32 {
-    scale_for_dpi(TITLE_BAR_HEIGHT_BASE, dpi)
-}
-
-fn get_menu_bar_height(dpi: i32) -> i32 {
-    scale_for_dpi(MENU_BAR_HEIGHT_BASE, dpi)
-}
-
-fn get_nc_height(dpi: i32) -> i32 {
-    get_title_bar_height(dpi) + get_menu_bar_height(dpi)
-}
-
-fn get_button_width(dpi: i32) -> i32 {
-    scale_for_dpi(BUTTON_WIDTH_BASE, dpi)
-}
-
-// Dark mode colors (BGR format) - matching Notepad's style
-// Active state (window has focus) - darker
-const DARK_TITLEBAR_ACTIVE: u32 = 0x00000000;   // #000000 - title bar when active (full black)
-pub const DARK_MENUBAR_ACTIVE: u32 = 0x00181818;    // #181818 - menu bar when active (between black and content)
-// Inactive state (window doesn't have focus) - use previous active colors
-const DARK_TITLEBAR_INACTIVE: u32 = 0x001E1E1E; // #1E1E1E - title bar when inactive
-const DARK_MENUBAR_INACTIVE: u32 = 0x002D2D2D;  // #2D2D2D - menu bar when inactive
-// Common colors
-const DARK_HOVER_COLOR: u32 = 0x00404040;       // #404040 - hover highlight
-const DARK_TEXT_COLOR: u32 = 0x00FFFFFF;        // White text
+// Dark theme color for client area background
+const DARK_CLIENT: u32 = 0x00202020;
 
 // Menu item IDs
 const IDM_FILE_OPEN: u32 = 1001;
@@ -417,42 +371,39 @@ const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 
-// Owner-drawn menu item data
-#[derive(Clone)]
-struct MenuItemData {
-    id: u32,
-    text: String,
-    is_separator: bool,
-}
-
-// Storage for menu item data (needs to live as long as menu exists)
-thread_local! {
-    static MENU_ITEM_DATA: RefCell<Vec<Box<MenuItemData>>> = const { RefCell::new(Vec::new()) };
-}
-
 // Registry key for settings
 const REGISTRY_KEY: &str = "Software\\MDView";
 
+// Undocumented uxtheme.dll ordinals for dark mode APIs
+const UXTHEME_ORDINAL_ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
+const UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE: usize = 135;
+const UXTHEME_ORDINAL_FLUSH_MENU_THEMES: usize = 136;
+
+// PreferredAppMode values for SetPreferredAppMode
+#[allow(dead_code)]
+const PREFERRED_APP_MODE_DEFAULT: i32 = 0;
+#[allow(dead_code)]
+const PREFERRED_APP_MODE_ALLOW_DARK: i32 = 1;
+const PREFERRED_APP_MODE_FORCE_DARK: i32 = 2;
+#[allow(dead_code)]
+const PREFERRED_APP_MODE_FORCE_LIGHT: i32 = 3;
+
 /// Enable dark mode for menus using undocumented uxtheme.dll API
-/// This calls SetPreferredAppMode (ordinal 135) with AllowDark (1)
 fn set_preferred_app_mode_dark() {
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     unsafe {
         let uxtheme: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
         if let Ok(hmodule) = LoadLibraryW(PCWSTR(uxtheme.as_ptr())) {
-            // Ordinal 135 = SetPreferredAppMode
-            // Ordinal 136 = FlushMenuThemes
             if let Some(set_preferred_app_mode) =
-                GetProcAddress(hmodule, windows::core::PCSTR(135_usize as *const u8))
+                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8))
             {
-                // PreferredAppMode: 0=Default, 1=AllowDark, 2=ForceDark, 3=ForceLight
                 let func: extern "system" fn(i32) -> i32 = std::mem::transmute(set_preferred_app_mode);
-                func(1); // AllowDark
+                func(PREFERRED_APP_MODE_FORCE_DARK);
             }
             // Flush menu themes to apply the change
             if let Some(flush_menu_themes) =
-                GetProcAddress(hmodule, windows::core::PCSTR(136_usize as *const u8))
+                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8))
             {
                 let func: extern "system" fn() = std::mem::transmute(flush_menu_themes);
                 func();
@@ -462,135 +413,58 @@ fn set_preferred_app_mode_dark() {
 }
 
 /// Allow dark mode for a specific window (needed for dark popup menus)
-/// This calls AllowDarkModeForWindow (ordinal 133)
 fn allow_dark_mode_for_window(hwnd: HWND) {
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     unsafe {
         let uxtheme: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
         if let Ok(hmodule) = LoadLibraryW(PCWSTR(uxtheme.as_ptr())) {
-            // Ordinal 133 = AllowDarkModeForWindow
             if let Some(allow_dark_mode) =
-                GetProcAddress(hmodule, windows::core::PCSTR(133_usize as *const u8))
+                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_ALLOW_DARK_MODE_FOR_WINDOW as *const u8))
             {
-                let func: extern "system" fn(isize, i32) -> i32 = std::mem::transmute(allow_dark_mode);
-                func(hwnd.0 as isize, 1); // Allow dark mode for this window
+                let func: extern "system" fn(isize, bool) -> bool = std::mem::transmute(allow_dark_mode);
+                func(hwnd.0 as isize, true);
             }
         }
     }
 }
 
-/// Refresh immersive color policy state (ordinal 104)
-fn refresh_immersive_color_policy() {
-    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-
+/// Helper to insert a native menu item at a position
+fn insert_menu_item(menu: HMENU, position: u32, id: u32, text: &str, is_grayed: bool) -> windows::core::Result<()> {
     unsafe {
-        let uxtheme: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
-        if let Ok(hmodule) = LoadLibraryW(PCWSTR(uxtheme.as_ptr())) {
-            // Ordinal 104 = RefreshImmersiveColorPolicyState
-            if let Some(refresh) =
-                GetProcAddress(hmodule, windows::core::PCSTR(104_usize as *const u8))
-            {
-                let func: extern "system" fn() = std::mem::transmute(refresh);
-                func();
-            }
-        }
-    }
-}
-
-/// Helper to create owner-drawn menu item data and return the pointer
-fn create_menu_item_data(id: u32, text: &str, is_separator: bool) -> usize {
-    let item_data = Box::new(MenuItemData {
-        id,
-        text: text.to_string(),
-        is_separator,
-    });
-    let item_ptr = Box::into_raw(item_data) as usize;
-
-    // Store pointer so we can free it later
-    MENU_ITEM_DATA.with(|data| {
-        data.borrow_mut().push(unsafe { Box::from_raw(item_ptr as *mut MenuItemData) });
-    });
-
-    // Get the pointer again (it's still valid, just also stored)
-    MENU_ITEM_DATA.with(|data| {
-        let items = data.borrow();
-        items.last().map(|b| b.as_ref() as *const MenuItemData as usize).unwrap_or(0)
-    })
-}
-
-/// Helper to add an owner-drawn menu item (append)
-fn add_owner_drawn_item(menu: HMENU, id: u32, text: &str, is_separator: bool) -> windows::core::Result<()> {
-    unsafe {
-        let ptr = create_menu_item_data(id, text, is_separator);
-
-        if is_separator {
-            AppendMenuW(menu, MF_OWNERDRAW | MF_SEPARATOR, 0, PCWSTR(ptr as *const u16))?;
-        } else {
-            AppendMenuW(menu, MF_OWNERDRAW, id as usize, PCWSTR(ptr as *const u16))?;
-        }
-        Ok(())
-    }
-}
-
-/// Helper to insert an owner-drawn menu item at a position
-fn insert_owner_drawn_item(menu: HMENU, position: u32, id: u32, text: &str, is_grayed: bool) -> windows::core::Result<()> {
-    unsafe {
-        let ptr = create_menu_item_data(id, text, false);
+        let text_wide: Vec<u16> = format!("{}\0", text).encode_utf16().collect();
         let flags = if is_grayed {
-            MF_BYPOSITION | MF_OWNERDRAW | MF_GRAYED
+            MF_BYPOSITION | MF_STRING | MF_GRAYED
         } else {
-            MF_BYPOSITION | MF_OWNERDRAW
+            MF_BYPOSITION | MF_STRING
         };
-        InsertMenuW(menu, position, flags, id as usize, PCWSTR(ptr as *const u16))?;
+        InsertMenuW(menu, position, flags, id as usize, PCWSTR(text_wide.as_ptr()))?;
         Ok(())
-    }
-}
-
-/// Configure popup menu with dark theme background
-fn configure_dark_popup_menu(menu: HMENU) {
-    unsafe {
-        // Create dark background brush for popup menu
-        let dark_brush = CreateSolidBrush(COLORREF(0x002D2D2D));
-
-        let mut mi = MENUINFO {
-            cbSize: std::mem::size_of::<MENUINFO>() as u32,
-            fMask: MIM_BACKGROUND | MIM_APPLYTOSUBMENUS,
-            dwStyle: MENUINFO_STYLE::default(),
-            cyMax: 0,
-            hbrBack: dark_brush,
-            dwContextHelpID: 0,
-            dwMenuData: 0,
-        };
-        let _ = SetMenuInfo(menu, &mi);
     }
 }
 
 /// Create the application menu bar
 fn create_menu() -> windows::core::Result<HMENU> {
     unsafe {
-        // Clear any existing menu item data
-        MENU_ITEM_DATA.with(|data| data.borrow_mut().clear());
-
         let menu_bar = CreateMenu()?;
         let file_menu = CreatePopupMenu()?;
         let help_menu = CreatePopupMenu()?;
 
-        // Configure popup menus with dark background
-        configure_dark_popup_menu(file_menu);
-        configure_dark_popup_menu(help_menu);
+        // File menu items (native Windows menus for proper dark mode styling)
+        let open_text: Vec<u16> = "&Open\tCtrl+O\0".encode_utf16().collect();
+        AppendMenuW(file_menu, MF_STRING, IDM_FILE_OPEN as usize, PCWSTR(open_text.as_ptr()))?;
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        let recent_text: Vec<u16> = "Recent Files\0".encode_utf16().collect();
+        AppendMenuW(file_menu, MF_STRING | MF_GRAYED, 0, PCWSTR(recent_text.as_ptr()))?;
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        let exit_text: Vec<u16> = "E&xit\0".encode_utf16().collect();
+        AppendMenuW(file_menu, MF_STRING, IDM_FILE_EXIT as usize, PCWSTR(exit_text.as_ptr()))?;
 
-        // File menu items (owner-drawn)
-        add_owner_drawn_item(file_menu, IDM_FILE_OPEN, "&Open\tCtrl+O", false)?;
-        add_owner_drawn_item(file_menu, 0, "", true)?; // Separator
-        add_owner_drawn_item(file_menu, 0, "Recent Files", false)?; // Placeholder
-        add_owner_drawn_item(file_menu, 0, "", true)?; // Separator
-        add_owner_drawn_item(file_menu, IDM_FILE_EXIT, "E&xit", false)?;
+        // Help menu items (native Windows menus)
+        let about_text: Vec<u16> = "&About MDView\0".encode_utf16().collect();
+        AppendMenuW(help_menu, MF_STRING, IDM_HELP_ABOUT as usize, PCWSTR(about_text.as_ptr()))?;
 
-        // Help menu items (owner-drawn)
-        add_owner_drawn_item(help_menu, IDM_HELP_ABOUT, "&About MDView", false)?;
-
-        // Add submenus to menu bar (these stay as MF_POPUP)
+        // Add submenus to menu bar
         let file_text: Vec<u16> = "&File\0".encode_utf16().collect();
         AppendMenuW(menu_bar, MF_POPUP, file_menu.0 as usize, PCWSTR(file_text.as_ptr()))?;
 
@@ -811,17 +685,17 @@ fn update_recent_files_menu() {
                 RECENT_FILES.with(|files| {
                     let files = files.borrow();
                     if files.is_empty() {
-                        // Show disabled placeholder (owner-drawn)
-                        let _ = insert_owner_drawn_item(file_menu, 2, 0, "(No Recent Files)", true);
+                        // Show disabled placeholder (native menu item)
+                        let _ = insert_menu_item(file_menu, 2, 0, "(No Recent Files)", true);
                     } else {
-                        // Add recent files (owner-drawn)
+                        // Add recent files (native menu items)
                         for (i, path) in files.iter().enumerate() {
                             let filename = Path::new(path)
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| path.clone());
                             let text = format!("&{} {}", i + 1, filename);
-                            let _ = insert_owner_drawn_item(
+                            let _ = insert_menu_item(
                                 file_menu,
                                 2 + i as u32,
                                 IDM_FILE_RECENT_BASE + i as u32,
@@ -1080,13 +954,20 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         // Load application icon from resources
         let icon = LoadIconW(Some(hinstance.into()), PCWSTR(1 as *const u16)).ok();
 
+        // Use dark background brush for dark mode
+        let bg_brush = if is_windows_dark_mode() {
+            CreateSolidBrush(COLORREF(DARK_CLIENT))
+        } else {
+            HBRUSH((COLOR_WINDOW.0 + 1) as _)
+        };
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
             hInstance: hinstance.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hbrBackground: HBRUSH((COLOR_WINDOW.0 + 1) as _), // Standard window background
+            hbrBackground: bg_brush,
             lpszClassName: PCWSTR(class_name_wide.as_ptr()),
             hIcon: icon.unwrap_or_default(),
             hIconSm: icon.unwrap_or_default(),
@@ -1094,7 +975,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         };
         RegisterClassExW(&wc);
 
-        // Create menu bar (stored later, not attached to window)
+        // Create menu bar
         let menu = create_menu()?;
 
         // Create accelerator table
@@ -1103,7 +984,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             *a.borrow_mut() = Some(haccel);
         });
 
-        // Create main window
+        // Create main window with native menu bar (using SetMenu via CreateWindowExW)
         let title_wide: Vec<u16> = format!("{} - MDView", title)
             .encode_utf16()
             .chain(std::iter::once(0))
@@ -1113,19 +994,18 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             WS_EX_ACCEPTFILES, // Enable drag & drop
             PCWSTR(class_name_wide.as_ptr()),
             PCWSTR(title_wide.as_ptr()),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1024,
             768,
             None,
-            None, // No standard menu - we'll draw our own
+            Some(menu), // Native menu bar via SetMenu
             Some(hinstance.into()),
             None,
         )?;
 
-        // Store menu handle for manual popup display
-        // (We don't use SetMenu because our custom NCCALCSIZE conflicts with Windows' menu bar)
+        // Store menu handle for recent files updates
         MENU_HANDLE.with(|m| {
             *m.borrow_mut() = Some(menu);
         });
@@ -1150,42 +1030,18 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         if is_windows_dark_mode() {
             // Allow dark mode for this window (needed for dark popup menus)
             allow_dark_mode_for_window(hwnd);
-            // Refresh immersive color policy to apply dark mode
-            refresh_immersive_color_policy();
-
-            // Enable dark mode menu bar drawing
-            DARK_MENU_BAR.with(|dmb| {
-                dmb.borrow_mut().enable(hwnd);
-            });
-
-            // Enable non-client rendering
-            let ncrp = DWMNCRP_ENABLED;
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_NCRENDERING_POLICY,
-                &ncrp as *const _ as *const std::ffi::c_void,
-                std::mem::size_of_val(&ncrp) as u32,
-            );
 
             // Enable immersive dark mode for title bar
-            let use_dark_mode: i32 = 1;
+            let use_dark_mode: u32 = 1;
             let _ = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &use_dark_mode as *const i32 as *const std::ffi::c_void,
-                std::mem::size_of::<i32>() as u32,
+                &use_dark_mode as *const u32 as *const std::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
             );
 
-            // Enable Mica backdrop for Windows 11 (attribute 38)
-            // DWMSBT_MAINWINDOW = 2 (Mica), DWMSBT_TABBEDWINDOW = 4 (Mica Alt)
-            const DWMSBT_MAINWINDOW: i32 = 2; // Mica
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                windows::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(38), // DWMWA_SYSTEMBACKDROP_TYPE
-                &DWMSBT_MAINWINDOW as *const i32 as *const std::ffi::c_void,
-                std::mem::size_of::<i32>() as u32,
-            );
-
+            // Force menu bar redraw to trigger UAH messages
+            let _ = DrawMenuBar(hwnd);
         }
 
         // Enable rounded corners on Windows 11
@@ -1196,18 +1052,6 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             &corner_preference as *const i32 as *const std::ffi::c_void,
             std::mem::size_of::<i32>() as u32,
         );
-
-        // Extend frame into client area for custom title bar and menu bar
-        // We draw both ourselves to ensure color consistency
-        let dpi = get_dpi_for_window(hwnd);
-        let nc_height = get_nc_height(dpi);
-        let margins = MARGINS {
-            cxLeftWidth: 0,
-            cxRightWidth: 0,
-            cyTopHeight: nc_height, // Title bar + menu bar height (DPI-scaled)
-            cyBottomHeight: 0,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
         // Initialize WebView2
         init_webview2_gui(hwnd, html)?;
@@ -1262,8 +1106,6 @@ thread_local! {
     static MENU_HANDLE: RefCell<Option<HMENU>> = const { RefCell::new(None) };
     static ACCEL_HANDLE: RefCell<Option<HACCEL>> = const { RefCell::new(None) };
     static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
-    static DARK_MENU_BAR: RefCell<dark_menu::DarkMenuBar> = RefCell::new(dark_menu::DarkMenuBar::new());
-    static WINDOW_ACTIVE: RefCell<bool> = const { RefCell::new(true) };
 }
 
 fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
@@ -1416,487 +1258,35 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Let DWM handle caption button interactions (hover, click effects)
-    let mut dwm_result = LRESULT(0);
-    if DwmDefWindowProc(hwnd, msg, wparam, lparam, &mut dwm_result).as_bool() {
-        return dwm_result;
-    }
-
-    // Handle dark mode menu bar messages
-    let dark_handled = DARK_MENU_BAR.with(|dmb| {
-        dmb.borrow().handle_message(hwnd, msg, wparam, lparam)
-    });
-    if let Some(result) = dark_handled {
-        return result;
-    }
-
     match msg {
-        WM_SIZE => {
-            // Adjust WebView bounds to account for custom title bar and menu bar
-            let dpi = get_dpi_for_window(hwnd);
-            let nc_height = get_nc_height(dpi);
-            CONTROLLER.with(|c| {
-                if let Some(controller) = c.borrow().as_ref() {
-                    unsafe {
+        // UAH messages for dark menu bar
+        dark_menu::WM_UAHDRAWMENU => {
+            return dark_menu::handle_uah_draw_menu(hwnd, lparam);
+        }
+        dark_menu::WM_UAHDRAWMENUITEM => {
+            return dark_menu::handle_uah_draw_menu_item(lparam);
+        }
+        WM_NCPAINT | WM_NCACTIVATE => {
+            // Let Windows draw first, then paint over the menu bar separator line
+            let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            dark_menu::paint_menu_separator(hwnd);
+            return result;
+        }
+        WM_ACTIVATE | WM_SIZE => {
+            let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            dark_menu::paint_menu_separator(hwnd);
+
+            // Also resize WebView on WM_SIZE
+            if msg == WM_SIZE {
+                CONTROLLER.with(|c| {
+                    if let Some(controller) = c.borrow().as_ref() {
                         let mut rect = RECT::default();
-                        let _ = GetClientRect(hwnd, &mut rect);
-                        // Offset for custom NC area (DPI-scaled)
-                        rect.top += nc_height;
-                        let _ = controller.SetBounds(rect);
+                        let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+                        let _ = unsafe { controller.SetBounds(rect) };
                     }
-                }
-            });
-            LRESULT(0)
-        }
-        WM_ACTIVATE => {
-            // Track window active state for title bar color
-            let active = (wparam.0 & 0xFFFF) != 0; // WA_INACTIVE = 0
-            WINDOW_ACTIVE.with(|a| *a.borrow_mut() = active);
-
-            // Repaint the NC area to update colors
-            unsafe {
-                let dpi = get_dpi_for_window(hwnd);
-                let nc_height = get_nc_height(dpi);
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-                rc.bottom = nc_height;
-                let _ = InvalidateRect(Some(hwnd), Some(&rc), false);
+                });
             }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-        WM_ERASEBKGND => {
-            // Fill title bar area with dark color to prevent white flash
-            // Mica will paint over this for active windows
-            unsafe {
-                let hdc = HDC(wparam.0 as *mut _);
-                let dpi = get_dpi_for_window(hwnd);
-                let title_bar_height = get_title_bar_height(dpi);
-
-                let mut rc = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc);
-
-                // Fill title bar area with dark color
-                let rc_titlebar = RECT {
-                    left: 0,
-                    top: 0,
-                    right: rc.right,
-                    bottom: title_bar_height,
-                };
-                let brush = CreateSolidBrush(COLORREF(DARK_TITLEBAR_ACTIVE)); // Use black
-                FillRect(hdc, &rc_titlebar, brush);
-                let _ = DeleteObject(brush.into());
-            }
-            LRESULT(1) // Return non-zero to indicate we handled it
-        }
-        WM_NCCALCSIZE => {
-            // Custom NC area: extend client area to include title bar and menu bar
-            if wparam.0 != 0 {
-                let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
-                unsafe {
-                    let original_top = (*params).rgrc[0].top;
-
-                    // Let Windows calculate default frame
-                    let result = DefWindowProcW(hwnd, msg, wparam, lparam);
-                    if result.0 != 0 {
-                        return result;
-                    }
-
-                    // Restore original top to remove standard title bar
-                    (*params).rgrc[0].top = original_top;
-                }
-            }
-            LRESULT(0)
-        }
-        WM_NCHITTEST => {
-            // Custom NC area: handle hit testing
-            unsafe {
-                let dpi = get_dpi_for_window(hwnd);
-                let title_bar_height = get_title_bar_height(dpi);
-                let nc_height = get_nc_height(dpi);
-                let button_width = get_button_width(dpi);
-
-                let pt = POINT {
-                    x: (lparam.0 & 0xFFFF) as i16 as i32,
-                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
-                };
-
-                // Get window rect
-                let mut rc = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut rc);
-
-                // Check if in resize border (top 8 pixels when not maximized)
-                let mut wp = WINDOWPLACEMENT::default();
-                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-                let _ = GetWindowPlacement(hwnd, &mut wp);
-                let is_maximized = wp.showCmd == SW_SHOWMAXIMIZED.0 as u32;
-
-                let resize_border = scale_for_dpi(8, dpi);
-                if !is_maximized && pt.y < rc.top + resize_border {
-                    return LRESULT(HTTOP as isize);
-                }
-
-                // Check if in title bar area
-                if pt.y < rc.top + title_bar_height {
-                    // Check for window buttons area (right side)
-                    if pt.x > rc.right - button_width {
-                        return LRESULT(HTCLOSE as isize);
-                    }
-                    if pt.x > rc.right - button_width * 2 {
-                        return LRESULT(HTMAXBUTTON as isize);
-                    }
-                    if pt.x > rc.right - button_width * 3 {
-                        return LRESULT(HTMINBUTTON as isize);
-                    }
-                    return LRESULT(HTCAPTION as isize);
-                }
-
-                // Check if in menu bar area
-                if pt.y < rc.top + nc_height {
-                    return LRESULT(HTCLIENT as isize);
-                }
-
-                // Let default handling take over
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
-        }
-        WM_PAINT => {
-            // Custom NC area: draw title bar and menu bar
-            unsafe {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-
-                // Get DPI for proper scaling
-                let dpi = GetDeviceCaps(Some(hdc), LOGPIXELSY);
-                let title_bar_height = get_title_bar_height(dpi);
-                let menu_bar_height = get_menu_bar_height(dpi);
-                let nc_height = title_bar_height + menu_bar_height;
-
-                let mut rc_client = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rc_client);
-
-                // Only draw if painting in our NC area
-                if ps.rcPaint.top < nc_height {
-                    // Get active state for color selection
-                    let is_active = WINDOW_ACTIVE.with(|a| *a.borrow());
-                    let menubar_color = if is_active { DARK_MENUBAR_ACTIVE } else { DARK_MENUBAR_INACTIVE };
-
-                    let menubar_brush = CreateSolidBrush(COLORREF(menubar_color));
-
-                    // Always paint title bar black - Mica blends with it for active windows
-                    let titlebar_brush = CreateSolidBrush(COLORREF(DARK_TITLEBAR_ACTIVE));
-                    let rc_titlebar = RECT {
-                        left: 0,
-                        top: 0,
-                        right: rc_client.right,
-                        bottom: title_bar_height,
-                    };
-                    FillRect(hdc, &rc_titlebar, titlebar_brush);
-                    let _ = DeleteObject(titlebar_brush.into());
-
-                    // Draw application icon in title bar (DPI-scaled)
-                    let icon_size = scale_for_dpi(16, dpi);
-                    let icon_x = scale_for_dpi(12, dpi);
-                    let icon_y = (title_bar_height - icon_size) / 2;
-                    if let Ok(hmodule) = GetModuleHandleW(None) {
-                        let hinstance = HINSTANCE(hmodule.0);
-                        if let Ok(hicon) = LoadIconW(Some(hinstance), PCWSTR(1 as *const u16)) {
-                            let _ = DrawIconEx(
-                                hdc,
-                                icon_x,
-                                icon_y,
-                                hicon,
-                                icon_size,
-                                icon_size,
-                                0,
-                                None,
-                                DI_NORMAL,
-                            );
-                        }
-                    }
-
-                    // Draw menu bar background (darker)
-                    let rc_menubar = RECT {
-                        left: 0,
-                        top: title_bar_height,
-                        right: rc_client.right,
-                        bottom: nc_height,
-                    };
-                    FillRect(hdc, &rc_menubar, menubar_brush);
-
-                    // Create font for title (Segoe UI, 12pt) - DPI aware
-                    // Formula: height = -(pointSize * dpi / 72)
-                    let title_font_height = -(12 * dpi / 72);
-                    let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-                    let title_font = CreateFontW(
-                        title_font_height,
-                        0, 0, 0,
-                        FW_NORMAL.0 as i32,
-                        0, 0, 0,
-                        DEFAULT_CHARSET,
-                        OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS,
-                        CLEARTYPE_QUALITY,
-                        DEFAULT_PITCH.0 as u32,
-                        PCWSTR(font_name.as_ptr()),
-                    );
-
-                    // Draw window title
-                    let mut title_buf = [0u16; 256];
-                    let title_len = GetWindowTextW(hwnd, &mut title_buf);
-                    if title_len > 0 {
-                        let old_font = SelectObject(hdc, title_font.into());
-                        let old_bk = SetBkMode(hdc, TRANSPARENT);
-                        let old_color = SetTextColor(hdc, COLORREF(DARK_TEXT_COLOR));
-
-                        let title_left = scale_for_dpi(36, dpi); // After icon (12 + 16 + 8)
-                        let mut rc_title = RECT {
-                            left: title_left,
-                            top: 0,
-                            right: rc_client.right - scale_for_dpi(150, dpi),
-                            bottom: title_bar_height,
-                        };
-
-                        DrawTextW(
-                            hdc,
-                            &mut title_buf[..title_len as usize],
-                            &mut rc_title,
-                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                        );
-
-                        SetTextColor(hdc, old_color);
-                        SetBkMode(hdc, BACKGROUND_MODE(old_bk as u32));
-                        SelectObject(hdc, old_font);
-                    }
-
-                    // Create font for menu items (Segoe UI, 11pt) - DPI aware
-                    let menu_font_height = -(11 * dpi / 72);
-                    let menu_font = CreateFontW(
-                        menu_font_height,
-                        0, 0, 0,
-                        FW_NORMAL.0 as i32,
-                        0, 0, 0,
-                        DEFAULT_CHARSET,
-                        OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS,
-                        CLEARTYPE_QUALITY,
-                        DEFAULT_PITCH.0 as u32,
-                        PCWSTR(font_name.as_ptr()),
-                    );
-
-                    let old_font = SelectObject(hdc, menu_font.into());
-                    let old_bk = SetBkMode(hdc, TRANSPARENT);
-                    let old_color = SetTextColor(hdc, COLORREF(DARK_TEXT_COLOR));
-
-                    // Draw menu items with Notepad-style spacing (DPI-aware)
-                    let menu_item_width = 56 * dpi / 96; // Width per menu item, scaled for DPI
-                    let menu_padding = 0;                // No padding, flush left like Notepad
-
-                    // File menu
-                    let file_text: Vec<u16> = "File".encode_utf16().collect();
-                    let mut rc_file = RECT {
-                        left: menu_padding,
-                        top: title_bar_height,
-                        right: menu_padding + menu_item_width,
-                        bottom: nc_height,
-                    };
-                    DrawTextW(hdc, &mut file_text.clone(), &mut rc_file, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-                    // Help menu
-                    let help_text: Vec<u16> = "Help".encode_utf16().collect();
-                    let mut rc_help = RECT {
-                        left: menu_padding + menu_item_width,
-                        top: title_bar_height,
-                        right: menu_padding + menu_item_width * 2,
-                        bottom: nc_height,
-                    };
-                    DrawTextW(hdc, &mut help_text.clone(), &mut rc_help, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-                    SetTextColor(hdc, old_color);
-                    SetBkMode(hdc, BACKGROUND_MODE(old_bk as u32));
-                    SelectObject(hdc, old_font);
-
-                    // Clean up GDI objects
-                    let _ = DeleteObject(title_font.into());
-                    let _ = DeleteObject(menu_font.into());
-                    let _ = DeleteObject(menubar_brush.into());
-                }
-
-                let _ = EndPaint(hwnd, &ps);
-            }
-            LRESULT(0)
-        }
-        WM_LBUTTONDOWN => {
-            // Handle menu clicks manually (since we can't use SetMenu with our custom NCCALCSIZE)
-            unsafe {
-                let x = (lparam.0 & 0xFFFF) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-
-                // Get DPI-scaled dimensions
-                let dpi = get_dpi_for_window(hwnd);
-                let title_bar_height = get_title_bar_height(dpi);
-                let nc_height = get_nc_height(dpi);
-                let menu_item_width = scale_for_dpi(56, dpi);
-
-                // Check if click is in menu bar area
-                if y >= title_bar_height && y < nc_height {
-                    MENU_HANDLE.with(|menu| {
-                        if let Some(hmenu) = menu.borrow().as_ref() {
-                            // Determine which menu was clicked
-                            let (popup, menu_x) = if x >= 0 && x < menu_item_width {
-                                // File menu
-                                (GetSubMenu(*hmenu, 0), 0)
-                            } else if x >= menu_item_width && x < menu_item_width * 2 {
-                                // Help menu
-                                (GetSubMenu(*hmenu, 1), menu_item_width)
-                            } else {
-                                (HMENU::default(), 0)
-                            };
-
-                            if !popup.is_invalid() {
-                                let mut pt = POINT { x: menu_x, y: nc_height };
-                                let _ = ClientToScreen(hwnd, &mut pt);
-
-                                let _ = TrackPopupMenu(
-                                    popup,
-                                    TPM_LEFTALIGN | TPM_TOPALIGN,
-                                    pt.x,
-                                    pt.y,
-                                    Some(0),
-                                    hwnd,
-                                    None,
-                                );
-                            }
-                        }
-                    });
-                    return LRESULT(0);
-                }
-            }
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-        WM_MEASUREITEM => {
-            // Owner-drawn menu: provide item dimensions (DPI-aware)
-            unsafe {
-                let mis = lparam.0 as *mut MEASUREITEMSTRUCT;
-                if (*mis).CtlType == ODT_MENU {
-                    let item_data = (*mis).itemData as *const MenuItemData;
-                    if !item_data.is_null() {
-                        let data = &*item_data;
-                        let dpi = get_dpi_for_window(hwnd);
-                        let scale = dpi as f32 / 96.0;
-
-                        if data.is_separator {
-                            // Separator: thin line (DPI-scaled)
-                            (*mis).itemHeight = (9.0 * scale) as u32;
-                            (*mis).itemWidth = 0;
-                        } else {
-                            // Regular item: match Notepad's ~36px at 96 DPI
-                            (*mis).itemHeight = (36.0 * scale) as u32;
-                            (*mis).itemWidth = (250.0 * scale) as u32;
-                        }
-                    }
-                }
-            }
-            LRESULT(1) // TRUE = we handled it
-        }
-        WM_DRAWITEM => {
-            // Owner-drawn menu: draw the item
-            unsafe {
-                let dis = lparam.0 as *const DRAWITEMSTRUCT;
-                if (*dis).CtlType == ODT_MENU {
-                    let item_data = (*dis).itemData as *const MenuItemData;
-                    if !item_data.is_null() {
-                        let data = &*item_data;
-                        let hdc = (*dis).hDC;
-                        let rc = (*dis).rcItem;
-                        let is_selected = ((*dis).itemState.0 & ODS_SELECTED.0) != 0;
-                        let is_disabled = ((*dis).itemState.0 & ODS_GRAYED.0) != 0;
-
-                        // Background color - dark gray, lighter when selected
-                        let bg_color = if is_selected {
-                            COLORREF(0x00404040) // Lighter for hover
-                        } else {
-                            COLORREF(0x002D2D2D) // Dark background like Notepad
-                        };
-                        let brush = CreateSolidBrush(bg_color);
-                        FillRect(hdc, &rc, brush);
-                        let _ = DeleteObject(brush.into());
-
-                        if data.is_separator {
-                            // Draw separator line (DPI-aware)
-                            let dpi = get_dpi_for_window(hwnd);
-                            let scale = dpi as f32 / 96.0;
-                            let margin = (12.0 * scale) as i32;
-                            let sep_brush = CreateSolidBrush(COLORREF(0x00505050));
-                            let sep_rc = RECT {
-                                left: rc.left + margin,
-                                top: (rc.top + rc.bottom) / 2,
-                                right: rc.right - margin,
-                                bottom: (rc.top + rc.bottom) / 2 + 1,
-                            };
-                            FillRect(hdc, &sep_rc, sep_brush);
-                            let _ = DeleteObject(sep_brush.into());
-                        } else {
-                            // Draw text (DPI-aware)
-                            let dpi = get_dpi_for_window(hwnd);
-                            let scale = dpi as f32 / 96.0;
-
-                            let text_color = if is_disabled {
-                                COLORREF(0x00808080) // Gray for disabled
-                            } else {
-                                COLORREF(0x00FFFFFF) // White
-                            };
-
-                            let old_bk = SetBkMode(hdc, TRANSPARENT);
-                            let old_color = SetTextColor(hdc, text_color);
-
-                            // Create font (DPI-scaled, ~12pt at 96 DPI)
-                            let font_height = (-14.0 * scale) as i32;
-                            let font = CreateFontW(
-                                font_height, 0, 0, 0,
-                                FW_NORMAL.0 as i32,
-                                0, 0, 0,
-                                DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS,
-                                CLIP_DEFAULT_PRECIS,
-                                CLEARTYPE_QUALITY,
-                                (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
-                                windows::core::w!("Segoe UI")
-                            );
-                            let old_font = SelectObject(hdc, font.into());
-
-                            // Split text and shortcut (separated by \t)
-                            let parts: Vec<&str> = data.text.split('\t').collect();
-                            let label = parts.first().unwrap_or(&"");
-                            let shortcut = parts.get(1);
-
-                            // Draw label (left aligned with DPI-scaled padding)
-                            let padding = (16.0 * scale) as i32;
-                            let mut text_rc = RECT {
-                                left: rc.left + padding,
-                                top: rc.top,
-                                right: rc.right - padding,
-                                bottom: rc.bottom,
-                            };
-                            let mut label_wide: Vec<u16> = label.encode_utf16().collect();
-                            DrawTextW(hdc, &mut label_wide, &mut text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-                            // Draw shortcut (right aligned, slightly dimmer)
-                            if let Some(sc) = shortcut {
-                                let shortcut_color = COLORREF(0x00A0A0A0); // Dimmer white
-                                SetTextColor(hdc, shortcut_color);
-                                let mut sc_wide: Vec<u16> = sc.encode_utf16().collect();
-                                DrawTextW(hdc, &mut sc_wide, &mut text_rc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-                            }
-
-                            SelectObject(hdc, old_font);
-                            let _ = DeleteObject(font.into());
-                            SetTextColor(hdc, old_color);
-                            SetBkMode(hdc, BACKGROUND_MODE(old_bk as u32));
-                        }
-                    }
-                }
-            }
-            LRESULT(1) // TRUE = we handled it
+            return result;
         }
         WM_COMMAND => {
             let cmd_id = (wparam.0 & 0xFFFF) as u32;
