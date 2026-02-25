@@ -272,22 +272,11 @@ fn main() {
     if opts.register {
         match register_file_association() {
             Ok(()) => {
-                write_console(
-                    "MDView file association registered successfully.\n\
-                     Opening Windows Settings to set default apps...",
-                );
+                write_console("MDView file association registered successfully.");
                 unsafe {
-                    let settings_uri =
-                        U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
-                    let open_verb = U16CString::from_str("open").unwrap_or_default();
-                    ShellExecuteW(
-                        None,
-                        PCWSTR(open_verb.as_ptr()),
-                        PCWSTR(settings_uri.as_ptr()),
-                        None,
-                        None,
-                        SW_SHOWNORMAL,
-                    );
+                    let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                    open_association_settings();
+                    CoUninitialize();
                 }
                 send_enter_key();
                 std::process::exit(0);
@@ -420,9 +409,9 @@ use windows::Win32::System::Registry::{
     REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::UI::Shell::{
-    DragFinish, DragQueryFileW, FileOpenDialog, IFileOpenDialog, SHChangeNotify, ShellExecuteW,
-    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, HDROP, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
-    SIGDN_FILESYSPATH,
+    DragFinish, DragQueryFileW, FileOpenDialog, IApplicationAssociationRegistrationUI,
+    IFileOpenDialog, SHChangeNotify, ShellExecuteW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, HDROP,
+    SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -1351,6 +1340,37 @@ fn set_dont_ask_register() {
     }
 }
 
+/// Open the system UI for setting MDView as the default app for its registered file types.
+/// Uses IApplicationAssociationRegistrationUI for a focused "set defaults" page.
+/// Falls back to ms-settings:defaultapps if the COM interface is unavailable.
+fn open_association_settings() {
+    unsafe {
+        // Try the focused association UI (shows only MDView's file types)
+        if let Ok(ui) = CoCreateInstance::<_, IApplicationAssociationRegistrationUI>(
+            &windows::core::GUID::from_u128(0x1968106d_f3b5_44cf_890e_116fcb9ecef1),
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            let app_name: Vec<u16> = "MDView\0".encode_utf16().collect();
+            if ui.LaunchAdvancedAssociationUI(PCWSTR(app_name.as_ptr())).is_ok() {
+                return;
+            }
+        }
+
+        // Fallback: open generic default apps settings
+        let settings_uri = U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
+        let open_verb = U16CString::from_str("open").unwrap_or_default();
+        ShellExecuteW(
+            None,
+            PCWSTR(open_verb.as_ptr()),
+            PCWSTR(settings_uri.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 fn run_gui(title: &str, html: &str, file_path: Option<&str>) -> windows::core::Result<()> {
     unsafe {
         // Initialize COM for this thread (required for WebView2)
@@ -1537,17 +1557,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
 
             if answer == IDYES {
                 if register_file_association().is_ok() {
-                    let open_verb = U16CString::from_str("open").unwrap_or_default();
-                    let settings_uri =
-                        U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
-                    ShellExecuteW(
-                        Some(hwnd),
-                        PCWSTR(open_verb.as_ptr()),
-                        PCWSTR(settings_uri.as_ptr()),
-                        None,
-                        None,
-                        SW_SHOWNORMAL,
-                    );
+                    open_association_settings();
                 }
             } else if answer == IDCANCEL {
                 set_dont_ask_register();
