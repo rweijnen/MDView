@@ -898,6 +898,69 @@ fn restore_window_position(hwnd: HWND) -> bool {
     }
 }
 
+/// Open a URL in the default browser
+fn open_url_in_browser(url: &str) {
+    unsafe {
+        let url_wide = U16CString::from_str(url).unwrap_or_default();
+        let open_wide = U16CString::from_str("open").unwrap_or_default();
+        ShellExecuteW(
+            None,
+            PCWSTR(open_wide.as_ptr()),
+            PCWSTR(url_wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
+/// Handle a regular click on a link in the viewer
+fn handle_follow_link(url: &str) {
+    // External URLs: open in browser
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        open_url_in_browser(url);
+        return;
+    }
+
+    // Strip fragment (#section) for file path resolution
+    let path_part = url.split('#').next().unwrap_or(url);
+
+    // Check if it's a markdown file
+    let ext = Path::new(path_part)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if ext == "md" || ext == "markdown" {
+        // Resolve relative path against current file's directory
+        let resolved = CURRENT_FILE.with(|f| {
+            let current = f.borrow();
+            if let Some(current_path) = current.as_ref() {
+                if let Some(dir) = Path::new(current_path).parent() {
+                    let target = dir.join(path_part);
+                    target.canonicalize().ok().map(|p| p.to_string_lossy().to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        if let Some(resolved_path) = resolved {
+            MAIN_HWND.with(|h| {
+                if let Some(hwnd) = h.borrow().as_ref() {
+                    load_file_into_webview(*hwnd, &resolved_path);
+                }
+            });
+            return;
+        }
+    }
+
+    // Fallback: try to open with default handler
+    open_url_in_browser(url);
+}
+
 /// Load a file into the WebView
 fn load_file_into_webview(hwnd: HWND, file_path: &str) {
     // Read file
@@ -1658,7 +1721,7 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 eprintln!("NavigateToString failed: {:?}", e);
                             }
 
-                            // Add message handler for Ctrl+click links
+                            // Add message handler for link clicks
                             let handler = webview2_com::WebMessageReceivedEventHandler::create(
                                 Box::new(|_webview, args| {
                                     if let Some(args) = args {
@@ -1666,23 +1729,20 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                         if args.WebMessageAsJson(&mut message_ptr).is_ok() && !message_ptr.is_null() {
                                             let msg_str = message_ptr.to_string().unwrap_or_default();
                                             windows::Win32::System::Com::CoTaskMemFree(Some(message_ptr.0 as *const _));
-                                            // Parse simple JSON to extract URL
-                                            if msg_str.contains("openLink") {
-                                                if let Some(start) = msg_str.find("\"url\":\"") {
-                                                    let url_start = start + 7;
-                                                    if let Some(end) = msg_str[url_start..].find('"') {
-                                                        let url = &msg_str[url_start..url_start + end];
-                                                        // Open URL in default browser
-                                                        let url_wide = U16CString::from_str(url).unwrap_or_default();
-                                                        let open_wide = U16CString::from_str("open").unwrap_or_default();
-                                                        ShellExecuteW(
-                                                            None,
-                                                            PCWSTR(open_wide.as_ptr()),
-                                                            PCWSTR(url_wide.as_ptr()),
-                                                            None,
-                                                            None,
-                                                            SW_SHOWNORMAL,
-                                                        );
+
+                                            // Extract URL from JSON message
+                                            if let Some(start) = msg_str.find("\"url\":\"") {
+                                                let url_start = start + 7;
+                                                if let Some(end) = msg_str[url_start..].find('"') {
+                                                    let url = msg_str[url_start..url_start + end].to_string();
+                                                    // Unescape JSON backslashes
+                                                    let url = url.replace("\\\\", "\\").replace("\\/", "/");
+
+                                                    if msg_str.contains("openLink") {
+                                                        // Ctrl+click: always open in browser
+                                                        open_url_in_browser(&url);
+                                                    } else if msg_str.contains("followLink") {
+                                                        handle_follow_link(&url);
                                                     }
                                                 }
                                             }
