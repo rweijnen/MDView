@@ -13,7 +13,7 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 - **WebView2 rendering** - Modern HTML rendering with full Markdown support (GUI mode)
 - **Auto dark mode** - Follows Windows appearance settings (GUI mode)
 - **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
-- **Ctrl+click links** - Open external links in your default browser
+- **Clickable links** - Click `.md` links to navigate, external links open in browser
 - **ESC to close** - Quick keyboard navigation
 - **Syntax highlighting** - Code blocks with proper formatting
 - **GitHub Flavored Markdown** - Tables, task lists, strikethrough, and more
@@ -118,7 +118,8 @@ mdview --unregister
 | Key | Action |
 |-----|--------|
 | ESC | Close viewer |
-| Ctrl+Click | Open link in browser |
+| Click link | Navigate .md files in viewer, open external URLs in browser |
+| Ctrl+Click | Always open link in browser |
 
 ## Building from Source
 
