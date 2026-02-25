@@ -118,8 +118,18 @@ mdview --unregister
 | Key | Action |
 |-----|--------|
 | ESC | Close viewer |
+| Ctrl+O | Open file |
 | Click link | Navigate .md files in viewer, open external URLs in browser |
 | Ctrl+Click | Always open link in browser |
+
+### Menu Options (GUI mode)
+
+| Menu | Item | Action |
+|------|------|--------|
+| File | Open | Open a Markdown file |
+| File | Register as .md Viewer... | Add MDView to the Open With list |
+| File | Unregister as .md Viewer | Remove MDView from Open With |
+| Help | About MDView | Version and license info |
 
 ## Building from Source
 
