@@ -89,11 +89,6 @@ input[type="checkbox"] {{
     margin-right: 0.5em;
 }}
 a {{ cursor: pointer; }}
-a:hover::after {{
-    content: " (Ctrl+click to open)";
-    font-size: 0.8em;
-    opacity: 0.6;
-}}
 </style>
 </head>
 <body>
@@ -101,10 +96,14 @@ a:hover::after {{
 <script>
 document.addEventListener('click', function(e) {{
     var link = e.target.closest('a');
-    if (link && link.href) {{
+    if (link) {{
+        var href = link.getAttribute('href');
+        if (!href || href.charAt(0) === '#') return;
         e.preventDefault();
         if (e.ctrlKey) {{
-            window.chrome.webview.postMessage({{type: 'openLink', url: link.href}});
+            window.chrome.webview.postMessage({{type: 'openLink', url: href}});
+        }} else {{
+            window.chrome.webview.postMessage({{type: 'followLink', url: href}});
         }}
     }}
 }});
