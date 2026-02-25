@@ -62,12 +62,14 @@ Arguments:
   [FILE]  Markdown file to view (reads from stdin if not provided)
 
 Options:
-  --gui        Force GUI window mode
-  --term       Force terminal output mode
-  --html       Output full HTML document to stdout
-  --body       Output HTML body only (no wrapper)
-  --text       Output plain text (no formatting)
-  -h, --help   Show help message
+  --gui          Force GUI window mode
+  --term         Force terminal output mode
+  --html         Output full HTML document to stdout
+  --body         Output HTML body only (no wrapper)
+  --text         Output plain text (no formatting)
+  --register     Register as .md file viewer (Open With)
+  --unregister   Remove .md file viewer registration
+  -h, --help     Show help message
 ```
 
 ### Examples
@@ -84,6 +86,21 @@ mdview --gui README.md
 
 # Output HTML for further processing
 mdview --html README.md > output.html
+```
+
+### File Association
+
+MDView can register itself as a handler for `.md` and `.markdown` files:
+
+- **First launch (GUI mode):** MDView will offer to register as a viewer. Choose "Yes" to register and open Windows Settings where you can set it as the default. Choose "No" to be asked again next time, or "Cancel" to suppress the prompt permanently.
+- **Command line:** Use `mdview --register` to register and `mdview --unregister` to remove the registration. Registration adds MDView to the "Open With" list; you then confirm the default in Windows Settings.
+
+```bash
+# Register as .md viewer and open Windows Settings
+mdview --register
+
+# Remove registration
+mdview --unregister
 ```
 
 ### Terminal Features
