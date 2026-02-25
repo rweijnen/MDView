@@ -425,6 +425,8 @@ const DARK_CLIENT: u32 = 0x00202020;
 const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
+const IDM_FILE_REGISTER: u32 = 1010;
+const IDM_FILE_UNREGISTER: u32 = 1011;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 
 // Registry key for settings
@@ -517,6 +519,11 @@ fn create_menu() -> windows::core::Result<HMENU> {
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let recent_text: Vec<u16> = "Recent Files\0".encode_utf16().collect();
         AppendMenuW(file_menu, MF_STRING | MF_GRAYED, 0, PCWSTR(recent_text.as_ptr()))?;
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        let register_text: Vec<u16> = "Register as .md Viewer...\0".encode_utf16().collect();
+        AppendMenuW(file_menu, MF_STRING, IDM_FILE_REGISTER as usize, PCWSTR(register_text.as_ptr()))?;
+        let unregister_text: Vec<u16> = "Unregister as .md Viewer\0".encode_utf16().collect();
+        AppendMenuW(file_menu, MF_STRING, IDM_FILE_UNREGISTER as usize, PCWSTR(unregister_text.as_ptr()))?;
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let exit_text: Vec<u16> = "E&xit\0".encode_utf16().collect();
         AppendMenuW(file_menu, MF_STRING, IDM_FILE_EXIT as usize, PCWSTR(exit_text.as_ptr()))?;
@@ -1770,6 +1777,24 @@ unsafe extern "system" fn window_proc(
             }
             return result;
         }
+        WM_INITMENUPOPUP => {
+            // Update register/unregister enabled state when menu opens
+            let menu = HMENU(wparam.0 as _);
+            let registered = is_file_association_registered();
+            unsafe {
+                let _ = EnableMenuItem(
+                    menu,
+                    IDM_FILE_REGISTER,
+                    if registered { MF_BYCOMMAND | MF_GRAYED } else { MF_BYCOMMAND },
+                );
+                let _ = EnableMenuItem(
+                    menu,
+                    IDM_FILE_UNREGISTER,
+                    if registered { MF_BYCOMMAND } else { MF_BYCOMMAND | MF_GRAYED },
+                );
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         WM_COMMAND => {
             let cmd_id = (wparam.0 & 0xFFFF) as u32;
             match cmd_id {
@@ -1781,6 +1806,16 @@ unsafe extern "system" fn window_proc(
                 }
                 IDM_FILE_EXIT => {
                     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).ok() };
+                    LRESULT(0)
+                }
+                IDM_FILE_REGISTER => {
+                    if register_file_association().is_ok() {
+                        open_association_settings();
+                    }
+                    LRESULT(0)
+                }
+                IDM_FILE_UNREGISTER => {
+                    let _ = unregister_file_association();
                     LRESULT(0)
                 }
                 IDM_HELP_ABOUT => {
