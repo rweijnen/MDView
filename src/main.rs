@@ -23,6 +23,8 @@ fn print_usage_console() {
          \x20 --html       Output full HTML document to stdout\n\
          \x20 --body       Output HTML body only (no wrapper)\n\
          \x20 --text       Output plain text (no formatting)\n\
+         \x20 --register   Register as .md file viewer (Open With)\n\
+         \x20 --unregister Remove .md file viewer registration\n\
          \x20 -h, --help   Show this help message\n\n\
          If no FILE is specified, reads from stdin (CLI mode only).\n\n\
          Examples:\n\
@@ -42,6 +44,8 @@ struct Options {
     html_full: bool,
     html_body: bool,
     plain_text: bool,
+    register: bool,
+    unregister: bool,
     file_path: Option<String>,
 }
 
@@ -60,6 +64,8 @@ fn parse_args(has_console: bool) -> Result<Options, String> {
             "--html" => opts.html_full = true,
             "--body" => opts.html_body = true,
             "--text" => opts.plain_text = true,
+            "--register" => opts.register = true,
+            "--unregister" => opts.unregister = true,
             s if s.starts_with('-') => {
                 return Err(format!("Unknown option: {}", s));
             }
@@ -70,6 +76,19 @@ fn parse_args(has_console: bool) -> Result<Options, String> {
                 opts.file_path = Some(path.to_string());
             }
         }
+    }
+
+    // Register/unregister are standalone operations
+    if opts.register || opts.unregister {
+        if opts.register && opts.unregister {
+            return Err("--register and --unregister are mutually exclusive".to_string());
+        }
+        let other_flags = opts.html_full as u8 + opts.html_body as u8 + opts.plain_text as u8
+            + opts.terminal_mode as u8 + opts.gui_mode as u8;
+        if other_flags > 0 || opts.file_path.is_some() {
+            return Err("--register and --unregister cannot be combined with other options".to_string());
+        }
+        return Ok(opts);
     }
 
     // Validate mutually exclusive options
@@ -249,6 +268,53 @@ fn main() {
         }
     };
 
+    // Handle --register / --unregister
+    if opts.register {
+        match register_file_association() {
+            Ok(()) => {
+                write_console(
+                    "MDView file association registered successfully.\n\
+                     Opening Windows Settings to set default apps...",
+                );
+                unsafe {
+                    let settings_uri =
+                        U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
+                    let open_verb = U16CString::from_str("open").unwrap_or_default();
+                    ShellExecuteW(
+                        None,
+                        PCWSTR(open_verb.as_ptr()),
+                        PCWSTR(settings_uri.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+                send_enter_key();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                write_console(&format!("Error: {}", e));
+                send_enter_key();
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if opts.unregister {
+        match unregister_file_association() {
+            Ok(()) => {
+                write_console("MDView file association removed successfully.");
+                send_enter_key();
+                std::process::exit(0);
+            }
+            Err(e) => {
+                write_console(&format!("Error: {}", e));
+                send_enter_key();
+                std::process::exit(1);
+            }
+        }
+    }
+
     // If no file and running in CLI/terminal mode, show help and exit
     if opts.file_path.is_none() && !opts.gui_mode {
         print_usage_console();
@@ -349,13 +415,14 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ,
-    REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
+    REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
 };
 use windows::Win32::UI::Shell::{
-    DragFinish, DragQueryFileW, FileOpenDialog, IFileOpenDialog, ShellExecuteW,
-    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, HDROP, SIGDN_FILESYSPATH,
+    DragFinish, DragQueryFileW, FileOpenDialog, IFileOpenDialog, SHChangeNotify, ShellExecuteW,
+    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, HDROP, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -373,6 +440,11 @@ const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 
 // Registry key for settings
 const REGISTRY_KEY: &str = "Software\\MDView";
+
+// File association registration
+const PROGID: &str = "MDView.Markdown";
+const PROGID_DESCRIPTION: &str = "Markdown Document";
+const APP_DESCRIPTION: &str = "Fast, lightweight Markdown viewer";
 
 // Undocumented uxtheme.dll ordinals for dark mode APIs
 const UXTHEME_ORDINAL_ALLOW_DARK_MODE_FOR_WINDOW: usize = 133;
@@ -919,6 +991,366 @@ fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
     }
 }
 
+// ============================================================================
+// File Association Registration
+// ============================================================================
+
+/// Helper: create a registry key under HKCU and set its default (unnamed) value
+fn reg_create_default(subkey_path: &str, value: &str) -> Result<(), String> {
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> = format!("{}\0", subkey_path).encode_utf16().collect();
+        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
+
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            None,
+            windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            Some(&mut disposition),
+        )
+        .is_err()
+        {
+            return Err(format!("Failed to create key: {}", subkey_path));
+        }
+
+        let data: Vec<u16> = format!("{}\0", value).encode_utf16().collect();
+        let result = RegSetValueExW(
+            hkey,
+            PCWSTR::null(),
+            Some(0),
+            REG_SZ,
+            Some(std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                data.len() * 2,
+            )),
+        );
+        let _ = RegCloseKey(hkey);
+
+        if result.is_err() {
+            return Err(format!("Failed to set value for: {}", subkey_path));
+        }
+        Ok(())
+    }
+}
+
+/// Helper: create a registry key under HKCU and set a named string value
+fn reg_set_named(subkey_path: &str, name: &str, value: &str) -> Result<(), String> {
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> = format!("{}\0", subkey_path).encode_utf16().collect();
+        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
+
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            None,
+            windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            Some(&mut disposition),
+        )
+        .is_err()
+        {
+            return Err(format!("Failed to create key: {}", subkey_path));
+        }
+
+        let name_wide: Vec<u16> = format!("{}\0", name).encode_utf16().collect();
+        let data: Vec<u16> = format!("{}\0", value).encode_utf16().collect();
+        let result = RegSetValueExW(
+            hkey,
+            PCWSTR(name_wide.as_ptr()),
+            Some(0),
+            REG_SZ,
+            Some(std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                data.len() * 2,
+            )),
+        );
+        let _ = RegCloseKey(hkey);
+
+        if result.is_err() {
+            return Err(format!("Failed to set value '{}' for: {}", name, subkey_path));
+        }
+        Ok(())
+    }
+}
+
+/// Register MDView as a handler for .md/.markdown files in the current user's registry
+fn register_file_association() -> Result<(), String> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {}", e))?
+        .to_string_lossy()
+        .to_string();
+
+    // ProgID: Software\Classes\MDView.Markdown
+    reg_create_default(
+        &format!("Software\\Classes\\{}", PROGID),
+        PROGID_DESCRIPTION,
+    )?;
+    reg_create_default(
+        &format!("Software\\Classes\\{}\\DefaultIcon", PROGID),
+        &format!("\"{}\",0", exe_path),
+    )?;
+    reg_create_default(
+        &format!("Software\\Classes\\{}\\shell\\open\\command", PROGID),
+        &format!("\"{}\" \"%1\"", exe_path),
+    )?;
+
+    // OpenWithProgids for .md and .markdown
+    for ext in &[".md", ".markdown"] {
+        reg_set_named(
+            &format!("Software\\Classes\\{}\\OpenWithProgids", ext),
+            PROGID,
+            "",
+        )?;
+    }
+
+    // Capabilities
+    reg_set_named(
+        "Software\\MDView\\Capabilities",
+        "ApplicationDescription",
+        APP_DESCRIPTION,
+    )?;
+    reg_set_named(
+        "Software\\MDView\\Capabilities",
+        "ApplicationName",
+        "MDView",
+    )?;
+    reg_set_named(
+        "Software\\MDView\\Capabilities\\FileAssociations",
+        ".md",
+        PROGID,
+    )?;
+    reg_set_named(
+        "Software\\MDView\\Capabilities\\FileAssociations",
+        ".markdown",
+        PROGID,
+    )?;
+
+    // RegisteredApplications
+    reg_set_named(
+        "Software\\RegisteredApplications",
+        "MDView",
+        "Software\\MDView\\Capabilities",
+    )?;
+
+    // App Paths
+    reg_create_default(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mdview.exe",
+        &exe_path,
+    )?;
+
+    // Notify shell of association change
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+
+    Ok(())
+}
+
+/// Remove MDView file association from the current user's registry
+fn unregister_file_association() -> Result<(), String> {
+    unsafe {
+        // Delete ProgID key tree
+        let subkey: Vec<u16> = format!("Software\\Classes\\{}\0", PROGID)
+            .encode_utf16()
+            .collect();
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()));
+
+        // Remove from OpenWithProgids for .md and .markdown
+        for ext in &[".md", ".markdown"] {
+            let mut hkey = std::mem::zeroed();
+            let owp_path: Vec<u16> = format!("Software\\Classes\\{}\\OpenWithProgids\0", ext)
+                .encode_utf16()
+                .collect();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(owp_path.as_ptr()),
+                Some(0),
+                KEY_WRITE,
+                &mut hkey,
+            )
+            .is_ok()
+            {
+                let name: Vec<u16> = format!("{}\0", PROGID).encode_utf16().collect();
+                let _ = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
+                let _ = RegCloseKey(hkey);
+            }
+        }
+
+        // Delete Capabilities tree
+        let cap_key: Vec<u16> = "Software\\MDView\\Capabilities\0"
+            .encode_utf16()
+            .collect();
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(cap_key.as_ptr()));
+
+        // Remove from RegisteredApplications
+        {
+            let mut hkey = std::mem::zeroed();
+            let ra_path: Vec<u16> = "Software\\RegisteredApplications\0"
+                .encode_utf16()
+                .collect();
+            if RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(ra_path.as_ptr()),
+                Some(0),
+                KEY_WRITE,
+                &mut hkey,
+            )
+            .is_ok()
+            {
+                let name: Vec<u16> = "MDView\0".encode_utf16().collect();
+                let _ = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
+                let _ = RegCloseKey(hkey);
+            }
+        }
+
+        // Delete App Paths
+        let ap_key: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mdview.exe\0"
+                .encode_utf16()
+                .collect();
+        let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(ap_key.as_ptr()));
+
+        // Notify shell
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+
+    Ok(())
+}
+
+/// Check if MDView is registered as a file handler and the command points to the current exe
+fn is_file_association_registered() -> bool {
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> =
+            format!("Software\\Classes\\{}\\shell\\open\\command\0", PROGID)
+                .encode_utf16()
+                .collect();
+
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return false;
+        }
+
+        let mut data = vec![0u16; 1024];
+        let mut data_size = (data.len() * 2) as u32;
+        let mut data_type = REG_VALUE_TYPE::default();
+
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR::null(),
+            None,
+            Some(&mut data_type),
+            Some(data.as_mut_ptr() as *mut u8),
+            Some(&mut data_size),
+        );
+        let _ = RegCloseKey(hkey);
+
+        if result.is_err() {
+            return false;
+        }
+
+        let len = data.iter().position(|&c| c == 0).unwrap_or(data.len());
+        let value = String::from_utf16_lossy(&data[..len]);
+
+        if let Ok(exe_path) = std::env::current_exe() {
+            let exe_str = exe_path.to_string_lossy().to_lowercase();
+            value.to_lowercase().contains(&exe_str)
+        } else {
+            false
+        }
+    }
+}
+
+/// Check if the user has opted out of the registration prompt
+fn should_prompt_registration() -> bool {
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> = format!("{}\0", REGISTRY_KEY).encode_utf16().collect();
+
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_err()
+        {
+            return true;
+        }
+
+        let name_wide: Vec<u16> = "DontAskRegister\0".encode_utf16().collect();
+        let mut value: u32 = 0;
+        let mut size: u32 = 4;
+        let mut data_type = REG_VALUE_TYPE::default();
+
+        let result = RegQueryValueExW(
+            hkey,
+            PCWSTR(name_wide.as_ptr()),
+            None,
+            Some(&mut data_type),
+            Some(&mut value as *mut u32 as *mut u8),
+            Some(&mut size),
+        );
+        let _ = RegCloseKey(hkey);
+
+        !(result.is_ok() && value == 1)
+    }
+}
+
+/// Set the "don't ask again" flag for file association registration
+fn set_dont_ask_register() {
+    unsafe {
+        let mut hkey = std::mem::zeroed();
+        let subkey: Vec<u16> = format!("{}\0", REGISTRY_KEY).encode_utf16().collect();
+        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
+
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            None,
+            windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            Some(&mut disposition),
+        )
+        .is_ok()
+        {
+            let name_wide: Vec<u16> = "DontAskRegister\0".encode_utf16().collect();
+            let value: u32 = 1;
+            let _ = RegSetValueExW(
+                hkey,
+                PCWSTR(name_wide.as_ptr()),
+                Some(0),
+                REG_DWORD,
+                Some(std::slice::from_raw_parts(
+                    &value as *const u32 as *const u8,
+                    4,
+                )),
+            );
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
 fn run_gui(title: &str, html: &str, file_path: Option<&str>) -> windows::core::Result<()> {
     unsafe {
         // Initialize COM for this thread (required for WebView2)
@@ -1081,6 +1513,46 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         // Show window
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
+
+        // Check file association and prompt if not registered
+        if !is_file_association_registered() && should_prompt_registration() {
+            let prompt_title: Vec<u16> = "MDView - File Association\0"
+                .encode_utf16()
+                .collect();
+            let prompt_message: Vec<u16> = concat!(
+                "Would you like to register MDView as a viewer for .md files?\n\n",
+                "This will add MDView to the 'Open With' list.\n",
+                "You can then set it as default in Windows Settings.\n\n",
+                "Choose 'Cancel' to never ask again.\0"
+            )
+            .encode_utf16()
+            .collect();
+
+            let answer = MessageBoxW(
+                Some(hwnd),
+                PCWSTR(prompt_message.as_ptr()),
+                PCWSTR(prompt_title.as_ptr()),
+                MB_YESNOCANCEL | MB_ICONQUESTION,
+            );
+
+            if answer == IDYES {
+                if register_file_association().is_ok() {
+                    let open_verb = U16CString::from_str("open").unwrap_or_default();
+                    let settings_uri =
+                        U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
+                    ShellExecuteW(
+                        Some(hwnd),
+                        PCWSTR(open_verb.as_ptr()),
+                        PCWSTR(settings_uri.as_ptr()),
+                        None,
+                        None,
+                        SW_SHOWNORMAL,
+                    );
+                }
+            } else if answer == IDCANCEL {
+                set_dont_ask_register();
+            }
+        }
 
         // Message loop with accelerator support
         let mut msg = MSG::default();
