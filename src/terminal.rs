@@ -1,6 +1,6 @@
 //! Terminal markdown rendering with ANSI formatting and modern terminal features
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, HeadingLevel, CodeBlockKind};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use std::env;
 
 /// Terminal capabilities detected at runtime
@@ -53,8 +53,10 @@ impl TerminalCaps {
         }
 
         // Check for true color support
-        let true_color = colorterm == "truecolor" || colorterm == "24bit"
-            || term.contains("256color") || term.contains("truecolor")
+        let true_color = colorterm == "truecolor"
+            || colorterm == "24bit"
+            || term.contains("256color")
+            || term.contains("truecolor")
             || cfg!(windows); // Windows Terminal and modern Windows consoles support true color
 
         // Hyperlinks (OSC 8) - only enable for known-good terminals
@@ -331,11 +333,15 @@ impl TerminalRenderer {
                     self.output.push_str(&bullet);
                 }
             }
-            Tag::Link { dest_url, title, .. } => {
+            Tag::Link {
+                dest_url, title, ..
+            } => {
                 self.pending_link = Some((dest_url.to_string(), title.to_string()));
                 self.link_text.clear();
             }
-            Tag::Image { dest_url, title, .. } => {
+            Tag::Image {
+                dest_url, title, ..
+            } => {
                 if self.caps.basic_ansi {
                     self.output.push_str(ansi::DIM);
                 }
@@ -559,7 +565,11 @@ impl TerminalRenderer {
 
     fn task_list_marker(&mut self, checked: bool) {
         let marker = if self.caps.unicode {
-            if checked { unicode::CHECKBOX_CHECKED } else { unicode::CHECKBOX_UNCHECKED }
+            if checked {
+                unicode::CHECKBOX_CHECKED
+            } else {
+                unicode::CHECKBOX_UNCHECKED
+            }
         } else {
             if checked { "[x]" } else { "[ ]" }
         };
@@ -583,7 +593,11 @@ impl TerminalRenderer {
                 self.output.push_str(ansi::FG_GRAY);
             }
             for _ in 0..self.in_block_quote {
-                let bar = if self.caps.unicode { unicode::QUOTE_BAR } else { "|" };
+                let bar = if self.caps.unicode {
+                    unicode::QUOTE_BAR
+                } else {
+                    "|"
+                };
                 self.output.push_str(bar);
                 self.output.push(' ');
             }
@@ -628,11 +642,19 @@ impl TerminalRenderer {
         }
 
         let (h, v, tl, tr, bl, br, cross, td, tu, tleft, tright) = if self.caps.unicode {
-            (unicode::TABLE_HORIZONTAL, unicode::TABLE_VERTICAL,
-             unicode::TABLE_TOP_LEFT, unicode::TABLE_TOP_RIGHT,
-             unicode::TABLE_BOTTOM_LEFT, unicode::TABLE_BOTTOM_RIGHT,
-             unicode::TABLE_CROSS, unicode::TABLE_T_DOWN, unicode::TABLE_T_UP,
-             unicode::TABLE_T_RIGHT, unicode::TABLE_T_LEFT)
+            (
+                unicode::TABLE_HORIZONTAL,
+                unicode::TABLE_VERTICAL,
+                unicode::TABLE_TOP_LEFT,
+                unicode::TABLE_TOP_RIGHT,
+                unicode::TABLE_BOTTOM_LEFT,
+                unicode::TABLE_BOTTOM_RIGHT,
+                unicode::TABLE_CROSS,
+                unicode::TABLE_T_DOWN,
+                unicode::TABLE_T_UP,
+                unicode::TABLE_T_RIGHT,
+                unicode::TABLE_T_LEFT,
+            )
         } else {
             ('-', '|', '+', '+', '+', '+', '+', '+', '+', '+', '+')
         };

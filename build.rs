@@ -12,10 +12,16 @@ fn main() {
         res.set("FileDescription", "MDView - Markdown Viewer")
             .set("ProductName", "MDView")
             .set("CompanyName", "Remko Weijnen")
-            .set("LegalCopyright", "Copyright 2026 Remko Weijnen - Mozilla Public License 2.0")
+            .set(
+                "LegalCopyright",
+                "Copyright 2026 Remko Weijnen - Mozilla Public License 2.0",
+            )
             .set("OriginalFilename", "mdview.exe")
             .set("FileVersion", &format!("{}.{}.{}.0", major, minor, patch))
-            .set("ProductVersion", &format!("{}.{}.{}.0", major, minor, patch));
+            .set(
+                "ProductVersion",
+                &format!("{}.{}.{}.0", major, minor, patch),
+            );
 
         // Add icon if it exists
         if std::path::Path::new("assets/mdview.ico").exists() {
