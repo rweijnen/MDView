@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -24,26 +25,38 @@ fn log_debug(msg: &str) {
 }
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    pwstr_from_str, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    pwstr_from_str,
 };
 use widestring::U16CString;
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{SHCreateMemStream, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::PCWSTR;
 
-const WINDOW_CLASS: &str = "MDViewWebView2Host";
+const WINDOW_CLASS_PREFIX: &str = "MDViewWebView2Host";
+
+fn window_class_name() -> U16CString {
+    let unique = format!("{}_{}", WINDOW_CLASS_PREFIX, window_proc as *const () as usize);
+    U16CString::from_str(&unique).unwrap()
+}
 
 // Thread-local storage for WebView2 controllers (COM objects are single-threaded)
 thread_local! {
     static CONTROLLERS: RefCell<HashMap<isize, Rc<ICoreWebView2Controller>>> = RefCell::new(HashMap::new());
+    static CURRENT_FILES: RefCell<HashMap<isize, String>> = RefCell::new(HashMap::new());
+    static DARK_MODES: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
 }
 
-pub fn create_viewer(parent: HWND, html: &str) -> windows::core::Result<HWND> {
+pub fn create_viewer(
+    parent: HWND,
+    html: &str,
+    file_path: Option<&str>,
+    dark_mode: bool,
+) -> windows::core::Result<HWND> {
     unsafe {
         // Initialize COM if not already initialized (safe to call multiple times)
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -56,7 +69,7 @@ pub fn create_viewer(parent: HWND, html: &str) -> windows::core::Result<HWND> {
         let _ = GetClientRect(parent, &mut rect);
 
         // Create host window
-        let class_name = U16CString::from_str(WINDOW_CLASS).unwrap();
+        let class_name = window_class_name();
         let hinstance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -73,8 +86,24 @@ pub fn create_viewer(parent: HWND, html: &str) -> windows::core::Result<HWND> {
             None,
         )?;
 
+        if let Some(file_path) = file_path {
+            CURRENT_FILES.with(|f| {
+                f.borrow_mut()
+                    .insert(hwnd.0 as isize, file_path.to_string());
+            });
+        }
+        DARK_MODES.with(|m| {
+            m.borrow_mut().insert(hwnd.0 as isize, dark_mode);
+        });
+
         // Initialize WebView2 synchronously
         if let Err(e) = init_webview2_sync(hwnd, html) {
+            CURRENT_FILES.with(|f| {
+                f.borrow_mut().remove(&(hwnd.0 as isize));
+            });
+            DARK_MODES.with(|m| {
+                m.borrow_mut().remove(&(hwnd.0 as isize));
+            });
             let _ = DestroyWindow(hwnd);
             return Err(e);
         }
@@ -85,7 +114,7 @@ pub fn create_viewer(parent: HWND, html: &str) -> windows::core::Result<HWND> {
 
 fn register_window_class() -> windows::core::Result<()> {
     unsafe {
-        let class_name = U16CString::from_str(WINDOW_CLASS).unwrap();
+        let class_name = window_class_name();
         let hinstance = GetModuleHandleW(None)?;
 
         let wc = WNDCLASSEXW {
@@ -105,11 +134,170 @@ fn register_window_class() -> windows::core::Result<()> {
     }
 }
 
+fn absolute_path(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+fn get_path_root(path: &Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let absolute = absolute_path(path)?;
+    let mut components = absolute.components();
+
+    match components.next()? {
+        Component::Prefix(prefix) => {
+            if !matches!(components.next(), Some(Component::RootDir)) {
+                return None;
+            }
+
+            let mut root = std::path::PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR.to_string());
+            Some(root)
+        }
+        Component::RootDir => Some(std::path::PathBuf::from(
+            std::path::MAIN_SEPARATOR.to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn path_relative_to_root(path: &Path) -> Option<String> {
+    use std::path::Component;
+
+    let absolute = absolute_path(path)?;
+    let mut saw_root = false;
+    let mut parts = Vec::new();
+
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) => {}
+            Component::RootDir => saw_root = true,
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = parts.pop();
+            }
+        }
+    }
+
+    if !saw_root {
+        return None;
+    }
+
+    Some(parts.join("/"))
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+
+    encoded
+}
+
+fn virtual_url_for_file(path: &Path) -> Option<String> {
+    let relative = path_relative_to_root(path)?;
+    Some(format!(
+        "https://mdview.example/{}",
+        percent_encode_path(&relative)
+    ))
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+}
+
+fn create_web_resource_response(
+    environment: &ICoreWebView2Environment,
+    bytes: &[u8],
+    status_code: i32,
+    reason: &str,
+    content_type: &str,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let stream = unsafe { SHCreateMemStream(Some(bytes)) }?;
+    let reason_wide = pwstr_from_str(reason);
+    let headers = format!(
+        "Content-Type: {}\r\nAccess-Control-Allow-Origin: *",
+        content_type
+    );
+    let headers_wide = pwstr_from_str(&headers);
+    unsafe {
+        environment
+            .CreateWebResourceResponse(
+                &stream,
+                status_code,
+                PCWSTR(reason_wide.as_ptr()),
+                PCWSTR(headers_wide.as_ptr()),
+            )
+            .ok()
+    }
+}
+
+fn create_not_found_response(
+    environment: &ICoreWebView2Environment,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    create_web_resource_response(
+        environment,
+        b"Not found",
+        404,
+        "Not Found",
+        "text/plain; charset=utf-8",
+    )
+}
+
+fn create_virtual_resource_response(
+    environment: &ICoreWebView2Environment,
+    file_path: &Path,
+    dark_mode: bool,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if ext == "md" || ext == "markdown" {
+        let markdown_content = std::fs::read_to_string(file_path).ok()?;
+        let html_body = crate::markdown::markdown_to_html(&markdown_content);
+        let full_html = crate::markdown::wrap_html(&html_body, dark_mode);
+        create_web_resource_response(
+            environment,
+            full_html.as_bytes(),
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+        )
+    } else {
+        let bytes = std::fs::read(file_path).ok()?;
+        create_web_resource_response(
+            environment,
+            &bytes,
+            200,
+            "OK",
+            content_type_for_path(file_path),
+        )
+    }
+}
+
 fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     log_debug(&format!("init_webview2_sync started, hwnd={:?}", hwnd.0));
 
     let html_owned = html.to_string();
-    let controller_result: Rc<RefCell<Option<ICoreWebView2Controller>>> = Rc::new(RefCell::new(None));
+    let controller_result: Rc<RefCell<Option<ICoreWebView2Controller>>> =
+        Rc::new(RefCell::new(None));
     let error_result: Rc<RefCell<Option<windows::core::Error>>> = Rc::new(RefCell::new(None));
     let completed = Rc::new(RefCell::new(false));
 
@@ -121,7 +309,10 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     log_debug("Creating environment handler");
     let env_handler = CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
         move |error_code, environment| {
-            log_debug(&format!("Environment callback fired, error_code={:?}", error_code));
+            log_debug(&format!(
+                "Environment callback fired, error_code={:?}",
+                error_code
+            ));
             let environment = match environment {
                 Some(env) => env,
                 None => {
@@ -137,12 +328,16 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
             let error_inner = error_clone.clone();
             let completed_inner = completed_clone.clone();
             let html_for_nav = html_owned.clone();
+            let environment_for_resources = environment.clone();
 
             // Create the controller
             log_debug("Creating controller handler");
             let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
                 move |error_code, controller| {
-                    log_debug(&format!("Controller callback fired, error_code={:?}", error_code));
+                    log_debug(&format!(
+                        "Controller callback fired, error_code={:?}",
+                        error_code
+                    ));
                     let controller = match controller {
                         Some(ctrl) => ctrl,
                         None => {
@@ -168,6 +363,7 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             // Configure settings for a secure, read-only viewer
                             if let Ok(settings) = webview.Settings() {
                                 let _ = settings.SetIsScriptEnabled(true); // needed for Ctrl+click and ESC handling
+                                let _ = settings.SetIsWebMessageEnabled(true); // needed for link clicks and ESC handling
                                 let _ = settings.SetAreDefaultContextMenusEnabled(false); // disable right-click menu
                                 let _ = settings.SetAreDevToolsEnabled(false); // disable F12 dev tools
                                 let _ = settings.SetIsStatusBarEnabled(false); // disable status bar
@@ -176,34 +372,128 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 // Zoom control left enabled for accessibility (Ctrl+scroll)
                             }
 
-                            // Navigate to HTML directly
-                            let html_wide = pwstr_from_str(&html_for_nav);
-                            let _ = webview.NavigateToString(PCWSTR(html_wide.as_ptr()));
+                            let filter = pwstr_from_str("https://mdview.example/*");
+                            let _ = webview.AddWebResourceRequestedFilter(
+                                PCWSTR(filter.as_ptr()),
+                                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                            );
 
-                            // Add message handler for Ctrl+click links and ESC to close
-                            let parent_hwnd = hwnd;
+                            let resource_environment = environment_for_resources.clone();
+                            let resource_handler =
+                                webview2_com::WebResourceRequestedEventHandler::create(Box::new(
+                                    move |_webview, args| {
+                                        if let Some(args) = args {
+                                            if let Ok(request) = args.Request() {
+                                                let mut uri_ptr: windows::core::PWSTR =
+                                                    windows::core::PWSTR::null();
+                                                if request.Uri(&mut uri_ptr).is_ok()
+                                                    && !uri_ptr.is_null()
+                                                {
+                                                    let uri =
+                                                        uri_ptr.to_string().unwrap_or_default();
+                                                    windows::Win32::System::Com::CoTaskMemFree(
+                                                        Some(uri_ptr.0 as *const _),
+                                                    );
+                                                    if let Some(response) =
+                                                        create_response_for_virtual_url(
+                                                            hwnd,
+                                                            &resource_environment,
+                                                            &uri,
+                                                        )
+                                                    {
+                                                        let _ = args.SetResponse(&response);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    },
+                                ));
+                            let mut resource_token: i64 = 0;
+                            let _ = webview
+                                .add_WebResourceRequested(&resource_handler, &mut resource_token);
+
+                            let nav_handler = webview2_com::NavigationStartingEventHandler::create(
+                                Box::new(move |_webview, args| {
+                                    if let Some(args) = args {
+                                        let mut uri_ptr: windows::core::PWSTR =
+                                            windows::core::PWSTR::null();
+                                        let mut user_initiated = windows::core::BOOL(0);
+                                        if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                            let uri = uri_ptr.to_string().unwrap_or_default();
+                                            let _ = args.IsUserInitiated(&mut user_initiated);
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                uri_ptr.0 as *const _,
+                                            ));
+                                            if !should_allow_webview_navigation(
+                                                &uri,
+                                                user_initiated.as_bool(),
+                                            ) {
+                                                let _ = args.SetCancel(true);
+                                                open_url_in_browser(&uri);
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                }),
+                            );
+                            let mut nav_token: i64 = 0;
+                            let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
+
+                            if let Some(current_file) =
+                                CURRENT_FILES.with(|f| f.borrow().get(&(hwnd.0 as isize)).cloned())
+                            {
+                                if let Some(url) = virtual_url_for_file(Path::new(&current_file)) {
+                                    let url_wide = pwstr_from_str(&url);
+                                    let _ = webview.Navigate(PCWSTR(url_wide.as_ptr()));
+                                }
+                            } else {
+                                let html_wide = pwstr_from_str(&html_for_nav);
+                                let _ = webview.NavigateToString(PCWSTR(html_wide.as_ptr()));
+                            }
+
+                            // Add message handler for link clicks and ESC to close
+                            let viewer_hwnd = hwnd;
                             let handler = webview2_com::WebMessageReceivedEventHandler::create(
                                 Box::new(move |_webview, args| {
                                     if let Some(args) = args {
-                                        let mut message_ptr: windows::core::PWSTR = windows::core::PWSTR::null();
-                                        if args.WebMessageAsJson(&mut message_ptr).is_ok() && !message_ptr.is_null() {
-                                            let msg_str = message_ptr.to_string().unwrap_or_default();
-                                            windows::Win32::System::Com::CoTaskMemFree(Some(message_ptr.0 as *const _));
+                                        let mut message_ptr: windows::core::PWSTR =
+                                            windows::core::PWSTR::null();
+                                        if args.WebMessageAsJson(&mut message_ptr).is_ok()
+                                            && !message_ptr.is_null()
+                                        {
+                                            let msg_str =
+                                                message_ptr.to_string().unwrap_or_default();
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                message_ptr.0 as *const _,
+                                            ));
 
                                             if msg_str.contains("\"close\"") {
                                                 // Send WM_CLOSE to parent (TC lister window)
-                                                if let Ok(parent) = GetParent(parent_hwnd) {
+                                                if let Ok(parent) = GetParent(viewer_hwnd) {
                                                     if !parent.is_invalid() {
-                                                        let _ = PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0));
+                                                        let _ = PostMessageW(
+                                                            Some(parent),
+                                                            WM_CLOSE,
+                                                            WPARAM(0),
+                                                            LPARAM(0),
+                                                        );
                                                     }
                                                 }
-                                            } else if msg_str.contains("openLink") {
-                                                if let Some(start) = msg_str.find("\"url\":\"") {
-                                                    let url_start = start + 7;
-                                                    if let Some(end) = msg_str[url_start..].find('"') {
-                                                        let url = &msg_str[url_start..url_start + end];
-                                                        // Open URL in default browser
-                                                        open_url_in_browser(url);
+                                            } else if let Some(start) = msg_str.find("\"url\":\"") {
+                                                let url_start = start + 7;
+                                                if let Some(end) = msg_str[url_start..].find('"') {
+                                                    let url = msg_str[url_start..url_start + end]
+                                                        .replace("\\\\", "\\")
+                                                        .replace("\\/", "/");
+
+                                                    if msg_str.contains("openLink") {
+                                                        open_resolved_or_external_url(
+                                                            viewer_hwnd,
+                                                            &url,
+                                                        );
+                                                    } else if msg_str.contains("followLink") {
+                                                        handle_follow_link(viewer_hwnd, &url);
                                                     }
                                                 }
                                             }
@@ -223,12 +513,16 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 if let Some(args) = args {
                                     use windows::Win32::UI::Input::KeyboardAndMouse::*;
                                     let mut key: u32 = 0;
-                                    let mut key_event_kind: COREWEBVIEW2_KEY_EVENT_KIND = COREWEBVIEW2_KEY_EVENT_KIND::default();
+                                    let mut key_event_kind: COREWEBVIEW2_KEY_EVENT_KIND =
+                                        COREWEBVIEW2_KEY_EVENT_KIND::default();
 
-                                    if args.VirtualKey(&mut key).is_ok() && args.KeyEventKind(&mut key_event_kind).is_ok() {
+                                    if args.VirtualKey(&mut key).is_ok()
+                                        && args.KeyEventKind(&mut key_event_kind).is_ok()
+                                    {
                                         // Only handle key down events
                                         if key_event_kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
-                                            || key_event_kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                                            || key_event_kind
+                                                == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
                                         {
                                             // Pass F3, F5, F7, N keys to parent (Total Commander)
                                             let pass_to_parent = matches!(
@@ -258,7 +552,8 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             }),
                         );
                         let mut accel_token: i64 = 0;
-                        let _ = controller.add_AcceleratorKeyPressed(&accel_handler, &mut accel_token);
+                        let _ =
+                            controller.add_AcceleratorKeyPressed(&accel_handler, &mut accel_token);
                     }
 
                     log_debug("Storing controller and marking complete");
@@ -285,7 +580,12 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     let user_data_wide = pwstr_from_str(&user_data_folder);
     log_debug("Calling CreateCoreWebView2EnvironmentWithOptions");
     unsafe {
-        let _ = CreateCoreWebView2EnvironmentWithOptions(None, PCWSTR(user_data_wide.as_ptr()), None, &env_handler);
+        let _ = CreateCoreWebView2EnvironmentWithOptions(
+            None,
+            PCWSTR(user_data_wide.as_ptr()),
+            None,
+            &env_handler,
+        );
     }
     log_debug("CreateCoreWebView2EnvironmentWithOptions returned, entering message loop");
 
@@ -306,7 +606,11 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
 
             // Log every 100 iterations
             if loop_count % 100 == 0 {
-                log_debug(&format!("Message loop iteration {}, elapsed={:?}", loop_count, start.elapsed()));
+                log_debug(&format!(
+                    "Message loop iteration {}, elapsed={:?}",
+                    loop_count,
+                    start.elapsed()
+                ));
             }
 
             let mut msg = MSG::default();
@@ -324,7 +628,11 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
             }
         }
     }
-    log_debug(&format!("Message loop exited, completed={}, loop_count={}", *completed.borrow(), loop_count));
+    log_debug(&format!(
+        "Message loop exited, completed={}, loop_count={}",
+        *completed.borrow(),
+        loop_count
+    ));
 
     // Check for errors
     if let Some(err) = error_result.borrow_mut().take() {
@@ -341,6 +649,35 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     Ok(())
 }
 
+fn cleanup_viewer_state(hwnd: HWND) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow_mut().remove(&(hwnd.0 as isize)) {
+            let _ = unsafe { controller.Close() };
+        }
+    });
+    CURRENT_FILES.with(|f| {
+        f.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+    DARK_MODES.with(|m| {
+        m.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+}
+
+fn unregister_window_class_if_unused() {
+    let no_controllers = CONTROLLERS.with(|c| c.borrow().is_empty());
+    let no_current_files = CURRENT_FILES.with(|f| f.borrow().is_empty());
+    let no_dark_modes = DARK_MODES.with(|m| m.borrow().is_empty());
+
+    if no_controllers && no_current_files && no_dark_modes {
+        unsafe {
+            if let Ok(hinstance) = GetModuleHandleW(None) {
+                let class_name = window_class_name();
+                let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), Some(hinstance.into()));
+            }
+        }
+    }
+}
+
 pub fn close_window(hwnd: HWND) {
     // Remove and close the controller
     CONTROLLERS.with(|c| {
@@ -349,7 +686,7 @@ pub fn close_window(hwnd: HWND) {
         }
     });
 
-    // Destroy the window
+    // Destroy the window; final state cleanup happens in WM_NCDESTROY
     let _ = unsafe { DestroyWindow(hwnd) };
 }
 
@@ -387,11 +724,194 @@ unsafe extern "system" fn window_proc(
             resize_webview(hwnd);
             LRESULT(0)
         }
-        WM_DESTROY => {
-            LRESULT(0)
+        WM_DESTROY => LRESULT(0),
+        WM_NCDESTROY => {
+            cleanup_viewer_state(hwnd);
+            unregister_window_class_if_unused();
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn percent_decode_repeated(input: &str) -> String {
+    let mut current = input.to_string();
+
+    for _ in 0..3 {
+        let decoded = percent_decode(&current);
+        if decoded == current {
+            break;
+        }
+        current = decoded;
+    }
+
+    current
+}
+
+fn resolve_current_relative_path(hwnd: HWND, path: &str) -> Option<String> {
+    CURRENT_FILES.with(|f| {
+        let files = f.borrow();
+        let current_path = files.get(&(hwnd.0 as isize))?;
+        let base_dir = Path::new(current_path).parent()?;
+        let target = base_dir.join(path);
+        target
+            .canonicalize()
+            .ok()
+            .map(|p| p.to_string_lossy().to_string())
+    })
+}
+
+fn resolve_virtual_mdview_url(hwnd: HWND, url: &str) -> Option<String> {
+    let relative_path = url
+        .strip_prefix("https://mdview.example/")
+        .or_else(|| url.strip_prefix("http://mdview.example/"))?
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+
+    if relative_path.is_empty() {
+        return None;
+    }
+
+    let decoded_path = percent_decode_repeated(relative_path);
+
+    CURRENT_FILES.with(|f| {
+        let files = f.borrow();
+        let current_path = files.get(&(hwnd.0 as isize))?;
+        let root_dir = get_path_root(Path::new(current_path))?;
+        let target = root_dir.join(decoded_path);
+        Some(target.to_string_lossy().to_string())
+    })
+}
+
+fn create_response_for_virtual_url(
+    hwnd: HWND,
+    environment: &ICoreWebView2Environment,
+    url: &str,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let resolved_path = resolve_virtual_mdview_url(hwnd, url)?;
+    let file_path = Path::new(&resolved_path);
+    if !file_path.exists() {
+        return create_not_found_response(environment);
+    }
+
+    let dark_mode =
+        DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    create_virtual_resource_response(environment, file_path, dark_mode)
+}
+
+fn is_internal_virtual_url(url: &str) -> bool {
+    url.starts_with("https://mdview.example/") || url.starts_with("http://mdview.example/")
+}
+
+fn should_allow_webview_navigation(url: &str, user_initiated: bool) -> bool {
+    !user_initiated
+        || is_internal_virtual_url(url)
+        || url == "about:blank"
+        || url.starts_with("about:blank#")
+        || url.starts_with("data:")
+}
+
+fn open_resolved_or_external_url(hwnd: HWND, url: &str) {
+    if let Some(resolved_path) = resolve_virtual_mdview_url(hwnd, url) {
+        open_url_in_browser(&resolved_path);
+    } else {
+        open_url_in_browser(url);
+    }
+}
+
+fn load_file_into_viewer(hwnd: HWND, file_path: &str) {
+    if std::fs::metadata(file_path).is_err() {
+        return;
+    }
+
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                if let Some(url) = virtual_url_for_file(Path::new(file_path)) {
+                    let url_wide = pwstr_from_str(&url);
+                    let _ = unsafe { webview.Navigate(PCWSTR(url_wide.as_ptr())) };
+                }
+            }
+        }
+    });
+
+    CURRENT_FILES.with(|f| {
+        f.borrow_mut()
+            .insert(hwnd.0 as isize, file_path.to_string());
+    });
+}
+
+fn handle_follow_link(hwnd: HWND, url: &str) {
+    if let Some(resolved_path) = resolve_virtual_mdview_url(hwnd, url) {
+        let ext = Path::new(&resolved_path)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        if ext == "md" || ext == "markdown" {
+            load_file_into_viewer(hwnd, &resolved_path);
+            return;
+        }
+
+        open_url_in_browser(&resolved_path);
+        return;
+    }
+
+    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
+        open_url_in_browser(url);
+        return;
+    }
+
+    let path_part = url.split('#').next().unwrap_or(url);
+    let ext = Path::new(path_part)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    if ext == "md" || ext == "markdown" {
+        if let Some(resolved_path) = resolve_current_relative_path(hwnd, path_part) {
+            load_file_into_viewer(hwnd, &resolved_path);
+            return;
+        }
+    }
+
+    if let Some(resolved_path) = resolve_current_relative_path(hwnd, path_part) {
+        open_url_in_browser(&resolved_path);
+        return;
+    }
+
+    open_url_in_browser(url);
 }
 
 fn open_url_in_browser(url: &str) {

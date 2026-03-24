@@ -1,4 +1,4 @@
-use pulldown_cmark::{html, Options, Parser};
+use pulldown_cmark::{Options, Parser, html};
 
 pub fn markdown_to_html(markdown: &str) -> String {
     let mut options = Options::empty();
@@ -8,6 +8,7 @@ pub fn markdown_to_html(markdown: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
 
     let parser = Parser::new_ext(markdown, options);
+
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
     html_output
@@ -19,6 +20,11 @@ pub fn wrap_html(content: &str, dark_mode: bool) -> String {
     let code_bg = if dark_mode { "#2d2d2d" } else { "#f6f8fa" };
     let link_color = if dark_mode { "#58a6ff" } else { "#0366d6" };
     let border_color = if dark_mode { "#444" } else { "#e1e4e8" };
+    let content = content
+        .replace("src=\"/", "src=\"")
+        .replace("href=\"/", "href=\"")
+        .replace("src='/", "src='")
+        .replace("href='/", "href='");
 
     format!(
         r#"<!DOCTYPE html>
@@ -94,24 +100,85 @@ a {{ cursor: pointer; }}
 <body>
 {content}
 <script>
-document.addEventListener('click', function(e) {{
-    var link = e.target.closest('a');
-    if (link) {{
-        var href = link.getAttribute('href');
-        if (!href || href.charAt(0) === '#') return;
-        e.preventDefault();
-        if (e.ctrlKey) {{
-            window.chrome.webview.postMessage({{type: 'openLink', url: href}});
-        }} else {{
-            window.chrome.webview.postMessage({{type: 'followLink', url: href}});
+(function() {{
+    function slugify(text) {{
+        return (text || '')
+            .toLowerCase()
+            .trim()
+            .replace(/[\s]+/g, '-')
+            .replace(/[^a-z0-9\-_]/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^-|-$/g, '');
+    }}
+
+    function assignHeadingIds() {{
+        var seen = Object.create(null);
+        document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach(function(heading) {{
+            if (heading.id) return;
+
+            var baseId = slugify(heading.textContent);
+            if (!baseId) return;
+
+            var id = baseId;
+            var counter = 1;
+            while (seen[id] || document.getElementById(id)) {{
+                counter += 1;
+                id = baseId + '-' + counter;
+            }}
+
+            seen[id] = true;
+            heading.id = id;
+        }});
+    }}
+
+    function scrollToHash(hash) {{
+        if (!hash || hash.charAt(0) !== '#') return false;
+
+        var id = decodeURIComponent(hash.slice(1));
+        if (!id) return false;
+
+        var target = document.getElementById(id);
+        if (!target) return false;
+
+        target.scrollIntoView();
+        if (history && history.replaceState) {{
+            history.replaceState(null, '', hash);
         }}
+        return true;
     }}
-}});
-document.addEventListener('keydown', function(e) {{
-    if (e.key === 'Escape') {{
-        window.chrome.webview.postMessage({{type: 'close'}});
+
+    assignHeadingIds();
+    if (location.hash) {{
+        scrollToHash(location.hash);
     }}
-}});
+
+    document.addEventListener('click', function(e) {{
+        var link = e.target.closest('a');
+        var webview = window.chrome && window.chrome.webview;
+        if (!link) return;
+
+        var href = link.getAttribute('href');
+        if (!href) return;
+
+        if (href.charAt(0) === '#') {{
+            e.preventDefault();
+            scrollToHash(href);
+            return;
+        }}
+
+        if (webview && e.ctrlKey) {{
+            e.preventDefault();
+            webview.postMessage({{type: 'openLink', url: link.href || href}});
+        }}
+    }});
+
+    document.addEventListener('keydown', function(e) {{
+        var webview = window.chrome && window.chrome.webview;
+        if (e.key === 'Escape' && webview) {{
+            webview.postMessage({{type: 'close'}});
+        }}
+    }});
+}})();
 </script>
 </body>
 </html>"#
@@ -174,5 +241,14 @@ mod tests {
         let html = markdown_to_html(md);
         assert!(html.contains("<code"));
         assert!(html.contains("fn main()"));
+    }
+
+    #[test]
+    fn test_preserve_relative_urls() {
+        let md = "[Guide](../README.md#top)\n\n![Img](../assets/screenshot.png)\n\n[Top](#top)";
+        let html = markdown_to_html(md);
+        assert!(html.contains("href=\"../README.md#top\""));
+        assert!(html.contains("src=\"../assets/screenshot.png\""));
+        assert!(html.contains("href=\"#top\""));
     }
 }

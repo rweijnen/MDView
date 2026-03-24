@@ -83,18 +83,28 @@ fn parse_args(has_console: bool) -> Result<Options, String> {
         if opts.register && opts.unregister {
             return Err("--register and --unregister are mutually exclusive".to_string());
         }
-        let other_flags = opts.html_full as u8 + opts.html_body as u8 + opts.plain_text as u8
-            + opts.terminal_mode as u8 + opts.gui_mode as u8;
+        let other_flags = opts.html_full as u8
+            + opts.html_body as u8
+            + opts.plain_text as u8
+            + opts.terminal_mode as u8
+            + opts.gui_mode as u8;
         if other_flags > 0 || opts.file_path.is_some() {
-            return Err("--register and --unregister cannot be combined with other options".to_string());
+            return Err(
+                "--register and --unregister cannot be combined with other options".to_string(),
+            );
         }
         return Ok(opts);
     }
 
     // Validate mutually exclusive options
-    let cli_format_count = opts.html_full as u8 + opts.html_body as u8 + opts.plain_text as u8 + opts.terminal_mode as u8;
+    let cli_format_count = opts.html_full as u8
+        + opts.html_body as u8
+        + opts.plain_text as u8
+        + opts.terminal_mode as u8;
     if cli_format_count > 1 {
-        return Err("Options --term, --html, --body, and --text are mutually exclusive".to_string());
+        return Err(
+            "Options --term, --html, --body, and --text are mutually exclusive".to_string(),
+        );
     }
 
     // Default behavior based on whether we have a console (terminal) or not (double-clicked)
@@ -114,16 +124,26 @@ fn parse_args(has_console: bool) -> Result<Options, String> {
 /// Detect if Windows is using dark mode (apps theme)
 fn is_windows_dark_mode() -> bool {
     use windows::Win32::System::Registry::{
-        RegOpenKeyExW, RegQueryValueExW, RegCloseKey, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
+        HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
     };
     use windows::core::PCWSTR;
 
     unsafe {
         let mut hkey = std::mem::zeroed();
-        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-            .encode_utf16().collect();
+        let subkey: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+                .encode_utf16()
+                .collect();
 
-        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), Some(0), KEY_READ, &mut hkey).is_ok() {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            Some(0),
+            KEY_READ,
+            &mut hkey,
+        )
+        .is_ok()
+        {
             let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
             let mut data: u32 = 1;
             let mut data_size: u32 = std::mem::size_of::<u32>() as u32;
@@ -151,14 +171,14 @@ fn is_windows_dark_mode() -> bool {
 /// Try to attach to parent process console for CLI output
 /// Returns true if successfully attached (meaning we were launched from a terminal)
 fn attach_console() -> bool {
-    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS).is_ok() }
 }
 
 /// Write text directly to console and print newline to "complete" the prompt line
 fn write_console(text: &str) {
-    use windows::Win32::System::Console::{GetStdHandle, WriteConsoleW, STD_OUTPUT_HANDLE};
+    use windows::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE, WriteConsoleW};
 
     unsafe {
         if let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) {
@@ -178,8 +198,8 @@ fn write_console(text: &str) {
 /// This allows legacy cmd.exe to process ANSI escape codes
 fn enable_virtual_terminal_processing() {
     use windows::Win32::System::Console::{
-        GetConsoleMode, SetConsoleMode, GetStdHandle,
-        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
     };
 
     unsafe {
@@ -198,7 +218,7 @@ fn enable_virtual_terminal_processing() {
 fn send_enter_key() {
     use windows::Win32::System::Console::GetConsoleWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_RETURN,
+        INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VK_RETURN,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
@@ -386,35 +406,35 @@ fn main() {
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    pwstr_from_str, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    pwstr_from_str,
 };
-use windows::core::Interface;
 use widestring::U16CString;
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
-    COINIT_APARTMENTTHREADED,
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+    CoUninitialize,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
-    RegQueryValueExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE,
-    REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
-};
-use windows::Win32::UI::Shell::{
-    DragFinish, DragQueryFileW, FileOpenDialog, IApplicationAssociationRegistrationUI,
-    IFileOpenDialog, SHChangeNotify, ShellExecuteW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, HDROP,
-    SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SIGDN_FILESYSPATH,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_CREATE_KEY_DISPOSITION, REG_DWORD, REG_SZ,
+    REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+use windows::Win32::UI::Shell::{
+    DragFinish, DragQueryFileW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog, HDROP,
+    IApplicationAssociationRegistrationUI, IFileOpenDialog, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
+    SHChangeNotify, SHCreateMemStream, SIGDN_FILESYSPATH, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::Interface;
+use windows::core::PCWSTR;
 
 const WINDOW_CLASS: &str = "MDViewWindow";
 
@@ -458,16 +478,19 @@ fn set_preferred_app_mode_dark() {
     unsafe {
         let uxtheme: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
         if let Ok(hmodule) = LoadLibraryW(PCWSTR(uxtheme.as_ptr())) {
-            if let Some(set_preferred_app_mode) =
-                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8))
-            {
-                let func: extern "system" fn(i32) -> i32 = std::mem::transmute(set_preferred_app_mode);
+            if let Some(set_preferred_app_mode) = GetProcAddress(
+                hmodule,
+                windows::core::PCSTR(UXTHEME_ORDINAL_SET_PREFERRED_APP_MODE as *const u8),
+            ) {
+                let func: extern "system" fn(i32) -> i32 =
+                    std::mem::transmute(set_preferred_app_mode);
                 func(PREFERRED_APP_MODE_FORCE_DARK);
             }
             // Flush menu themes to apply the change
-            if let Some(flush_menu_themes) =
-                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8))
-            {
+            if let Some(flush_menu_themes) = GetProcAddress(
+                hmodule,
+                windows::core::PCSTR(UXTHEME_ORDINAL_FLUSH_MENU_THEMES as *const u8),
+            ) {
                 let func: extern "system" fn() = std::mem::transmute(flush_menu_themes);
                 func();
             }
@@ -482,10 +505,12 @@ fn allow_dark_mode_for_window(hwnd: HWND) {
     unsafe {
         let uxtheme: Vec<u16> = "uxtheme.dll\0".encode_utf16().collect();
         if let Ok(hmodule) = LoadLibraryW(PCWSTR(uxtheme.as_ptr())) {
-            if let Some(allow_dark_mode) =
-                GetProcAddress(hmodule, windows::core::PCSTR(UXTHEME_ORDINAL_ALLOW_DARK_MODE_FOR_WINDOW as *const u8))
-            {
-                let func: extern "system" fn(isize, bool) -> bool = std::mem::transmute(allow_dark_mode);
+            if let Some(allow_dark_mode) = GetProcAddress(
+                hmodule,
+                windows::core::PCSTR(UXTHEME_ORDINAL_ALLOW_DARK_MODE_FOR_WINDOW as *const u8),
+            ) {
+                let func: extern "system" fn(isize, bool) -> bool =
+                    std::mem::transmute(allow_dark_mode);
                 func(hwnd.0 as isize, true);
             }
         }
@@ -493,7 +518,13 @@ fn allow_dark_mode_for_window(hwnd: HWND) {
 }
 
 /// Helper to insert a native menu item at a position
-fn insert_menu_item(menu: HMENU, position: u32, id: u32, text: &str, is_grayed: bool) -> windows::core::Result<()> {
+fn insert_menu_item(
+    menu: HMENU,
+    position: u32,
+    id: u32,
+    text: &str,
+    is_grayed: bool,
+) -> windows::core::Result<()> {
     unsafe {
         let text_wide: Vec<u16> = format!("{}\0", text).encode_utf16().collect();
         let flags = if is_grayed {
@@ -501,7 +532,13 @@ fn insert_menu_item(menu: HMENU, position: u32, id: u32, text: &str, is_grayed: 
         } else {
             MF_BYPOSITION | MF_STRING
         };
-        InsertMenuW(menu, position, flags, id as usize, PCWSTR(text_wide.as_ptr()))?;
+        InsertMenuW(
+            menu,
+            position,
+            flags,
+            id as usize,
+            PCWSTR(text_wide.as_ptr()),
+        )?;
         Ok(())
     }
 }
@@ -515,29 +552,69 @@ fn create_menu() -> windows::core::Result<HMENU> {
 
         // File menu items (native Windows menus for proper dark mode styling)
         let open_text: Vec<u16> = "&Open\tCtrl+O\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_OPEN as usize, PCWSTR(open_text.as_ptr()))?;
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_FILE_OPEN as usize,
+            PCWSTR(open_text.as_ptr()),
+        )?;
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let recent_text: Vec<u16> = "Recent Files\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING | MF_GRAYED, 0, PCWSTR(recent_text.as_ptr()))?;
+        AppendMenuW(
+            file_menu,
+            MF_STRING | MF_GRAYED,
+            0,
+            PCWSTR(recent_text.as_ptr()),
+        )?;
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let register_text: Vec<u16> = "Register as .md Viewer...\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_REGISTER as usize, PCWSTR(register_text.as_ptr()))?;
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_FILE_REGISTER as usize,
+            PCWSTR(register_text.as_ptr()),
+        )?;
         let unregister_text: Vec<u16> = "Unregister as .md Viewer\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_UNREGISTER as usize, PCWSTR(unregister_text.as_ptr()))?;
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_FILE_UNREGISTER as usize,
+            PCWSTR(unregister_text.as_ptr()),
+        )?;
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let exit_text: Vec<u16> = "E&xit\0".encode_utf16().collect();
-        AppendMenuW(file_menu, MF_STRING, IDM_FILE_EXIT as usize, PCWSTR(exit_text.as_ptr()))?;
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_FILE_EXIT as usize,
+            PCWSTR(exit_text.as_ptr()),
+        )?;
 
         // Help menu items (native Windows menus)
         let about_text: Vec<u16> = "&About MDView\0".encode_utf16().collect();
-        AppendMenuW(help_menu, MF_STRING, IDM_HELP_ABOUT as usize, PCWSTR(about_text.as_ptr()))?;
+        AppendMenuW(
+            help_menu,
+            MF_STRING,
+            IDM_HELP_ABOUT as usize,
+            PCWSTR(about_text.as_ptr()),
+        )?;
 
         // Add submenus to menu bar
         let file_text: Vec<u16> = "&File\0".encode_utf16().collect();
-        AppendMenuW(menu_bar, MF_POPUP, file_menu.0 as usize, PCWSTR(file_text.as_ptr()))?;
+        AppendMenuW(
+            menu_bar,
+            MF_POPUP,
+            file_menu.0 as usize,
+            PCWSTR(file_text.as_ptr()),
+        )?;
 
         let help_text: Vec<u16> = "&Help\0".encode_utf16().collect();
-        AppendMenuW(menu_bar, MF_POPUP, help_menu.0 as usize, PCWSTR(help_text.as_ptr()))?;
+        AppendMenuW(
+            menu_bar,
+            MF_POPUP,
+            help_menu.0 as usize,
+            PCWSTR(help_text.as_ptr()),
+        )?;
 
         Ok(menu_bar)
     }
@@ -546,13 +623,11 @@ fn create_menu() -> windows::core::Result<HMENU> {
 /// Create accelerator table for keyboard shortcuts
 fn create_accelerators() -> windows::core::Result<HACCEL> {
     unsafe {
-        let accels = [
-            ACCEL {
-                fVirt: FVIRTKEY | FCONTROL,
-                key: 'O' as u16,
-                cmd: IDM_FILE_OPEN as u16,
-            },
-        ];
+        let accels = [ACCEL {
+            fVirt: FVIRTKEY | FCONTROL,
+            key: 'O' as u16,
+            cmd: IDM_FILE_OPEN as u16,
+        }];
         let haccel = CreateAcceleratorTableW(&accels)?;
         Ok(haccel)
     }
@@ -876,7 +951,9 @@ fn restore_window_position(hwnd: HWND) -> bool {
 
         let _ = RegCloseKey(hkey);
 
-        if let (Some(l), Some(t), Some(r), Some(b), Some(cmd)) = (left, top, right, bottom, show_cmd) {
+        if let (Some(l), Some(t), Some(r), Some(b), Some(cmd)) =
+            (left, top, right, bottom, show_cmd)
+        {
             // Validate window is at least partially visible
             if r > l && b > t && (r - l) >= 100 && (b - t) >= 100 {
                 let placement = WINDOWPLACEMENT {
@@ -914,8 +991,281 @@ fn open_url_in_browser(url: &str) {
     }
 }
 
+fn absolute_path(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        std::env::current_dir().ok().map(|cwd| cwd.join(path))
+    }
+}
+
+fn get_path_root(path: &Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+
+    let absolute = absolute_path(path)?;
+    let mut components = absolute.components();
+
+    match components.next()? {
+        Component::Prefix(prefix) => {
+            if !matches!(components.next(), Some(Component::RootDir)) {
+                return None;
+            }
+
+            let mut root = std::path::PathBuf::from(prefix.as_os_str());
+            root.push(std::path::MAIN_SEPARATOR.to_string());
+            Some(root)
+        }
+        Component::RootDir => Some(std::path::PathBuf::from(
+            std::path::MAIN_SEPARATOR.to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn path_relative_to_root(path: &Path) -> Option<String> {
+    use std::path::Component;
+
+    let absolute = absolute_path(path)?;
+    let mut saw_root = false;
+    let mut parts = Vec::new();
+
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) => {}
+            Component::RootDir => saw_root = true,
+            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = parts.pop();
+            }
+        }
+    }
+
+    if !saw_root {
+        return None;
+    }
+
+    Some(parts.join("/"))
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+
+    for byte in path.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+
+    encoded
+}
+
+fn virtual_url_for_file(path: &Path) -> Option<String> {
+    let relative = path_relative_to_root(path)?;
+    Some(format!(
+        "https://mdview.example/{}",
+        percent_encode_path(&relative)
+    ))
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream")
+}
+
+fn create_web_resource_response(
+    environment: &ICoreWebView2Environment,
+    bytes: &[u8],
+    status_code: i32,
+    reason: &str,
+    content_type: &str,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let stream = unsafe { SHCreateMemStream(Some(bytes)) }?;
+    let reason_wide = pwstr_from_str(reason);
+    let headers = format!(
+        "Content-Type: {}\r\nAccess-Control-Allow-Origin: *",
+        content_type
+    );
+    let headers_wide = pwstr_from_str(&headers);
+    unsafe {
+        environment
+            .CreateWebResourceResponse(
+                &stream,
+                status_code,
+                PCWSTR(reason_wide.as_ptr()),
+                PCWSTR(headers_wide.as_ptr()),
+            )
+            .ok()
+    }
+}
+
+fn create_not_found_response(
+    environment: &ICoreWebView2Environment,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    create_web_resource_response(
+        environment,
+        b"Not found",
+        404,
+        "Not Found",
+        "text/plain; charset=utf-8",
+    )
+}
+
+fn create_virtual_resource_response(
+    environment: &ICoreWebView2Environment,
+    file_path: &Path,
+    dark_mode: bool,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let ext = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if ext == "md" || ext == "markdown" {
+        let markdown_content = fs::read_to_string(file_path).ok()?;
+        let html_body = markdown::markdown_to_html(&markdown_content);
+        let full_html = markdown::wrap_html(&html_body, dark_mode);
+        create_web_resource_response(
+            environment,
+            full_html.as_bytes(),
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+        )
+    } else {
+        let bytes = fs::read(file_path).ok()?;
+        create_web_resource_response(
+            environment,
+            &bytes,
+            200,
+            "OK",
+            content_type_for_path(file_path),
+        )
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                decoded.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8_lossy(&decoded).to_string()
+}
+
+fn percent_decode_repeated(input: &str) -> String {
+    let mut current = input.to_string();
+
+    for _ in 0..3 {
+        let decoded = percent_decode(&current);
+        if decoded == current {
+            break;
+        }
+        current = decoded;
+    }
+
+    current
+}
+
+fn resolve_virtual_mdview_url(url: &str) -> Option<String> {
+    let relative_path = url
+        .strip_prefix("https://mdview.example/")
+        .or_else(|| url.strip_prefix("http://mdview.example/"))?
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default();
+
+    if relative_path.is_empty() {
+        return None;
+    }
+
+    let relative_path = percent_decode_repeated(relative_path);
+
+    CURRENT_FILE.with(|f| {
+        let current = f.borrow();
+        let current_path = current.as_ref()?;
+        let root_dir = get_path_root(Path::new(current_path))?;
+        let target = root_dir.join(relative_path);
+        Some(target.to_string_lossy().to_string())
+    })
+}
+
+fn create_response_for_virtual_url(
+    environment: &ICoreWebView2Environment,
+    url: &str,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    let resolved_path = resolve_virtual_mdview_url(url)?;
+    let file_path = Path::new(&resolved_path);
+    if !file_path.exists() {
+        return create_not_found_response(environment);
+    }
+    create_virtual_resource_response(environment, file_path, is_windows_dark_mode())
+}
+
+fn is_internal_virtual_url(url: &str) -> bool {
+    url.starts_with("https://mdview.example/") || url.starts_with("http://mdview.example/")
+}
+
+fn should_allow_webview_navigation(url: &str, user_initiated: bool) -> bool {
+    !user_initiated
+        || is_internal_virtual_url(url)
+        || url == "about:blank"
+        || url.starts_with("about:blank#")
+        || url.starts_with("data:")
+}
+
+fn open_resolved_or_external_url(url: &str) {
+    if let Some(resolved_path) = resolve_virtual_mdview_url(url) {
+        open_url_in_browser(&resolved_path);
+    } else {
+        open_url_in_browser(url);
+    }
+}
+
 /// Handle a regular click on a link in the viewer
 fn handle_follow_link(url: &str) {
+    if let Some(resolved_path) = resolve_virtual_mdview_url(url) {
+        let ext = Path::new(&resolved_path)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+
+        if ext == "md" || ext == "markdown" {
+            MAIN_HWND.with(|h| {
+                if let Some(hwnd) = h.borrow().as_ref() {
+                    load_file_into_webview(*hwnd, &resolved_path);
+                }
+            });
+            return;
+        }
+    }
+
     // External URLs: open in browser
     if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
         open_url_in_browser(url);
@@ -938,7 +1288,10 @@ fn handle_follow_link(url: &str) {
             if let Some(current_path) = current.as_ref() {
                 if let Some(dir) = Path::new(current_path).parent() {
                     let target = dir.join(path_part);
-                    target.canonicalize().ok().map(|p| p.to_string_lossy().to_string())
+                    target
+                        .canonicalize()
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
                 } else {
                     None
                 }
@@ -963,42 +1316,34 @@ fn handle_follow_link(url: &str) {
 
 /// Load a file into the WebView
 fn load_file_into_webview(hwnd: HWND, file_path: &str) {
-    // Read file
-    let content = match fs::read_to_string(file_path) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg: Vec<u16> = format!("Failed to read file:\n{}\0", e)
-                .encode_utf16()
-                .collect();
-            let title: Vec<u16> = "Error\0".encode_utf16().collect();
-            unsafe {
-                MessageBoxW(
-                    Some(hwnd),
-                    PCWSTR(msg.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONERROR,
-                );
-            }
-            return;
+    if fs::metadata(file_path).is_err() {
+        let msg: Vec<u16> = format!("Failed to read file:\n{}\0", file_path)
+            .encode_utf16()
+            .collect();
+        let title: Vec<u16> = "Error\0".encode_utf16().collect();
+        unsafe {
+            MessageBoxW(
+                Some(hwnd),
+                PCWSTR(msg.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONERROR,
+            );
         }
-    };
+        return;
+    }
 
-    // Convert to HTML
-    let html_body = markdown::markdown_to_html(&content);
-    let dark_mode = is_windows_dark_mode();
-    let full_html = markdown::wrap_html(&html_body, dark_mode);
-
-    // Navigate WebView
-    CONTROLLER.with(|c| {
-        if let Some(controller) = c.borrow().as_ref() {
-            unsafe {
-                if let Ok(webview) = controller.CoreWebView2() {
-                    let html_wide = pwstr_from_str(&full_html);
-                    let _ = webview.NavigateToString(PCWSTR(html_wide.as_ptr()));
+    if let Some(url) = virtual_url_for_file(Path::new(file_path)) {
+        CONTROLLER.with(|c| {
+            if let Some(controller) = c.borrow().as_ref() {
+                unsafe {
+                    if let Ok(webview) = controller.CoreWebView2() {
+                        let url_wide = pwstr_from_str(&url);
+                        let _ = webview.Navigate(PCWSTR(url_wide.as_ptr()));
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 
     // Update window title
     let filename = Path::new(file_path)
@@ -1135,7 +1480,10 @@ fn reg_set_named(subkey_path: &str, name: &str, value: &str) -> Result<(), Strin
         let _ = RegCloseKey(hkey);
 
         if result.is_err() {
-            return Err(format!("Failed to set value '{}' for: {}", name, subkey_path));
+            return Err(format!(
+                "Failed to set value '{}' for: {}",
+                name, subkey_path
+            ));
         }
         Ok(())
     }
@@ -1245,9 +1593,7 @@ fn unregister_file_association() -> Result<(), String> {
         }
 
         // Delete Capabilities tree
-        let cap_key: Vec<u16> = "Software\\MDView\\Capabilities\0"
-            .encode_utf16()
-            .collect();
+        let cap_key: Vec<u16> = "Software\\MDView\\Capabilities\0".encode_utf16().collect();
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(cap_key.as_ptr()));
 
         // Remove from RegisteredApplications
@@ -1289,10 +1635,9 @@ fn unregister_file_association() -> Result<(), String> {
 fn is_file_association_registered() -> bool {
     unsafe {
         let mut hkey = std::mem::zeroed();
-        let subkey: Vec<u16> =
-            format!("Software\\Classes\\{}\\shell\\open\\command\0", PROGID)
-                .encode_utf16()
-                .collect();
+        let subkey: Vec<u16> = format!("Software\\Classes\\{}\\shell\\open\\command\0", PROGID)
+            .encode_utf16()
+            .collect();
 
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
@@ -1422,7 +1767,10 @@ fn open_association_settings() {
             CLSCTX_INPROC_SERVER,
         ) {
             let app_name: Vec<u16> = "MDView\0".encode_utf16().collect();
-            if ui.LaunchAdvancedAssociationUI(PCWSTR(app_name.as_ptr())).is_ok() {
+            if ui
+                .LaunchAdvancedAssociationUI(PCWSTR(app_name.as_ptr()))
+                .is_ok()
+            {
                 return;
             }
         }
@@ -1470,7 +1818,10 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         });
 
         // Register window class
-        let class_name_wide: Vec<u16> = WINDOW_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+        let class_name_wide: Vec<u16> = WINDOW_CLASS
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         let hinstance = GetModuleHandleW(None)?;
 
         // Load application icon from resources
@@ -1589,15 +1940,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             let window_height = (screen_height * 75) / 100;
             let x = (screen_width - window_width) / 2;
             let y = (screen_height - window_height) / 2;
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                x,
-                y,
-                window_width,
-                window_height,
-                SWP_NOZORDER,
-            );
+            let _ = SetWindowPos(hwnd, None, x, y, window_width, window_height, SWP_NOZORDER);
         }
 
         // Show window
@@ -1606,9 +1949,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
 
         // Check file association and prompt if not registered
         if !is_file_association_registered() && should_prompt_registration() {
-            let prompt_title: Vec<u16> = "MDView - File Association\0"
-                .encode_utf16()
-                .collect();
+            let prompt_title: Vec<u16> = "MDView - File Association\0".encode_utf16().collect();
             let prompt_message: Vec<u16> = concat!(
                 "Would you like to register MDView as a viewer for .md files?\n\n",
                 "This will add MDView to the 'Open With' list.\n",
@@ -1682,6 +2023,7 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
             let html_for_nav = html_owned.clone();
             let completed_inner = completed_clone.clone();
             let error_inner = error_clone.clone();
+            let environment_for_resources = environment.clone();
 
             let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
                 move |_error_code, controller| {
@@ -1711,36 +2053,130 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         if let Ok(webview) = controller.CoreWebView2() {
                             if let Ok(settings) = webview.Settings() {
                                 let _ = settings.SetIsScriptEnabled(true);
+                                let _ = settings.SetIsWebMessageEnabled(true);
                                 let _ = settings.SetAreDefaultContextMenusEnabled(true);
                                 let _ = settings.SetIsStatusBarEnabled(false);
                             }
 
-                            // Use NavigateToString for direct HTML loading
-                            let html_wide = pwstr_from_str(&html_for_nav);
-                            if let Err(e) = webview.NavigateToString(PCWSTR(html_wide.as_ptr())) {
-                                eprintln!("NavigateToString failed: {:?}", e);
+                            let filter = pwstr_from_str("https://mdview.example/*");
+                            let _ = webview.AddWebResourceRequestedFilter(
+                                PCWSTR(filter.as_ptr()),
+                                COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+                            );
+
+                            let resource_environment = environment_for_resources.clone();
+                            let resource_handler =
+                                webview2_com::WebResourceRequestedEventHandler::create(Box::new(
+                                    move |_webview, args| {
+                                        if let Some(args) = args {
+                                            if let Ok(request) = args.Request() {
+                                                let mut uri_ptr: windows::core::PWSTR =
+                                                    windows::core::PWSTR::null();
+                                                if request.Uri(&mut uri_ptr).is_ok()
+                                                    && !uri_ptr.is_null()
+                                                {
+                                                    let uri =
+                                                        uri_ptr.to_string().unwrap_or_default();
+                                                    windows::Win32::System::Com::CoTaskMemFree(
+                                                        Some(uri_ptr.0 as *const _),
+                                                    );
+                                                    if let Some(response) =
+                                                        create_response_for_virtual_url(
+                                                            &resource_environment,
+                                                            &uri,
+                                                        )
+                                                    {
+                                                        let _ = args.SetResponse(&response);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    },
+                                ));
+                            let mut resource_token: i64 = 0;
+                            let _ = webview
+                                .add_WebResourceRequested(&resource_handler, &mut resource_token);
+
+                            let nav_handler = webview2_com::NavigationStartingEventHandler::create(
+                                Box::new(move |_webview, args| {
+                                    if let Some(args) = args {
+                                        let mut uri_ptr: windows::core::PWSTR =
+                                            windows::core::PWSTR::null();
+                                        let mut user_initiated = windows::core::BOOL(0);
+                                        if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                            let uri = uri_ptr.to_string().unwrap_or_default();
+                                            let _ = args.IsUserInitiated(&mut user_initiated);
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                uri_ptr.0 as *const _,
+                                            ));
+                                            if !should_allow_webview_navigation(
+                                                &uri,
+                                                user_initiated.as_bool(),
+                                            ) {
+                                                let _ = args.SetCancel(true);
+                                                open_url_in_browser(&uri);
+                                            }
+                                        }
+                                    }
+                                    Ok(())
+                                }),
+                            );
+                            let mut nav_token: i64 = 0;
+                            let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
+
+                            if let Some(current_file) = CURRENT_FILE.with(|f| f.borrow().clone()) {
+                                if let Some(url) = virtual_url_for_file(Path::new(&current_file)) {
+                                    let url_wide = pwstr_from_str(&url);
+                                    let _ = webview.Navigate(PCWSTR(url_wide.as_ptr()));
+                                }
+                            } else {
+                                let html_wide = pwstr_from_str(&html_for_nav);
+                                if let Err(e) = webview.NavigateToString(PCWSTR(html_wide.as_ptr()))
+                                {
+                                    eprintln!("NavigateToString failed: {:?}", e);
+                                }
                             }
 
                             // Add message handler for link clicks
+                            let main_hwnd = hwnd;
                             let handler = webview2_com::WebMessageReceivedEventHandler::create(
-                                Box::new(|_webview, args| {
+                                Box::new(move |_webview, args| {
                                     if let Some(args) = args {
-                                        let mut message_ptr: windows::core::PWSTR = windows::core::PWSTR::null();
-                                        if args.WebMessageAsJson(&mut message_ptr).is_ok() && !message_ptr.is_null() {
-                                            let msg_str = message_ptr.to_string().unwrap_or_default();
-                                            windows::Win32::System::Com::CoTaskMemFree(Some(message_ptr.0 as *const _));
+                                        let mut message_ptr: windows::core::PWSTR =
+                                            windows::core::PWSTR::null();
+                                        if args.WebMessageAsJson(&mut message_ptr).is_ok()
+                                            && !message_ptr.is_null()
+                                        {
+                                            let msg_str =
+                                                message_ptr.to_string().unwrap_or_default();
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                message_ptr.0 as *const _,
+                                            ));
+
+                                            if msg_str.contains("\"close\"") {
+                                                let _ = PostMessageW(
+                                                    Some(main_hwnd),
+                                                    WM_CLOSE,
+                                                    WPARAM(0),
+                                                    LPARAM(0),
+                                                );
+                                                return Ok(());
+                                            }
 
                                             // Extract URL from JSON message
                                             if let Some(start) = msg_str.find("\"url\":\"") {
                                                 let url_start = start + 7;
                                                 if let Some(end) = msg_str[url_start..].find('"') {
-                                                    let url = msg_str[url_start..url_start + end].to_string();
+                                                    let url = msg_str[url_start..url_start + end]
+                                                        .to_string();
                                                     // Unescape JSON backslashes
-                                                    let url = url.replace("\\\\", "\\").replace("\\/", "/");
+                                                    let url = url
+                                                        .replace("\\\\", "\\")
+                                                        .replace("\\/", "/");
 
                                                     if msg_str.contains("openLink") {
-                                                        // Ctrl+click: always open in browser
-                                                        open_url_in_browser(&url);
+                                                        open_resolved_or_external_url(&url);
                                                     } else if msg_str.contains("followLink") {
                                                         handle_follow_link(&url);
                                                     }
@@ -1778,7 +2214,12 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
         .unwrap_or_else(|_| ".".to_string());
     let user_data_wide = pwstr_from_str(&user_data_folder);
     unsafe {
-        let _ = CreateCoreWebView2EnvironmentWithOptions(None, PCWSTR(user_data_wide.as_ptr()), None, &env_handler);
+        let _ = CreateCoreWebView2EnvironmentWithOptions(
+            None,
+            PCWSTR(user_data_wide.as_ptr()),
+            None,
+            &env_handler,
+        );
     }
 
     // Pump messages until WebView2 is ready
@@ -1845,12 +2286,20 @@ unsafe extern "system" fn window_proc(
                 let _ = EnableMenuItem(
                     menu,
                     IDM_FILE_REGISTER,
-                    if registered { MF_BYCOMMAND | MF_GRAYED } else { MF_BYCOMMAND },
+                    if registered {
+                        MF_BYCOMMAND | MF_GRAYED
+                    } else {
+                        MF_BYCOMMAND
+                    },
                 );
                 let _ = EnableMenuItem(
                     menu,
                     IDM_FILE_UNREGISTER,
-                    if registered { MF_BYCOMMAND } else { MF_BYCOMMAND | MF_GRAYED },
+                    if registered {
+                        MF_BYCOMMAND
+                    } else {
+                        MF_BYCOMMAND | MF_GRAYED
+                    },
                 );
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }

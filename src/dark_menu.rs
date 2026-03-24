@@ -1,11 +1,11 @@
 //! Dark mode menu bar support using undocumented UAH messages
 //! Based on the menu_test program approach
 
-use windows::core::PWSTR;
+use std::mem;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
-use std::mem;
+use windows::core::PWSTR;
 
 // Undocumented UAH messages for menu bar theming
 pub const WM_UAHDRAWMENU: u32 = 0x0091;
@@ -146,12 +146,12 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
             let dis = &udmi.dis;
 
             // Choose color based on state
-            let bg_color = if (dis.item_state & ODS_SELECTED) != 0 ||
-                              (dis.item_state & ODS_HOTLIGHT) != 0 {
-                DARK_HOVER
-            } else {
-                DARK_BG
-            };
+            let bg_color =
+                if (dis.item_state & ODS_SELECTED) != 0 || (dis.item_state & ODS_HOTLIGHT) != 0 {
+                    DARK_HOVER
+                } else {
+                    DARK_BG
+                };
 
             // Fill background
             let brush = CreateSolidBrush(COLORREF(bg_color));
@@ -179,7 +179,9 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
                         ncm.cbSize,
                         Some(&mut ncm as *mut _ as *mut _),
                         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-                    ).is_ok() {
+                    )
+                    .is_ok()
+                    {
                         // Scale up font height to match popup menu (lfHeight is negative)
                         let mut lf = ncm.lfMenuFont;
                         lf.lfHeight = (lf.lfHeight as f32 * 1.12) as i32;
@@ -188,10 +190,18 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
                         // Fallback to hardcoded font if system call fails
                         let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
                         CreateFontW(
-                            -16, 0, 0, 0,
-                            FW_NORMAL.0 as i32, 0, 0, 0,
-                            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            -16,
+                            0,
+                            0,
+                            0,
+                            FW_NORMAL.0 as i32,
+                            0,
+                            0,
+                            0,
+                            DEFAULT_CHARSET,
+                            OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS,
+                            CLEARTYPE_QUALITY,
                             DEFAULT_PITCH.0 as u32,
                             windows::core::PCWSTR(font_name.as_ptr()),
                         )

@@ -3,7 +3,7 @@
 mod markdown;
 mod viewer;
 
-use std::ffi::{c_char, c_int, CStr};
+use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
 use widestring::U16CStr;
 use windows::Win32::Foundation::HWND;
@@ -75,7 +75,7 @@ fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
     let full_html = markdown::wrap_html(&html_body, dark_mode);
 
     // Create viewer window with WebView2
-    match viewer::create_viewer(parent, &full_html) {
+    match viewer::create_viewer(parent, &full_html, Some(file_path), dark_mode) {
         Ok(hwnd) => hwnd,
         Err(_) => HWND::default(),
     }
@@ -134,7 +134,7 @@ fn do_search(list_win: HWND, search_string: &str, search_parameter: c_int) -> c_
         "window.find(\"{}\", {}, {}, {}, {}, false, false)",
         escaped,
         case_sensitive,
-        false, // backwards (we search forward)
+        false,         // backwards (we search forward)
         !forward_only, // wrapAround
         whole_word
     );
@@ -145,11 +145,7 @@ fn do_search(list_win: HWND, search_string: &str, search_parameter: c_int) -> c_
 
 /// Handle commands (copy, select all, etc.)
 #[unsafe(no_mangle)]
-pub extern "system" fn ListSendCommand(
-    list_win: HWND,
-    command: c_int,
-    _parameter: c_int,
-) -> c_int {
+pub extern "system" fn ListSendCommand(list_win: HWND, command: c_int, _parameter: c_int) -> c_int {
     const LC_COPY: c_int = 1;
     const LC_SELECTALL: c_int = 3;
 
