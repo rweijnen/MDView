@@ -37,7 +37,12 @@ use windows::Win32::UI::Shell::{SHCreateMemStream, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
-const WINDOW_CLASS: &str = "MDViewWebView2Host";
+const WINDOW_CLASS_PREFIX: &str = "MDViewWebView2Host";
+
+fn window_class_name() -> U16CString {
+    let unique = format!("{}_{}", WINDOW_CLASS_PREFIX, window_proc as *const () as usize);
+    U16CString::from_str(&unique).unwrap()
+}
 
 // Thread-local storage for WebView2 controllers (COM objects are single-threaded)
 thread_local! {
@@ -64,7 +69,7 @@ pub fn create_viewer(
         let _ = GetClientRect(parent, &mut rect);
 
         // Create host window
-        let class_name = U16CString::from_str(WINDOW_CLASS).unwrap();
+        let class_name = window_class_name();
         let hinstance = GetModuleHandleW(None)?;
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -109,7 +114,7 @@ pub fn create_viewer(
 
 fn register_window_class() -> windows::core::Result<()> {
     unsafe {
-        let class_name = U16CString::from_str(WINDOW_CLASS).unwrap();
+        let class_name = window_class_name();
         let hinstance = GetModuleHandleW(None)?;
 
         let wc = WNDCLASSEXW {
@@ -644,6 +649,35 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     Ok(())
 }
 
+fn cleanup_viewer_state(hwnd: HWND) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow_mut().remove(&(hwnd.0 as isize)) {
+            let _ = unsafe { controller.Close() };
+        }
+    });
+    CURRENT_FILES.with(|f| {
+        f.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+    DARK_MODES.with(|m| {
+        m.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+}
+
+fn unregister_window_class_if_unused() {
+    let no_controllers = CONTROLLERS.with(|c| c.borrow().is_empty());
+    let no_current_files = CURRENT_FILES.with(|f| f.borrow().is_empty());
+    let no_dark_modes = DARK_MODES.with(|m| m.borrow().is_empty());
+
+    if no_controllers && no_current_files && no_dark_modes {
+        unsafe {
+            if let Ok(hinstance) = GetModuleHandleW(None) {
+                let class_name = window_class_name();
+                let _ = UnregisterClassW(PCWSTR(class_name.as_ptr()), Some(hinstance.into()));
+            }
+        }
+    }
+}
+
 pub fn close_window(hwnd: HWND) {
     // Remove and close the controller
     CONTROLLERS.with(|c| {
@@ -652,14 +686,7 @@ pub fn close_window(hwnd: HWND) {
         }
     });
 
-    CURRENT_FILES.with(|f| {
-        f.borrow_mut().remove(&(hwnd.0 as isize));
-    });
-    DARK_MODES.with(|m| {
-        m.borrow_mut().remove(&(hwnd.0 as isize));
-    });
-
-    // Destroy the window
+    // Destroy the window; final state cleanup happens in WM_NCDESTROY
     let _ = unsafe { DestroyWindow(hwnd) };
 }
 
@@ -698,6 +725,11 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => LRESULT(0),
+        WM_NCDESTROY => {
+            cleanup_viewer_state(hwnd);
+            unregister_window_class_if_unused();
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
 }
