@@ -20,6 +20,11 @@ pub fn wrap_html(content: &str, dark_mode: bool) -> String {
     let code_bg = if dark_mode { "#2d2d2d" } else { "#f6f8fa" };
     let link_color = if dark_mode { "#58a6ff" } else { "#0366d6" };
     let border_color = if dark_mode { "#444" } else { "#e1e4e8" };
+    let content = content
+        .replace("src=\"/", "src=\"")
+        .replace("href=\"/", "href=\"")
+        .replace("src='/", "src='")
+        .replace("href='/", "href='");
 
     format!(
         r#"<!DOCTYPE html>
