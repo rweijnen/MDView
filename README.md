@@ -15,7 +15,7 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 - **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
 - **Clickable links** - Click `.md` links to navigate, external links open in browser
 - **ESC to close** - Quick keyboard navigation
-- **Syntax highlighting** - Code blocks with proper formatting
+- **Code blocks** - Monospaced and shaded, with formatting preserved
 - **GitHub Flavored Markdown** - Tables, task lists, strikethrough, and more
 
 ## Installation
