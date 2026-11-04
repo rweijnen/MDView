@@ -7,6 +7,8 @@ pub fn markdown_to_html(markdown: &str) -> String {
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
 
     let mut events: Vec<Event> = Parser::new_ext(markdown, options).collect();
     assign_heading_ids(&mut events);
@@ -227,13 +229,19 @@ a {{ cursor: pointer; }}
 pub fn markdown_to_plain_text(markdown: &str) -> String {
     use pulldown_cmark::{Event, Tag, TagEnd};
 
-    let options = Options::empty();
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
     let parser = Parser::new_ext(markdown, options);
 
     let mut output = String::new();
+    let mut in_metadata_block = false;
 
     for event in parser {
         match event {
+            Event::Start(Tag::MetadataBlock(_)) => in_metadata_block = true,
+            Event::End(TagEnd::MetadataBlock(_)) => in_metadata_block = false,
+            _ if in_metadata_block => {}
             Event::Text(text) => output.push_str(&text),
             Event::Code(code) => {
                 output.push('`');
@@ -349,5 +357,43 @@ mod tests {
         assert!(html.contains("<h1 id=\"notes\">"), "{html}");
         assert!(html.contains("<h1 id=\"notes-1\">"), "{html}");
         assert!(html.contains("<h1 id=\"notes-2\">"), "{html}");
+    }
+
+    #[test]
+    fn test_yaml_front_matter_hidden_from_html() {
+        let md = "---\ntags: [rust, markdown]\n---\n\n# Hello";
+        let html = markdown_to_html(md);
+
+        assert!(html.contains("<h1 id=\"hello\">Hello</h1>"));
+        assert!(!html.contains("tags"));
+        assert!(!html.contains("<hr"));
+    }
+
+    #[test]
+    fn test_toml_front_matter_hidden_from_html() {
+        let md = "+++\ntitle = \"My note\"\n+++\n\n# Hello";
+        let html = markdown_to_html(md);
+
+        assert!(html.contains("<h1 id=\"hello\">Hello</h1>"));
+        assert!(!html.contains("title"), "front matter leaked:\n{html}");
+    }
+
+    #[test]
+    fn test_plain_text_hides_yaml_front_matter() {
+        let md = "---\ntags: [rust, markdown]\n---\n\n# Hello";
+        let text = markdown_to_plain_text(md);
+
+        assert!(text.contains("Hello"));
+        assert!(!text.contains("tags"));
+    }
+
+    #[test]
+    fn test_normal_horizontal_rule_still_renders() {
+        let md = "# A\n\n---\n\n# B";
+        let html = markdown_to_html(md);
+
+        assert!(html.contains("<h1 id=\"a\">A</h1>"));
+        assert!(html.contains("<hr"));
+        assert!(html.contains("<h1 id=\"b\">B</h1>"));
     }
 }

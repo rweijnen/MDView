@@ -163,6 +163,8 @@ pub fn render_to_terminal(markdown: &str, caps: &TerminalCaps) -> String {
     options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
+    options.insert(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    options.insert(Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS);
 
     let parser = Parser::new_ext(markdown, options);
     let mut renderer = TerminalRenderer::new(caps.clone());
@@ -184,6 +186,7 @@ struct TerminalRenderer {
     in_strong: bool,
     in_strikethrough: bool,
     in_code_block: bool,
+    in_metadata_block: bool,
     in_block_quote: u32,
     in_list: bool,
     list_index: Option<u64>,
@@ -208,6 +211,7 @@ impl TerminalRenderer {
             in_strong: false,
             in_strikethrough: false,
             in_code_block: false,
+            in_metadata_block: false,
             in_block_quote: 0,
             in_list: false,
             list_index: None,
@@ -237,6 +241,10 @@ impl TerminalRenderer {
 
     fn start_tag(&mut self, tag: Tag) {
         match tag {
+            Tag::MetadataBlock(_) => {
+                self.in_metadata_block = true;
+            }
+            _ if self.in_metadata_block => {}
             Tag::Heading { level, .. } => {
                 self.in_heading = Some(level);
                 self.output.push('\n');
@@ -377,6 +385,10 @@ impl TerminalRenderer {
 
     fn end_tag(&mut self, tag: TagEnd) {
         match tag {
+            TagEnd::MetadataBlock(_) => {
+                self.in_metadata_block = false;
+            }
+            _ if self.in_metadata_block => {}
             TagEnd::Heading(_) => {
                 if self.caps.basic_ansi {
                     self.output.push_str(ansi::RESET);
@@ -484,6 +496,10 @@ impl TerminalRenderer {
     }
 
     fn text(&mut self, text: &str) {
+        if self.in_metadata_block {
+            return;
+        }
+
         if self.pending_link.is_some() {
             self.link_text.push_str(text);
             return;
@@ -507,6 +523,10 @@ impl TerminalRenderer {
     }
 
     fn inline_code(&mut self, code: &str) {
+        if self.in_metadata_block {
+            return;
+        }
+
         if self.in_table {
             self.current_cell.push('`');
             self.current_cell.push_str(code);
@@ -532,6 +552,10 @@ impl TerminalRenderer {
     }
 
     fn soft_break(&mut self) {
+        if self.in_metadata_block {
+            return;
+        }
+
         if self.pending_link.is_some() {
             self.link_text.push(' ');
         } else if self.in_table {
@@ -542,11 +566,19 @@ impl TerminalRenderer {
     }
 
     fn hard_break(&mut self) {
+        if self.in_metadata_block {
+            return;
+        }
+
         self.output.push('\n');
         self.write_blockquote_prefix();
     }
 
     fn horizontal_rule(&mut self) {
+        if self.in_metadata_block {
+            return;
+        }
+
         self.output.push('\n');
         if self.caps.basic_ansi {
             self.output.push_str(ansi::DIM);
@@ -564,6 +596,10 @@ impl TerminalRenderer {
     }
 
     fn task_list_marker(&mut self, checked: bool) {
+        if self.in_metadata_block {
+            return;
+        }
+
         let marker = if self.caps.unicode {
             if checked {
                 unicode::CHECKBOX_CHECKED
@@ -748,5 +784,24 @@ mod tests {
         let caps = TerminalCaps::detect();
         // Should at least detect basic ANSI on most systems
         assert!(caps.basic_ansi || cfg!(not(windows)));
+    }
+
+    #[test]
+    fn test_yaml_front_matter_hidden_from_terminal() {
+        let caps = TerminalCaps::basic();
+        let output = render_to_terminal("---\ntags: [rust, markdown]\n---\n\n# Hello", &caps);
+
+        assert!(output.contains("Hello"));
+        assert!(!output.contains("tags"));
+    }
+
+    #[test]
+    fn test_normal_horizontal_rule_still_renders() {
+        let caps = TerminalCaps::basic();
+        let output = render_to_terminal("# A\n\n---\n\n# B", &caps);
+
+        assert!(output.contains("A"));
+        assert!(output.contains("----------------------------------------"));
+        assert!(output.contains("B"));
     }
 }
