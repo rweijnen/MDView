@@ -46,16 +46,26 @@ fn assign_heading_ids(events: &mut [Event]) {
 }
 
 /// Slug rules of github-slugger (used by GitHub for heading anchors):
-/// lowercase, drop everything except letters, numbers, `-`, `_` and spaces,
-/// then turn each space into `-` (consecutive hyphens are kept).
+/// lowercase, then keep alphabetic characters, combining marks, decimal
+/// digits, connector punctuation (`_`) and `-`, turn each space into `-`
+/// (consecutive hyphens are kept) and drop everything else, including
+/// "other numbers" such as `½` and `²`.
 fn github_slug(text: &str) -> String {
+    use unicode_general_category::{GeneralCategory as Gc, get_general_category};
+
     text.to_lowercase()
         .chars()
         .filter_map(|c| match c {
-            ' ' => Some('-'),
-            '-' | '_' => Some(c),
-            c if c.is_alphanumeric() => Some(c),
-            _ => None,
+            ' ' | '-' => Some('-'),
+            c if c.is_alphabetic() => Some(c),
+            c => match get_general_category(c) {
+                Gc::NonspacingMark
+                | Gc::SpacingMark
+                | Gc::EnclosingMark
+                | Gc::DecimalNumber
+                | Gc::ConnectorPunctuation => Some(c),
+                _ => None,
+            },
         })
         .collect()
 }
@@ -308,6 +318,27 @@ mod tests {
         let html = markdown_to_html("### Run `cargo test`, then *ship*!");
         assert!(
             html.contains("<h3 id=\"run-cargo-test-then-ship\">"),
+            "unexpected heading id:\n{html}"
+        );
+    }
+
+    // Combining marks (vowel signs, viramas) are part of words in many scripts
+    // and are kept by GitHub.
+    #[test]
+    fn test_heading_id_keeps_combining_marks() {
+        let html = markdown_to_html("## \u{939}\u{93F}\u{928}\u{94D}\u{926}\u{940} \u{e20}\u{e32}\u{e29}\u{e32}\u{e44}\u{e17}\u{e22}");
+        assert!(
+            html.contains("<h2 id=\"\u{939}\u{93F}\u{928}\u{94D}\u{926}\u{940}-\u{e20}\u{e32}\u{e29}\u{e32}\u{e44}\u{e17}\u{e22}\">"),
+            "unexpected heading id:\n{html}"
+        );
+    }
+
+    // GitHub drops "other number" characters such as fractions and superscripts.
+    #[test]
+    fn test_heading_id_drops_other_numbers() {
+        let html = markdown_to_html("## \u{BD} half \u{B2} squared");
+        assert!(
+            html.contains("<h2 id=\"-half--squared\">"),
             "unexpected heading id:\n{html}"
         );
     }
