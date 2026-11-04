@@ -445,6 +445,7 @@ const DARK_CLIENT: u32 = 0x00202020;
 const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
+const IDM_EDIT_FIND: u32 = 1201;
 const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
@@ -548,6 +549,7 @@ fn create_menu() -> windows::core::Result<HMENU> {
     unsafe {
         let menu_bar = CreateMenu()?;
         let file_menu = CreatePopupMenu()?;
+        let edit_menu = CreatePopupMenu()?;
         let help_menu = CreatePopupMenu()?;
 
         // File menu items (native Windows menus for proper dark mode styling)
@@ -590,6 +592,15 @@ fn create_menu() -> windows::core::Result<HMENU> {
             PCWSTR(exit_text.as_ptr()),
         )?;
 
+        // Edit menu items
+        let find_text: Vec<u16> = "&Find...\tCtrl+F\0".encode_utf16().collect();
+        AppendMenuW(
+            edit_menu,
+            MF_STRING,
+            IDM_EDIT_FIND as usize,
+            PCWSTR(find_text.as_ptr()),
+        )?;
+
         // Help menu items (native Windows menus)
         let about_text: Vec<u16> = "&About MDView\0".encode_utf16().collect();
         AppendMenuW(
@@ -608,6 +619,14 @@ fn create_menu() -> windows::core::Result<HMENU> {
             PCWSTR(file_text.as_ptr()),
         )?;
 
+        let edit_text: Vec<u16> = "&Edit\0".encode_utf16().collect();
+        AppendMenuW(
+            menu_bar,
+            MF_POPUP,
+            edit_menu.0 as usize,
+            PCWSTR(edit_text.as_ptr()),
+        )?;
+
         let help_text: Vec<u16> = "&Help\0".encode_utf16().collect();
         AppendMenuW(
             menu_bar,
@@ -623,11 +642,20 @@ fn create_menu() -> windows::core::Result<HMENU> {
 /// Create accelerator table for keyboard shortcuts
 fn create_accelerators() -> windows::core::Result<HACCEL> {
     unsafe {
-        let accels = [ACCEL {
-            fVirt: FVIRTKEY | FCONTROL,
-            key: 'O' as u16,
-            cmd: IDM_FILE_OPEN as u16,
-        }];
+        // These only fire while MDView's own window has focus; inside the
+        // document, WebView2 handles Ctrl+F itself with the same find bar.
+        let accels = [
+            ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
+                key: 'O' as u16,
+                cmd: IDM_FILE_OPEN as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
+                key: 'F' as u16,
+                cmd: IDM_EDIT_FIND as u16,
+            },
+        ];
         let haccel = CreateAcceleratorTableW(&accels)?;
         Ok(haccel)
     }
@@ -1971,6 +1999,9 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         // Show window
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
+        // Activation inside ShowWindow focuses this window before WebView2 can
+        // take focus; hand it to the document now that the window is shown.
+        focus_webview();
 
         // Check file association and prompt if not registered
         if !is_file_association_registered() && should_prompt_registration() {
@@ -2024,6 +2055,67 @@ thread_local! {
     static MENU_HANDLE: RefCell<Option<HMENU>> = const { RefCell::new(None) };
     static ACCEL_HANDLE: RefCell<Option<HACCEL>> = const { RefCell::new(None) };
     static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
+    static ENVIRONMENT: RefCell<Option<ICoreWebView2Environment>> = const { RefCell::new(None) };
+}
+
+/// Edit > Find: open WebView2's built-in find bar.
+fn open_find(hwnd: HWND) {
+    focus_webview();
+    if let Err(e) = start_find(hwnd) {
+        show_find_error(hwnd, &e);
+    }
+}
+
+fn show_find_error(hwnd: HWND, e: &windows::core::Error) {
+    let msg: Vec<u16> = format!("Could not open the find bar: {}\0", e.message())
+    .encode_utf16()
+    .collect();
+    let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+    unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(msg.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONWARNING,
+        );
+    }
+}
+
+fn start_find(hwnd: HWND) -> windows::core::Result<()> {
+    let environment = ENVIRONMENT
+        .with(|e| e.borrow().clone())
+        .ok_or_else(|| windows::core::Error::new(E_FAIL, "WebView2 is not initialised"))?;
+    let webview = CONTROLLER
+        .with(|c| c.borrow().clone())
+        .ok_or_else(|| windows::core::Error::new(E_FAIL, "WebView2 is not initialised"))?;
+    unsafe {
+        let find = webview.CoreWebView2()?.cast::<ICoreWebView2_28>()?.Find()?;
+        let options = environment
+            .cast::<ICoreWebView2Environment15>()?
+            .CreateFindOptions()?;
+        options.SetSuppressDefaultFindDialog(false)?;
+        // An empty term opens the find bar without searching yet. It must be a
+        // real empty string: pwstr_from_str("") returns a null pointer.
+        let empty_term: [u16; 1] = [0];
+        options.SetFindTerm(PCWSTR(empty_term.as_ptr()))?;
+        let handler = webview2_com::FindStartCompletedHandler::create(Box::new(move |result| {
+            if let Err(e) = result {
+                show_find_error(hwnd, &e);
+            }
+            Ok(())
+        }));
+        find.Start(&options, &handler)
+    }
+}
+
+/// Give keyboard focus to the document, so Ctrl+F, scrolling keys and Esc
+/// work without clicking in it first.
+fn focus_webview() {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            let _ = unsafe { controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC) };
+        }
+    });
 }
 
 fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
@@ -2049,6 +2141,7 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
             let completed_inner = completed_clone.clone();
             let error_inner = error_clone.clone();
             let environment_for_resources = environment.clone();
+            ENVIRONMENT.with(|e| *e.borrow_mut() = Some(environment.clone()));
 
             let ctrl_handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
                 move |_error_code, controller| {
@@ -2303,6 +2396,12 @@ unsafe extern "system" fn window_proc(
             }
             return result;
         }
+        // Windows gives focus to this window when it is activated; pass it on
+        // to the document.
+        WM_SETFOCUS => {
+            focus_webview();
+            LRESULT(0)
+        }
         WM_INITMENUPOPUP => {
             // Update register/unregister enabled state when menu opens
             let menu = HMENU(wparam.0 as _);
@@ -2354,6 +2453,10 @@ unsafe extern "system" fn window_proc(
                 }
                 IDM_HELP_ABOUT => {
                     show_about_dialog(hwnd);
+                    LRESULT(0)
+                }
+                IDM_EDIT_FIND => {
+                    open_find(hwnd);
                     LRESULT(0)
                 }
                 id if id >= IDM_FILE_RECENT_BASE && id < IDM_FILE_RECENT_BASE + 10 => {
