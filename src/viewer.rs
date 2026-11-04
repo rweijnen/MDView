@@ -928,3 +928,90 @@ fn open_url_in_browser(url: &str) {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A fake window handle: the URL mapping only uses it as a lookup key.
+    fn viewer_showing(file: &str) -> HWND {
+        let hwnd = HWND(0x4D44 as *mut _);
+        CURRENT_FILES.with(|f| f.borrow_mut().insert(hwnd.0 as isize, file.to_string()));
+        hwnd
+    }
+
+    // Compare as paths: Windows accepts both `\` and `/` as separators, so
+    // `C:\docs/img/a.png` and `C:\docs\img\a.png` name the same file.
+    fn assert_resolves(hwnd: HWND, url: &str, expected: &str) {
+        let resolved = resolve_virtual_mdview_url(hwnd, url)
+            .unwrap_or_else(|| panic!("{url} did not resolve to a file"));
+        assert_eq!(Path::new(&resolved), Path::new(expected), "resolved {url} to {resolved}");
+    }
+
+    #[test]
+    fn test_document_url_is_path_from_drive_root() {
+        assert_eq!(
+            virtual_url_for_file(Path::new(r"C:\docs\note.md")).as_deref(),
+            Some("https://mdview.example/docs/note.md")
+        );
+    }
+
+    // Issue #7: `![test](img/screen.png)` next to the document. The browser
+    // resolves the relative src against the document URL
+    // (https://mdview.example/docs/note.md) and requests the URL below, which
+    // must map back to the image file next to the document.
+    #[test]
+    fn test_relative_image_maps_to_file_next_to_document_issue_7() {
+        let hwnd = viewer_showing(r"C:\docs\note.md");
+        assert_resolves(
+            hwnd,
+            "https://mdview.example/docs/img/screen.png",
+            r"C:\docs\img\screen.png",
+        );
+    }
+
+    // Folder and file names with spaces and non-ASCII letters arrive
+    // percent-encoded (UTF-8) from the browser.
+    #[test]
+    fn test_encoded_non_ascii_and_spaces_round_trip() {
+        let doc = r"C:\Dokumenty\poznámky\note.md";
+        assert_eq!(
+            virtual_url_for_file(Path::new(doc)).as_deref(),
+            Some("https://mdview.example/Dokumenty/pozn%C3%A1mky/note.md")
+        );
+
+        let hwnd = viewer_showing(doc);
+        assert_resolves(
+            hwnd,
+            "https://mdview.example/Dokumenty/pozn%C3%A1mky/obr%C3%A1zky/sn%C3%ADmek%20obrazovky.png",
+            r"C:\Dokumenty\poznámky\obrázky\snímek obrazovky.png",
+        );
+    }
+
+    #[test]
+    fn test_query_and_fragment_are_ignored() {
+        let hwnd = viewer_showing(r"C:\docs\note.md");
+        assert_resolves(
+            hwnd,
+            "https://mdview.example/docs/img/a.png?v=2#x",
+            r"C:\docs\img\a.png",
+        );
+    }
+
+    // Documents on a network share resolve images on the same share.
+    #[test]
+    fn test_unc_share_images_stay_on_share() {
+        let doc = r"\\server\share\docs\note.md";
+        assert_eq!(
+            virtual_url_for_file(Path::new(doc)).as_deref(),
+            Some("https://mdview.example/docs/note.md")
+        );
+
+        let hwnd = viewer_showing(doc);
+        assert_resolves(
+            hwnd,
+            "https://mdview.example/docs/img/screen.png",
+            r"\\server\share\docs\img\screen.png",
+        );
+    }
+}
