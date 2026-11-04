@@ -1,5 +1,8 @@
 name: Build and Release
 
+# Pushes to main and pull requests only build and test.
+# A release is created only when this workflow is started manually
+# (Actions > Build and Release > Run workflow) on main.
 on:
   push:
     branches: [main]
@@ -9,6 +12,9 @@ on:
       - 'Cargo.lock'
       - 'build.rs'
       - '.github/workflows/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -19,8 +25,17 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      IS_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
 
     steps:
+      - name: Refuse release from a branch other than main
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        shell: pwsh
+        run: |
+          Write-Error "Releases can only be created from main (this run is on ${{ github.ref }})."
+          exit 1
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
@@ -41,6 +56,7 @@ jobs:
         run: cargo test --release
 
       - name: Get current version
+        if: env.IS_RELEASE == 'true'
         id: version
         shell: pwsh
         run: |
@@ -68,6 +84,7 @@ jobs:
           }
 
       - name: Create release directory
+        if: env.IS_RELEASE == 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path release
@@ -87,11 +104,13 @@ jobs:
           Copy-Item "LICENSE" "release\"
 
       - name: Create ZIP
+        if: env.IS_RELEASE == 'true'
         shell: pwsh
         run: |
           Compress-Archive -Path "release\*" -DestinationPath "MDView-v${{ steps.version.outputs.current }}.zip"
 
       - name: Create Release
+        if: env.IS_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.current }}
@@ -124,6 +143,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bump version in Cargo.toml
+        if: env.IS_RELEASE == 'true'
         shell: pwsh
         run: |
           $content = Get-Content Cargo.toml -Raw
@@ -131,6 +151,7 @@ jobs:
           Set-Content -Path Cargo.toml -Value $newContent -NoNewline
 
       - name: Commit version bump
+        if: env.IS_RELEASE == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
