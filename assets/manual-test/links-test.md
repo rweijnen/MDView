@@ -32,6 +32,8 @@ Click the badge itself:
 
 - [Jump to Section A](#section-a)
 - [Jump to Section B](#section-b)
+- [Jump to STEP 1 — Architecture Analysis](#step-1--architecture-analysis) (GitHub-style anchor, issue #4)
+- [Jump to Βήμα 2 — Ανάλυση](#βήμα-2--ανάλυση) (non-ASCII heading)
 
 ## Mixed links with fragments
 
@@ -51,3 +53,11 @@ Some text here.
 ## Section B
 
 Some more text here.
+
+## STEP 1 — Architecture Analysis
+
+Target of the GitHub-style anchor link.
+
+## Βήμα 2 — Ανάλυση
+
+Target of the non-ASCII anchor link.
