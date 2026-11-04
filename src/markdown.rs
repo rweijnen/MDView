@@ -370,6 +370,15 @@ mod tests {
     }
 
     #[test]
+    fn test_toml_front_matter_hidden_from_html() {
+        let md = "+++\ntitle = \"My note\"\n+++\n\n# Hello";
+        let html = markdown_to_html(md);
+
+        assert!(html.contains("<h1 id=\"hello\">Hello</h1>"));
+        assert!(!html.contains("title"), "front matter leaked:\n{html}");
+    }
+
+    #[test]
     fn test_plain_text_hides_yaml_front_matter() {
         let md = "---\ntags: [rust, markdown]\n---\n\n# Hello";
         let text = markdown_to_plain_text(md);
