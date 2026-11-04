@@ -46,6 +46,14 @@ If local resource mapping works, this image should render:
 
 ![Local screenshot](../screenshot.png)
 
+Image in a subfolder next to this file (the layout from issue #7). A green bar should show:
+
+![test](img/screen.png)
+
+Subfolder and file name with non-ASCII letters and a space. A blue bar should show:
+
+![test](obrázky/snímek%20obrazovky.png)
+
 ## Section A
 
 Some text here.
