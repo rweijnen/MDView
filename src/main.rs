@@ -854,6 +854,31 @@ fn update_recent_files_menu() {
 }
 
 /// Save window position to registry
+/// The show state to remember for a window that is being closed. A window
+/// closed while minimised (e.g. from the taskbar) is remembered in the state
+/// it would be restored to, so the next start is not minimised.
+fn show_cmd_to_save(placement: &WINDOWPLACEMENT) -> u32 {
+    if placement.showCmd == SW_SHOWMINIMIZED.0 as u32 {
+        if (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0 {
+            SW_SHOWMAXIMIZED.0 as u32
+        } else {
+            SW_SHOWNORMAL.0 as u32
+        }
+    } else {
+        placement.showCmd
+    }
+}
+
+/// The show state to start with: maximised if that was remembered, otherwise
+/// normal. Never minimised, also for values saved by older versions.
+fn show_cmd_to_restore(saved: i32) -> u32 {
+    if saved == SW_SHOWMAXIMIZED.0 {
+        SW_SHOWMAXIMIZED.0 as u32
+    } else {
+        SW_SHOWNORMAL.0 as u32
+    }
+}
+
 fn save_window_position(hwnd: HWND) {
     unsafe {
         let mut placement = WINDOWPLACEMENT {
@@ -883,7 +908,7 @@ fn save_window_position(hwnd: HWND) {
                     ("Top", placement.rcNormalPosition.top as u32),
                     ("Right", placement.rcNormalPosition.right as u32),
                     ("Bottom", placement.rcNormalPosition.bottom as u32),
-                    ("ShowCmd", placement.showCmd),
+                    ("ShowCmd", show_cmd_to_save(&placement)),
                 ];
                 for (name, value) in values {
                     let name_wide: Vec<u16> = format!("{}\0", name).encode_utf16().collect();
@@ -958,7 +983,7 @@ fn restore_window_position(hwnd: HWND) -> bool {
             if r > l && b > t && (r - l) >= 100 && (b - t) >= 100 {
                 let placement = WINDOWPLACEMENT {
                     length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    showCmd: cmd as u32,
+                    showCmd: show_cmd_to_restore(cmd),
                     rcNormalPosition: RECT {
                         left: l,
                         top: t,
@@ -2364,5 +2389,49 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn placement(show_cmd: SHOW_WINDOW_CMD, flags: WINDOWPLACEMENT_FLAGS) -> WINDOWPLACEMENT {
+        WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            flags,
+            showCmd: show_cmd.0 as u32,
+            ..Default::default()
+        }
+    }
+
+    // Issue #6: closing a minimised window must not make the next start minimised.
+    #[test]
+    fn test_closing_minimised_saves_normal() {
+        let p = placement(SW_SHOWMINIMIZED, WINDOWPLACEMENT_FLAGS(0));
+        assert_eq!(show_cmd_to_save(&p), SW_SHOWNORMAL.0 as u32);
+    }
+
+    #[test]
+    fn test_closing_minimised_from_maximised_saves_maximised() {
+        let p = placement(SW_SHOWMINIMIZED, WPF_RESTORETOMAXIMIZED);
+        assert_eq!(show_cmd_to_save(&p), SW_SHOWMAXIMIZED.0 as u32);
+    }
+
+    #[test]
+    fn test_closing_maximised_or_normal_saves_as_is() {
+        let p = placement(SW_SHOWMAXIMIZED, WINDOWPLACEMENT_FLAGS(0));
+        assert_eq!(show_cmd_to_save(&p), SW_SHOWMAXIMIZED.0 as u32);
+        let p = placement(SW_SHOWNORMAL, WINDOWPLACEMENT_FLAGS(0));
+        assert_eq!(show_cmd_to_save(&p), SW_SHOWNORMAL.0 as u32);
+    }
+
+    #[test]
+    fn test_restore_never_starts_minimised() {
+        assert_eq!(show_cmd_to_restore(SW_SHOWMAXIMIZED.0), SW_SHOWMAXIMIZED.0 as u32);
+        assert_eq!(show_cmd_to_restore(SW_SHOWNORMAL.0), SW_SHOWNORMAL.0 as u32);
+        // Saved by older versions when closed while minimised.
+        assert_eq!(show_cmd_to_restore(SW_SHOWMINIMIZED.0), SW_SHOWNORMAL.0 as u32);
+        assert_eq!(show_cmd_to_restore(SW_MINIMIZE.0), SW_SHOWNORMAL.0 as u32);
     }
 }
