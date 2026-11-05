@@ -22,9 +22,11 @@ pub enum LinkAction {
     Refuse { target: String, reason: &'static str },
 }
 
+use crate::settings::{APP_NAME, app_name};
+
 pub const REFUSED_PROGRAM: &str =
-    "MDView does not open programs or scripts from links in a document.";
-pub const REFUSED_LINK_TYPE: &str = "MDView does not open this kind of link.";
+    concat!(app_name!(), " does not open programs or scripts from links in a document.");
+pub const REFUSED_LINK_TYPE: &str = concat!(app_name!(), " does not open this kind of link.");
 
 /// File types that run code when opened. Compared case-insensitively against
 /// the extension after `normalized_file_name`.
@@ -196,7 +198,7 @@ fn message_box(
     use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
     use windows::core::PCWSTR;
     let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+    let title: Vec<u16> = format!("{APP_NAME}\0").encode_utf16().collect();
     unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) }
 }
 

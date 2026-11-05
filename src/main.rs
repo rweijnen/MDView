@@ -294,10 +294,10 @@ fn main() {
     if opts.register {
         match register_file_association() {
             Ok(()) => {
-                write_console("MDView file association registered successfully.");
+                write_console(concat!(app_name!(), " file association registered successfully."));
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                    open_association_settings();
+                    open_association_settings(None);
                     CoUninitialize();
                 }
                 send_enter_key();
@@ -314,7 +314,7 @@ fn main() {
     if opts.unregister {
         match unregister_file_association() {
             Ok(()) => {
-                write_console("MDView file association removed successfully.");
+                write_console(concat!(app_name!(), " file association removed successfully."));
                 send_enter_key();
                 std::process::exit(0);
             }
@@ -364,7 +364,7 @@ fn main() {
                 dark_mode,
                 markdown::RemoteImages::Blocked,
             );
-            ("MDView".to_string(), welcome_html)
+            (APP_NAME.to_string(), welcome_html)
         };
 
         if let Err(e) = run_gui(&title, &full_html, opts.file_path.as_deref()) {
@@ -434,7 +434,7 @@ use windows::Win32::System::Registry::{
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     DragFinish, DragQueryFileW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog, HDROP,
-    IApplicationAssociationRegistrationUI, IFileOpenDialog, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
+    IFileOpenDialog, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
     SHChangeNotify, SHCreateMemStream, SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -455,12 +455,18 @@ const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 
-// Registry key for settings
-const REGISTRY_KEY: &str = "Software\\MDView";
+// The product name is defined once, in settings::app_name!().
+use settings::{APP_NAME, REGISTRY_KEY, app_name};
 
 // File association registration
-const PROGID: &str = "MDView.Markdown";
+const PROGID: &str = concat!(app_name!(), ".Markdown");
 const PROGID_DESCRIPTION: &str = "Markdown Document";
+/// Name under which MDView is listed in HKCU\Software\RegisteredApplications;
+/// the Settings deep link must use the same name.
+const REGISTERED_APP_NAME: &str = APP_NAME;
+const CAPABILITIES_KEY: &str = concat!("Software\\", app_name!(), "\\Capabilities");
+const FILE_ASSOCIATIONS_KEY: &str =
+    concat!("Software\\", app_name!(), "\\Capabilities\\FileAssociations");
 const APP_DESCRIPTION: &str = "Fast, lightweight Markdown viewer";
 
 // Undocumented uxtheme.dll ordinals for dark mode APIs
@@ -607,7 +613,7 @@ fn create_menu() -> windows::core::Result<HMENU> {
         )?;
 
         // Help menu items (native Windows menus)
-        let about_text: Vec<u16> = "&About MDView\0".encode_utf16().collect();
+        let about_text: Vec<u16> = concat!("&About ", app_name!(), "\0").encode_utf16().collect();
         AppendMenuW(
             help_menu,
             MF_STRING,
@@ -713,7 +719,7 @@ fn show_open_file_dialog(hwnd: HWND) -> Option<String> {
 /// Show the About dialog
 fn show_about_dialog(hwnd: HWND) {
     unsafe {
-        let title: Vec<u16> = "About MDView\0".encode_utf16().collect();
+        let title: Vec<u16> = concat!("About ", app_name!(), "\0").encode_utf16().collect();
         let message = format!(
             "MDView - Markdown Viewer v{}\n\n\
              Copyright 2026 Remko Weijnen\n\
@@ -1204,7 +1210,7 @@ fn create_blocked_response(
         environment,
         b"",
         403,
-        "Blocked by MDView",
+        concat!("Blocked by ", app_name!()),
         "text/plain; charset=utf-8",
         PASSIVE_FILE_HEADERS,
     )
@@ -1415,7 +1421,7 @@ fn save_remote_images_setting(hwnd: HWND, setting: settings::RemoteImagesSetting
             let text: Vec<u16> = format!("Could not save the remote images setting:\n\n{e}\0")
                 .encode_utf16()
                 .collect();
-            let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+            let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
             unsafe {
                 MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
             }
@@ -1460,7 +1466,7 @@ fn load_file_into_webview(hwnd: HWND, file_path: &str) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| file_path.to_string());
-    let title: Vec<u16> = format!("{} - MDView\0", filename).encode_utf16().collect();
+    let title: Vec<u16> = format!("{filename} - {APP_NAME}\0").encode_utf16().collect();
     unsafe {
         let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
     }
@@ -1630,32 +1636,16 @@ fn register_file_association() -> Result<(), String> {
     }
 
     // Capabilities
-    reg_set_named(
-        "Software\\MDView\\Capabilities",
-        "ApplicationDescription",
-        APP_DESCRIPTION,
-    )?;
-    reg_set_named(
-        "Software\\MDView\\Capabilities",
-        "ApplicationName",
-        "MDView",
-    )?;
-    reg_set_named(
-        "Software\\MDView\\Capabilities\\FileAssociations",
-        ".md",
-        PROGID,
-    )?;
-    reg_set_named(
-        "Software\\MDView\\Capabilities\\FileAssociations",
-        ".markdown",
-        PROGID,
-    )?;
+    reg_set_named(CAPABILITIES_KEY, "ApplicationDescription", APP_DESCRIPTION)?;
+    reg_set_named(CAPABILITIES_KEY, "ApplicationName", APP_NAME)?;
+    reg_set_named(FILE_ASSOCIATIONS_KEY, ".md", PROGID)?;
+    reg_set_named(FILE_ASSOCIATIONS_KEY, ".markdown", PROGID)?;
 
     // RegisteredApplications
     reg_set_named(
         "Software\\RegisteredApplications",
-        "MDView",
-        "Software\\MDView\\Capabilities",
+        REGISTERED_APP_NAME,
+        CAPABILITIES_KEY,
     )?;
 
     // App Paths
@@ -1703,7 +1693,7 @@ fn unregister_file_association() -> Result<(), String> {
         }
 
         // Delete Capabilities tree
-        let cap_key: Vec<u16> = "Software\\MDView\\Capabilities\0".encode_utf16().collect();
+        let cap_key: Vec<u16> = concat!("Software\\", app_name!(), "\\Capabilities\0").encode_utf16().collect();
         let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(cap_key.as_ptr()));
 
         // Remove from RegisteredApplications
@@ -1721,7 +1711,7 @@ fn unregister_file_association() -> Result<(), String> {
             )
             .is_ok()
             {
-                let name: Vec<u16> = "MDView\0".encode_utf16().collect();
+                let name: Vec<u16> = format!("{REGISTERED_APP_NAME}\0").encode_utf16().collect();
                 let _ = RegDeleteValueW(hkey, PCWSTR(name.as_ptr()));
                 let _ = RegCloseKey(hkey);
             }
@@ -1865,37 +1855,61 @@ fn set_dont_ask_register() {
     }
 }
 
-/// Open the system UI for setting MDView as the default app for its registered file types.
-/// Uses IApplicationAssociationRegistrationUI for a focused "set defaults" page.
-/// Falls back to ms-settings:defaultapps if the COM interface is unavailable.
-fn open_association_settings() {
-    unsafe {
-        // Try the focused association UI (shows only MDView's file types)
-        if let Ok(ui) = CoCreateInstance::<_, IApplicationAssociationRegistrationUI>(
-            &windows::core::GUID::from_u128(0x1968106d_f3b5_44cf_890e_116fcb9ecef1),
-            None,
-            CLSCTX_INPROC_SERVER,
-        ) {
-            let app_name: Vec<u16> = "MDView\0".encode_utf16().collect();
-            if ui
-                .LaunchAdvancedAssociationUI(PCWSTR(app_name.as_ptr()))
-                .is_ok()
-            {
-                return;
-            }
-        }
+/// The Settings page for choosing MDView for .md files. Windows 11 opens
+/// MDView's own default-apps page; versions without that deep link open the
+/// general Default apps page.
+fn default_apps_settings_uri() -> String {
+    format!("ms-settings:defaultapps?registeredAppUser={REGISTERED_APP_NAME}")
+}
 
-        // Fallback: open generic default apps settings
-        let settings_uri = U16CString::from_str("ms-settings:defaultapps").unwrap_or_default();
+/// After registering, take the user to the Settings page where MDView can be
+/// chosen for .md files.
+///
+/// Not IApplicationAssociationRegistrationUI::LaunchAdvancedAssociationUI:
+/// Windows 10 and 11 only show "To change your default apps, go to Settings >
+/// Apps > Default apps." for it, and report success (#36).
+fn open_association_settings(owner: Option<HWND>) {
+    unsafe {
+        let settings_uri = U16CString::from_str(default_apps_settings_uri()).unwrap_or_default();
         let open_verb = U16CString::from_str("open").unwrap_or_default();
-        ShellExecuteW(
-            None,
+        let result = ShellExecuteW(
+            owner,
             PCWSTR(open_verb.as_ptr()),
             PCWSTR(settings_uri.as_ptr()),
             None,
             None,
             SW_SHOWNORMAL,
         );
+        // ShellExecute returns a value greater than 32 on success.
+        if result.0 as usize <= 32 {
+            show_message(
+                owner,
+                "MDView is registered, but Windows Settings could not be opened.\n\n\
+                 To use MDView for .md files, open Settings > Apps > Default apps, \
+                 search for MDView and choose it for .md and .markdown.",
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+    }
+}
+
+/// Register MDView and open Settings; tell the user if registering failed.
+fn register_and_open_settings(owner: Option<HWND>) {
+    match register_file_association() {
+        Ok(()) => open_association_settings(owner),
+        Err(e) => show_message(
+            owner,
+            &format!("Could not register {APP_NAME} as a viewer for .md files:\n\n{e}"),
+            MB_OK | MB_ICONERROR,
+        ),
+    }
+}
+
+fn show_message(owner: Option<HWND>, text: &str, style: MESSAGEBOX_STYLE) {
+    let text: Vec<u16> = format!("{text}\0").encode_utf16().collect();
+    let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
+    unsafe {
+        MessageBoxW(owner, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style);
     }
 }
 
@@ -1968,7 +1982,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         });
 
         // Create main window with native menu bar (using SetMenu via CreateWindowExW)
-        let title_wide: Vec<u16> = format!("{} - MDView", title)
+        let title_wide: Vec<u16> = format!("{title} - {APP_NAME}")
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
@@ -2062,10 +2076,10 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
 
         // Check file association and prompt if not registered
         if !is_file_association_registered() && should_prompt_registration() {
-            let prompt_title: Vec<u16> = "MDView - File Association\0".encode_utf16().collect();
+            let prompt_title: Vec<u16> = concat!(app_name!(), " - File Association\0").encode_utf16().collect();
             let prompt_message: Vec<u16> = concat!(
-                "Would you like to register MDView as a viewer for .md files?\n\n",
-                "This will add MDView to the 'Open With' list.\n",
+                "Would you like to register ", app_name!(), " as a viewer for .md files?\n\n",
+                "This will add ", app_name!(), " to the 'Open With' list.\n",
                 "You can then set it as default in Windows Settings.\n\n",
                 "Choose 'Cancel' to never ask again.\0"
             )
@@ -2080,9 +2094,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             );
 
             if answer == IDYES {
-                if register_file_association().is_ok() {
-                    open_association_settings();
-                }
+                register_and_open_settings(Some(hwnd));
             } else if answer == IDCANCEL {
                 set_dont_ask_register();
             }
@@ -2139,7 +2151,7 @@ fn show_find_error(hwnd: HWND, e: &windows::core::Error) {
     let msg: Vec<u16> = format!("Could not open the find bar: {}\0", e.message())
     .encode_utf16()
     .collect();
-    let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+    let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
     unsafe {
         MessageBoxW(
             Some(hwnd),
@@ -2463,8 +2475,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     let user_data_folder = match settings::webview2_data_folder() {
         Ok(folder) => folder.to_string_lossy().into_owned(),
         Err(e) => {
-            let text: Vec<u16> = format!("MDView cannot start its viewer:\n\n{e}\0").encode_utf16().collect();
-            let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+            let text: Vec<u16> = format!("{APP_NAME} cannot start its viewer:\n\n{e}\0").encode_utf16().collect();
+            let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
             unsafe {
                 MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
             }
@@ -2587,9 +2599,7 @@ unsafe extern "system" fn window_proc(
                     LRESULT(0)
                 }
                 IDM_FILE_REGISTER => {
-                    if register_file_association().is_ok() {
-                        open_association_settings();
-                    }
+                    register_and_open_settings(Some(hwnd));
                     LRESULT(0)
                 }
                 IDM_FILE_UNREGISTER => {
@@ -2672,6 +2682,26 @@ mod tests {
         assert_eq!(show_cmd_to_save(&p), SW_SHOWMAXIMIZED.0 as u32);
         let p = placement(SW_SHOWNORMAL, WINDOWPLACEMENT_FLAGS(0));
         assert_eq!(show_cmd_to_save(&p), SW_SHOWNORMAL.0 as u32);
+    }
+
+    // #36: the Settings deep link must name exactly the application MDView
+    // registers under HKCU\Software\RegisteredApplications.
+    #[test]
+    fn test_settings_link_uses_the_registered_name() {
+        assert_eq!(default_apps_settings_uri(), "ms-settings:defaultapps?registeredAppUser=MDView");
+        assert!(default_apps_settings_uri().ends_with(&format!("={REGISTERED_APP_NAME}")));
+    }
+
+    // The product name is defined once; everything else is derived from it.
+    #[test]
+    fn test_names_are_derived_from_the_product_name() {
+        assert_eq!(APP_NAME, "MDView");
+        assert_eq!(REGISTRY_KEY, "Software\\MDView");
+        assert_eq!(PROGID, "MDView.Markdown");
+        assert_eq!(REGISTERED_APP_NAME, APP_NAME);
+        assert_eq!(CAPABILITIES_KEY, "Software\\MDView\\Capabilities");
+        assert_eq!(FILE_ASSOCIATIONS_KEY, "Software\\MDView\\Capabilities\\FileAssociations");
+        assert!(links::REFUSED_PROGRAM.starts_with("MDView does not open"));
     }
 
     #[test]
