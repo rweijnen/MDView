@@ -26,7 +26,7 @@ Click the badge itself:
 ## Relative non-markdown files
 
 - [Open LICENSE](../../LICENSE)
-- [Open screenshot image](../screenshot.png)
+- [Open screenshot image](../mdview-poster.jpg)
 
 ## Fragment links
 
@@ -44,7 +44,7 @@ Click the badge itself:
 
 If local resource mapping works, this image should render:
 
-![Local screenshot](../screenshot.png)
+![Local screenshot](../mdview-poster.jpg)
 
 Image in a subfolder next to this file (the layout from issue #7). A green bar should show:
 

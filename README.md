@@ -4,9 +4,7 @@
 
 A fast, lightweight Markdown viewer for Windows. Available as a Total Commander Lister plugin and standalone executable with rich terminal output.
 
-## Total Commander Plugin
-
-![MDView in Total Commander](assets/screenshot.png)
+![MDView in Total Commander, as a standalone viewer and in the terminal](https://raw.githubusercontent.com/rweijnen/MDView/main/assets/mdview-poster.jpg)
 
 ## Features
 
@@ -45,13 +43,9 @@ The standalone `mdview.exe` automatically detects its environment:
 
 Full support for modern terminal features including clickable hyperlinks (OSC 8), true color, and unicode box drawing for tables.
 
-![MDView in Windows Terminal](assets/screenshot-wt.png)
-
 ### Legacy cmd.exe
 
 ANSI escape processing is automatically enabled for color support in legacy consoles.
-
-![MDView in cmd.exe](assets/screenshot-cmd.png)
 
 ### Command Line Options
 
