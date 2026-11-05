@@ -704,10 +704,14 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
         },
     ));
 
-    // Start the creation process - use TEMP folder (auto-cleaned by Windows)
-    let user_data_folder = env::var("TEMP")
-        .map(|p| format!("{}\\MDView_WebView2", p))
-        .unwrap_or_else(|_| ".".to_string());
+    // Own WebView2 data folder for this host program (#33)
+    let user_data_folder = match crate::settings::webview2_data_folder() {
+        Ok(folder) => folder.to_string_lossy().into_owned(),
+        Err(e) => {
+            log_debug(&format!("no WebView2 data folder: {e}"));
+            return Err(windows::core::Error::new(E_FAIL, e));
+        }
+    };
     log_debug(&format!("User data folder: {}", user_data_folder));
     let user_data_wide = pwstr_from_str(&user_data_folder);
     log_debug("Calling CreateCoreWebView2EnvironmentWithOptions");

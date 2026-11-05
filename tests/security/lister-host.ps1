@@ -12,10 +12,13 @@ param(
     [Parameter(Mandatory)] [string]$Doc,
     [int]$Seconds = 6,
     [Parameter(Mandatory)] [string]$StatusFile,
-    [string]$Search
+    [string]$Search,
+    # Use this folder as TEMP (an elevated host does not inherit the caller's environment)
+    [string]$Temp
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Temp) { $env:TEMP = $Temp; $env:TMP = $Temp }
 Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type -TypeDefinition @'
