@@ -36,6 +36,7 @@ windows = { version = "0.61", features = [
     "Win32_Security",
     "Win32_System_WindowsProgramming",
     "Win32_Globalization",
+    "Win32_UI_HiDpi",
 ] }
 webview2-com = "0.38"
 once_cell = "1.20"
