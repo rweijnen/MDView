@@ -406,6 +406,19 @@ mod tests {
         assert!(!page.contains("script-src 'unsafe-inline'"));
     }
 
+    // Code that contains HTML or scripts is shown as text, not affected by the
+    // CSP; harmless raw HTML such as <details> keeps working.
+    #[test]
+    fn test_code_with_html_is_shown_as_text() {
+        let md = "Inline `<script>alert(1)</script>`\n\n```html\n<script>x()</script>\n<img src=x onerror=\"y()\">\n```\n\n    <script>indented</script>\n\n<details><summary>S</summary>body</details>\n";
+        let html = markdown_to_html(md);
+        assert!(html.contains("<code>&lt;script&gt;alert(1)&lt;/script&gt;</code>"), "{html}");
+        assert!(html.contains("&lt;script&gt;x()&lt;/script&gt;\n&lt;img src=x onerror=\"y()\"&gt;"), "{html}");
+        assert!(html.contains("&lt;script&gt;indented&lt;/script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "code must never become a real script tag: {html}");
+        assert!(html.contains("<details><summary>S</summary>body</details>"), "{html}");
+    }
+
     #[test]
     fn test_page_nonce_is_new_for_every_page() {
         let a = nonce_of(&wrap_html("", false, RemoteImages::Blocked));

