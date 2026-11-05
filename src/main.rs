@@ -345,7 +345,9 @@ fn main() {
             };
             let html_body = markdown::markdown_to_html(&markdown_content);
             let dark_mode = is_windows_dark_mode();
-            let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images_for(Path::new(path)));
+            // Not shown for a file: the document is loaded through its virtual URL
+            // and served by create_virtual_resource_response (with its bars).
+            let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images_for(Path::new(path)), &[]);
             let title = Path::new(path)
                 .file_name()
                 .unwrap_or_default()
@@ -363,6 +365,7 @@ fn main() {
                  </div>",
                 dark_mode,
                 markdown::RemoteImages::Blocked,
+                &[],
             );
             (APP_NAME.to_string(), welcome_html)
         };
@@ -395,7 +398,7 @@ fn main() {
             let dark_mode = is_windows_dark_mode();
             // An exported page is the user's own file, opened in their browser:
             // no banner works there, so remote images are allowed.
-            markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Allowed)
+            markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Allowed, &[])
         };
 
         if let Err(e) = io::stdout().write_all(output.as_bytes()) {
@@ -1183,7 +1186,9 @@ fn create_virtual_resource_response(
         let html_body = markdown::markdown_to_html(&markdown_content);
         let remote_images = remote_images_for(file_path);
         PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.set(remote_images == markdown::RemoteImages::Allowed));
-        let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images);
+        let bars = markdown::document_bars(remote_images);
+        let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
+        PAGE_BARS.with(|b| *b.borrow_mut() = bars);
         create_web_resource_response(
             environment,
             full_html.as_bytes(),
@@ -1383,9 +1388,18 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
                 queue_link(url.clone());
             }
         }
-        Some("remoteImages") => {
-            if let (Some(choice), Some(path)) = (msg.get("choice"), resolve_virtual_mdview_url(source)) {
-                handle_remote_images_choice(hwnd, choice, Path::new(&path));
+        Some("bar") => {
+            let (Some(bar), Some(choice)) = (msg.get("bar"), msg.get("choice")) else { return };
+            if !PAGE_BARS.with(|b| markdown::bar_choice_offered(&b.borrow(), bar, choice)) {
+                return;
+            }
+            match bar.as_str() {
+                markdown::REMOTE_IMAGES_BAR => {
+                    if let Some(path) = resolve_virtual_mdview_url(source) {
+                        handle_remote_images_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
+                _ => {}
             }
         }
         _ => {}
@@ -2137,6 +2151,8 @@ thread_local! {
     static REMOTE_IMAGES_ONCE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
     /// Whether the page being shown may load remote images (set when MDView serves it).
     static PAGE_ALLOWS_REMOTE_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The bars MDView put on the page being shown; only answers to these are accepted.
+    static PAGE_BARS: RefCell<Vec<markdown::Bar>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Posted to the main window to handle queued links (see `queue_link`).
