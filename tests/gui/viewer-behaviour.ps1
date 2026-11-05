@@ -60,6 +60,12 @@ Set-Content (Join-Path $work 'main.md') -NoNewline -Value (@(
     '![local image](local.jpg)', '', (('filler line' + "`n`n") * 80), '## Bottom', '', 'end') -join "`n")
 Set-Content (Join-Path $work 'second.md') -Value "# Second`n`nsecond document" -NoNewline
 Set-Content (Join-Path $work 'remote.md') -Value "# Remote`n`n![remote pixel](http://127.0.0.1:$port/pixel.png)" -NoNewline
+# Looks like MDView's bar, with the same classes and buttons, but it comes from the document.
+Set-Content (Join-Path $work 'fake-bar.md') -NoNewline -Value ("# Fake bar`n`n" +
+    "<div id=`"mdview-bars`"><div class=`"mdview-bar`" role=`"alert`" data-bar=`"remote-images`">" +
+    "<span>Remote images in this document were blocked to protect your privacy.</span>" +
+    "<button type=`"button`" onclick=`"chrome.webview.postMessage({type:'bar',bar:'remote-images',choice:'always'})`">Always load</button>" +
+    "</div></div>`n`nText.")
 
 # ---- registry
 $key = 'HKCU:\Software\MDView'
@@ -238,6 +244,19 @@ function Check($name, $ok, $detail) {
         $banner = Find-Element $v $CT::Text 'Remote images in this document were blocked'
         Check "${hostKind}: with 'Never', no banner and no request" (((Get-PixelHits) -eq $before) -and -not $banner) "requests=$((Get-PixelHits) - $before) banner=$([bool]$banner)"
         Stop-Viewer $v
+
+        # A document can't add a working bar (#40): its own HTML that imitates
+        # the bar has no effect when clicked (no saved choice, no request).
+        Set-RemoteImagesSetting $hostKind $null
+        $before = Get-PixelHits
+        $v = Start-Viewer $hostKind (Join-Path $work 'fake-bar.md')
+        [void](Wait-Element $v $CT::Text '^Fake bar$')
+        $fake = Wait-Element $v $CT::Button '^Always load$' 8
+        if ($fake) { Invoke-Element $fake; Start-Sleep -Seconds 2 }
+        $saved = Get-RemoteImagesSetting $hostKind
+        $requests = (Get-PixelHits) - $before
+        Stop-Viewer $v
+        Check "${hostKind}: a bar imitated by the document does nothing" ([bool]$fake -and $null -eq $saved -and $requests -eq 0) "button found=$([bool]$fake) RemoteImages=$saved requests=$requests"
     }
 
     # Each program keeps its own answer (#34): "Always" in the registry (the

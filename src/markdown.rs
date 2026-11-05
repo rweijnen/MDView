@@ -95,6 +95,113 @@ pub enum RemoteImages {
     Blocked,
 }
 
+/// A bar at the top of a document (Outlook-style), offered by MDView, never by
+/// the document. The user's choice is posted as `{type:'bar', bar, choice}`;
+/// the host acts on it only if it offered that bar on the page (#40).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bar {
+    pub id: &'static str,
+    pub text: String,
+    pub buttons: Vec<BarButton>,
+    pub show: BarShow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarButton {
+    pub choice: &'static str,
+    pub label: &'static str,
+    /// Remove the bar right away (the host does not reload the page).
+    pub closes_bar: bool,
+}
+
+/// When a bar appears.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarShow {
+    /// As soon as the page is shown.
+    #[allow(dead_code)] // for the registration (#37) and Mark of the Web (#24) bars
+    Now,
+    /// Only once a remote image was actually blocked.
+    WhenRemoteImageBlocked,
+}
+
+pub const REMOTE_IMAGES_BAR: &str = "remote-images";
+
+/// The bars MDView puts on a document page.
+pub fn document_bars(remote_images: RemoteImages) -> Vec<Bar> {
+    let mut bars = Vec::new();
+    if remote_images == RemoteImages::AskToLoad {
+        bars.push(Bar {
+            id: REMOTE_IMAGES_BAR,
+            text: "Remote images in this document were blocked to protect your privacy.".to_string(),
+            buttons: vec![
+                BarButton { choice: "once", label: "Load images", closes_bar: false },
+                BarButton { choice: "always", label: "Always load", closes_bar: false },
+                BarButton { choice: "never", label: "Never", closes_bar: true },
+            ],
+            show: BarShow::WhenRemoteImageBlocked,
+        });
+    }
+    bars
+}
+
+/// Whether `choice` is an answer to a bar that is on the page.
+pub fn bar_choice_offered(bars: &[Bar], bar: &str, choice: &str) -> bool {
+    bars.iter()
+        .any(|b| b.id == bar && b.buttons.iter().any(|button| button.choice == choice))
+}
+
+/// A JSON string literal that is also safe inside an HTML <script>: `<`, `>`
+/// and `&` are escaped, so the text can never end the script.
+fn script_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '<' | '>' | '&' | '\u{2028}' | '\u{2029}' => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn bars_json(bars: &[Bar]) -> String {
+    let items: Vec<String> = bars
+        .iter()
+        .map(|bar| {
+            let buttons: Vec<String> = bar
+                .buttons
+                .iter()
+                .map(|b| {
+                    format!(
+                        r#"{{"choice":{},"label":{},"closesBar":{}}}"#,
+                        script_string(b.choice),
+                        script_string(b.label),
+                        b.closes_bar
+                    )
+                })
+                .collect();
+            let show = match bar.show {
+                BarShow::Now => "now",
+                BarShow::WhenRemoteImageBlocked => "remoteImageBlocked",
+            };
+            format!(
+                r#"{{"id":{},"text":{},"buttons":[{}],"show":"{show}"}}"#,
+                script_string(bar.id),
+                script_string(&bar.text),
+                buttons.join(",")
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 /// A random value for the page's Content-Security-Policy nonce. Documents are
 /// written before they are shown, so they cannot know it, and only MDView's
 /// own scripts carry it. RandomState keys come from the OS random generator.
@@ -129,10 +236,10 @@ fn content_security_policy(nonce: &str, remote_images: RemoteImages) -> String {
     )
 }
 
-pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages) -> String {
+pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, bars: &[Bar]) -> String {
     let nonce = new_nonce();
     let csp = content_security_policy(&nonce, remote_images);
-    let ask_remote_images = remote_images == RemoteImages::AskToLoad;
+    let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
     let banner_border = if dark_mode { "#6b5b2a" } else { "#d4a72c" };
     let bg_color = if dark_mode { "#1e1e1e" } else { "#ffffff" };
@@ -155,29 +262,34 @@ pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages) ->
 <script nonce="{nonce}">
 // Registered before the document's images start loading, so no blocked
 // remote image is missed.
-window.__mdviewBlockedRemoteImages = false;
+window.__mdviewRemoteImageBlocked = false;
 document.addEventListener('securitypolicyviolation', function(e) {{
     if (String(e.violatedDirective).indexOf('img-src') === 0 && /^https?:/i.test(e.blockedURI)) {{
-        window.__mdviewBlockedRemoteImages = true;
-        if (window.__mdviewShowRemoteImagesBanner) window.__mdviewShowRemoteImagesBanner();
+        window.__mdviewRemoteImageBlocked = true;
+        if (window.__mdviewOnRemoteImageBlocked) window.__mdviewOnRemoteImageBlocked();
     }}
 }});
 </script>
 <style>
-#mdview-remote-images {{
+#mdview-bars {{
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: -8px 0 16px 0;
+}}
+.mdview-bar {{
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
-    margin: -8px 0 16px 0;
     padding: 6px 10px;
     border: 1px solid {banner_border};
     border-radius: 6px;
     background-color: {banner_bg};
     font-size: 13px;
 }}
-#mdview-remote-images span {{ flex: 1; }}
-#mdview-remote-images button {{ font: inherit; cursor: pointer; }}
+.mdview-bar span {{ flex: 1; }}
+.mdview-bar button {{ font: inherit; cursor: pointer; }}
 body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     font-size: 14px;
@@ -247,32 +359,47 @@ a {{ cursor: pointer; }}
 {content}
 <script nonce="{nonce}">
 (function() {{
-    var askRemoteImages = {ask_remote_images};
+    // Bars offered by MDView (markdown::Bar), stacked at the top of the page.
+    // The answer goes to MDView, which saves it or reloads the page as needed.
+    var bars = {bars};
+    var webview = window.chrome && window.chrome.webview;
 
-    // Outlook-style bar when remote images were blocked: load them this time,
-    // always, or never ask again. MDView itself reloads the page as needed.
-    window.__mdviewShowRemoteImagesBanner = function() {{
-        var webview = window.chrome && window.chrome.webview;
-        if (!askRemoteImages || !webview || document.getElementById('mdview-remote-images')) return;
+    function showBar(def) {{
+        if (!webview || document.querySelector('#mdview-bars > [data-bar="' + def.id + '"]')) return;
+        var stack = document.getElementById('mdview-bars');
+        if (!stack) {{
+            stack = document.createElement('div');
+            stack.id = 'mdview-bars';
+            document.body.insertBefore(stack, document.body.firstChild);
+        }}
         var bar = document.createElement('div');
-        bar.id = 'mdview-remote-images';
+        bar.className = 'mdview-bar';
         bar.setAttribute('role', 'alert');
+        bar.setAttribute('data-bar', def.id);
         var text = document.createElement('span');
-        text.textContent = 'Remote images in this document were blocked to protect your privacy.';
+        text.textContent = def.text;
         bar.appendChild(text);
-        [['once', 'Load images'], ['always', 'Always load'], ['never', 'Never']].forEach(function(c) {{
+        def.buttons.forEach(function(button) {{
             var b = document.createElement('button');
             b.type = 'button';
-            b.textContent = c[1];
+            b.textContent = button.label;
             b.addEventListener('click', function() {{
-                webview.postMessage({{type: 'remoteImages', choice: c[0]}});
-                if (c[0] === 'never') bar.remove();
+                webview.postMessage({{type: 'bar', bar: def.id, choice: button.choice}});
+                if (button.closesBar) {{
+                    bar.remove();
+                    if (!stack.firstChild) stack.remove();
+                }}
             }});
             bar.appendChild(b);
         }});
-        document.body.insertBefore(bar, document.body.firstChild);
+        stack.appendChild(bar);
+    }}
+
+    bars.forEach(function(def) {{ if (def.show === 'now') showBar(def); }});
+    window.__mdviewOnRemoteImageBlocked = function() {{
+        bars.forEach(function(def) {{ if (def.show === 'remoteImageBlocked') showBar(def); }});
     }};
-    if (window.__mdviewBlockedRemoteImages) window.__mdviewShowRemoteImagesBanner();
+    if (window.__mdviewRemoteImageBlocked) window.__mdviewOnRemoteImageBlocked();
 
     // Heading ids are generated server-side (markdown::assign_heading_ids).
     function scrollToHash(hash) {{
@@ -385,7 +512,7 @@ mod tests {
     #[test]
     fn test_page_csp_only_lets_mdview_scripts_run() {
         let body = markdown_to_html("# T\n\n<script>evil()</script>\n\n<img src=x onerror=\"evil()\">");
-        let page = wrap_html(&body, false, RemoteImages::AskToLoad);
+        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad));
         let nonce = nonce_of(&page);
         assert_eq!(nonce.len(), 32);
         let meta_at = page.find("<meta http-equiv=\"Content-Security-Policy\"").expect("CSP meta");
@@ -421,22 +548,103 @@ mod tests {
 
     #[test]
     fn test_page_nonce_is_new_for_every_page() {
-        let a = nonce_of(&wrap_html("", false, RemoteImages::Blocked));
-        let b = nonce_of(&wrap_html("", false, RemoteImages::Blocked));
+        let a = nonce_of(&wrap_html("", false, RemoteImages::Blocked, &[]));
+        let b = nonce_of(&wrap_html("", false, RemoteImages::Blocked, &[]));
         assert_ne!(a, b);
     }
 
     #[test]
     fn test_remote_images_load_only_when_allowed() {
-        let allowed = wrap_html("", false, RemoteImages::Allowed);
+        let allowed = wrap_html("", false, RemoteImages::Allowed, &[]);
         assert!(allowed.contains("img-src https://mdview.example data: https: http:;"));
-        assert!(allowed.contains("var askRemoteImages = false"));
-        let ask = wrap_html("", false, RemoteImages::AskToLoad);
+        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad));
         assert!(ask.contains("img-src https://mdview.example data:;"));
-        assert!(ask.contains("var askRemoteImages = true"));
-        let blocked = wrap_html("", false, RemoteImages::Blocked);
+        let blocked = wrap_html("", false, RemoteImages::Blocked, &[]);
         assert!(blocked.contains("img-src https://mdview.example data:;"));
-        assert!(blocked.contains("var askRemoteImages = false"));
+    }
+
+    // #40: one bar component; MDView decides which bars a page gets.
+    fn bar(id: &'static str, text: &str, buttons: &[(&'static str, &'static str, bool)], show: BarShow) -> Bar {
+        Bar {
+            id,
+            text: text.to_string(),
+            buttons: buttons
+                .iter()
+                .map(|&(choice, label, closes_bar)| BarButton { choice, label, closes_bar })
+                .collect(),
+            show,
+        }
+    }
+
+    #[test]
+    fn test_page_shows_every_bar_it_is_given_in_order() {
+        let bars = [
+            bar("first", "First bar", &[("yes", "Yes", false), ("no", "No", true)], BarShow::Now),
+            bar("second", "Second bar", &[("ok", "OK", true)], BarShow::WhenRemoteImageBlocked),
+        ];
+        let page = wrap_html("", false, RemoteImages::Blocked, &bars);
+        let first = page.find(r#""id":"first""#).expect("first bar in the page");
+        let second = page.find(r#""id":"second""#).expect("second bar in the page");
+        assert!(first < second, "bars keep their order");
+        for part in [
+            r#""text":"First bar""#,
+            r#"{"choice":"yes","label":"Yes","closesBar":false}"#,
+            r#"{"choice":"no","label":"No","closesBar":true}"#,
+            r#""show":"now""#,
+            r#""show":"remoteImageBlocked""#,
+        ] {
+            assert!(page.contains(part), "missing {part}");
+        }
+        let none = wrap_html("", false, RemoteImages::Blocked, &[]);
+        assert!(none.contains("var bars = [];"), "a page without bars gets an empty list");
+    }
+
+    // Bar text is written into MDView's own script; it must never be able to
+    // end that script or start another one.
+    #[test]
+    fn test_bar_text_cannot_leave_the_script() {
+        let text = "</script><script>x()</script> & <!-- \"q\" \\ \u{2028}\u{2029}\n";
+        let page = wrap_html("", false, RemoteImages::Blocked, &[bar("b", text, &[], BarShow::Now)]);
+        let nonce = nonce_of(&page);
+        assert_eq!(page.matches("<script").count(), 2, "only MDView's own two scripts");
+        assert_eq!(page.matches(&format!("<script nonce=\"{nonce}\">")).count(), 2);
+        assert_eq!(page.matches("</script>").count(), 2);
+        // Expected JSON, built from parts: `u(x)` is a backslash-u escape.
+        let u = |hex: &str| format!("{}u{hex}", char::from(92));
+        let bs = char::from(92);
+        let expected = format!(
+            "\"text\":\"{lt}/script{gt}{lt}script{gt}x(){lt}/script{gt} {amp} {lt}!-- {bs}\"q{bs}\" {bs}{bs} {ls}{ps}{bs}n\"",
+            lt = u("003c"), gt = u("003e"), amp = u("0026"), ls = u("2028"), ps = u("2029")
+        );
+        assert!(page.contains(&expected), "expected {expected}");
+    }
+
+    #[test]
+    fn test_document_bars_follow_remote_images() {
+        let bars = document_bars(RemoteImages::AskToLoad);
+        assert_eq!(bars.len(), 1);
+        let remote = &bars[0];
+        assert_eq!(remote.id, REMOTE_IMAGES_BAR);
+        assert_eq!(remote.show, BarShow::WhenRemoteImageBlocked);
+        assert_eq!(remote.text, "Remote images in this document were blocked to protect your privacy.");
+        let buttons: Vec<_> = remote.buttons.iter().map(|b| (b.choice, b.label, b.closes_bar)).collect();
+        assert_eq!(
+            buttons,
+            [("once", "Load images", false), ("always", "Always load", false), ("never", "Never", true)]
+        );
+        assert!(document_bars(RemoteImages::Allowed).is_empty());
+        assert!(document_bars(RemoteImages::Blocked).is_empty());
+    }
+
+    // The host only acts on an answer to a bar it put on the current page.
+    #[test]
+    fn test_only_offered_bar_choices_are_accepted() {
+        let bars = document_bars(RemoteImages::AskToLoad);
+        assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "once"));
+        assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "never"));
+        assert!(!bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "delete"), "unknown choice");
+        assert!(!bar_choice_offered(&bars, "register", "yes"), "bar not on this page");
+        assert!(!bar_choice_offered(&[], REMOTE_IMAGES_BAR, "always"), "no bars offered");
     }
 
     #[test]

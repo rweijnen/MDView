@@ -58,6 +58,8 @@ thread_local! {
     static REMOTE_IMAGES_ONCE: RefCell<HashMap<isize, std::path::PathBuf>> = RefCell::new(HashMap::new());
     /// Per viewer: whether the page being shown may load remote images (set when MDView serves it).
     static PAGE_ALLOWS_REMOTE_IMAGES: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
+    /// Per viewer: the bars MDView put on the page being shown; only answers to these are accepted.
+    static PAGE_BARS: RefCell<HashMap<isize, Vec<crate::markdown::Bar>>> = RefCell::new(HashMap::new());
 }
 
 /// Posted to a viewer window to handle its queued links (see `queue_link`).
@@ -293,7 +295,9 @@ fn create_virtual_resource_response(
                 remote_images == crate::markdown::RemoteImages::Allowed,
             )
         });
-        let full_html = crate::markdown::wrap_html(&html_body, dark_mode, remote_images);
+        let bars = crate::markdown::document_bars(remote_images);
+        let full_html = crate::markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
+        PAGE_BARS.with(|b| b.borrow_mut().insert(hwnd.0 as isize, bars));
         create_web_resource_response(
             environment,
             full_html.as_bytes(),
@@ -802,6 +806,7 @@ fn cleanup_viewer_state(hwnd: HWND) {
     EXPECT_STRING_PAGE.with(|e| e.borrow_mut().remove(&key));
     REMOTE_IMAGES_ONCE.with(|o| o.borrow_mut().remove(&key));
     PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.borrow_mut().remove(&key));
+    PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
 }
 
 fn unregister_window_class_if_unused() {
@@ -1033,11 +1038,24 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
                 queue_link(hwnd, url.clone());
             }
         }
-        Some("remoteImages") => {
-            if let (Some(choice), Some(path)) =
-                (msg.get("choice"), resolve_virtual_mdview_url(hwnd, source))
-            {
-                handle_remote_images_choice(hwnd, choice, Path::new(&path));
+        Some("bar") => {
+            let (Some(bar), Some(choice)) = (msg.get("bar"), msg.get("choice")) else { return };
+            let offered = PAGE_BARS.with(|b| {
+                b.borrow()
+                    .get(&(hwnd.0 as isize))
+                    .is_some_and(|bars| crate::markdown::bar_choice_offered(bars, bar, choice))
+            });
+            if !offered {
+                log_debug(&format!("ignored answer to a bar not on this page: {bar} / {choice}"));
+                return;
+            }
+            match bar.as_str() {
+                crate::markdown::REMOTE_IMAGES_BAR => {
+                    if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
+                        handle_remote_images_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
+                _ => {}
             }
         }
         _ => {}
