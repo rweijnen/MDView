@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 
 mod dark_menu;
+mod links;
 mod markdown;
+mod settings;
 mod terminal;
 
 use std::cell::RefCell;
@@ -343,7 +345,7 @@ fn main() {
             };
             let html_body = markdown::markdown_to_html(&markdown_content);
             let dark_mode = is_windows_dark_mode();
-            let full_html = markdown::wrap_html(&html_body, dark_mode);
+            let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images_for(Path::new(path)));
             let title = Path::new(path)
                 .file_name()
                 .unwrap_or_default()
@@ -360,6 +362,7 @@ fn main() {
                  <p>or drag and drop a .md file onto this window.</p>\
                  </div>",
                 dark_mode,
+                markdown::RemoteImages::Blocked,
             );
             ("MDView".to_string(), welcome_html)
         };
@@ -390,7 +393,9 @@ fn main() {
         } else {
             let html_body = markdown::markdown_to_html(&markdown_content);
             let dark_mode = is_windows_dark_mode();
-            markdown::wrap_html(&html_body, dark_mode)
+            // An exported page is the user's own file, opened in their browser:
+            // no banner works there, so remote images are allowed.
+            markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Allowed)
         };
 
         if let Err(e) = io::stdout().write_all(output.as_bytes()) {
@@ -1028,22 +1033,6 @@ fn restore_window_position(hwnd: HWND) -> bool {
     }
 }
 
-/// Open a URL in the default browser
-fn open_url_in_browser(url: &str) {
-    unsafe {
-        let url_wide = U16CString::from_str(url).unwrap_or_default();
-        let open_wide = U16CString::from_str("open").unwrap_or_default();
-        ShellExecuteW(
-            None,
-            PCWSTR(open_wide.as_ptr()),
-            PCWSTR(url_wide.as_ptr()),
-            None,
-            None,
-            SW_SHOWNORMAL,
-        );
-    }
-}
-
 fn absolute_path(path: &Path) -> Option<std::path::PathBuf> {
     if path.is_absolute() {
         Some(path.to_path_buf())
@@ -1130,18 +1119,24 @@ fn content_type_for_path(path: &Path) -> &'static str {
         .unwrap_or("application/octet-stream")
 }
 
+/// Headers for files other than the Markdown page (images, and anything else a
+/// document refers to): never run as a page with script, never sniffed into
+/// another type. A local .html or .svg must not run script on MDView's origin.
+const PASSIVE_FILE_HEADERS: &str = "\r\nContent-Security-Policy: default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox\r\nX-Content-Type-Options: nosniff";
+
 fn create_web_resource_response(
     environment: &ICoreWebView2Environment,
     bytes: &[u8],
     status_code: i32,
     reason: &str,
     content_type: &str,
+    extra_headers: &str,
 ) -> Option<ICoreWebView2WebResourceResponse> {
     let stream = unsafe { SHCreateMemStream(Some(bytes)) }?;
     let reason_wide = pwstr_from_str(reason);
     let headers = format!(
-        "Content-Type: {}\r\nAccess-Control-Allow-Origin: *",
-        content_type
+        "Content-Type: {}\r\nAccess-Control-Allow-Origin: *{}",
+        content_type, extra_headers
     );
     let headers_wide = pwstr_from_str(&headers);
     unsafe {
@@ -1165,6 +1160,7 @@ fn create_not_found_response(
         404,
         "Not Found",
         "text/plain; charset=utf-8",
+        PASSIVE_FILE_HEADERS,
     )
 }
 
@@ -1173,22 +1169,19 @@ fn create_virtual_resource_response(
     file_path: &Path,
     dark_mode: bool,
 ) -> Option<ICoreWebView2WebResourceResponse> {
-    let ext = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    if ext == "md" || ext == "markdown" {
+    if links::is_markdown(file_path) {
         let markdown_content = fs::read_to_string(file_path).ok()?;
         let html_body = markdown::markdown_to_html(&markdown_content);
-        let full_html = markdown::wrap_html(&html_body, dark_mode);
+        let remote_images = remote_images_for(file_path);
+        PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.set(remote_images == markdown::RemoteImages::Allowed));
+        let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images);
         create_web_resource_response(
             environment,
             full_html.as_bytes(),
             200,
             "OK",
             "text/html; charset=utf-8",
+            "",
         )
     } else {
         let bytes = fs::read(file_path).ok()?;
@@ -1198,7 +1191,48 @@ fn create_virtual_resource_response(
             200,
             "OK",
             content_type_for_path(file_path),
+            PASSIVE_FILE_HEADERS,
         )
+    }
+}
+
+/// Answer for a request MDView does not allow to reach the network.
+fn create_blocked_response(
+    environment: &ICoreWebView2Environment,
+) -> Option<ICoreWebView2WebResourceResponse> {
+    create_web_resource_response(
+        environment,
+        b"",
+        403,
+        "Blocked by MDView",
+        "text/plain; charset=utf-8",
+        PASSIVE_FILE_HEADERS,
+    )
+}
+
+/// A request outside MDView's own files may only go out if it is an image on
+/// a page whose remote images the user chose to load.
+fn remote_request_allowed(uri: &str, context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> bool {
+    let lower = uri.to_ascii_lowercase();
+    context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
+        && (lower.starts_with("https://") || lower.starts_with("http://"))
+        && PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.get())
+}
+
+/// Remote images for a document: the saved choice, or "load once" if the user
+/// chose that for this document in the banner.
+fn remote_images_for(file_path: &Path) -> markdown::RemoteImages {
+    match settings::remote_images_setting() {
+        settings::RemoteImagesSetting::Always => markdown::RemoteImages::Allowed,
+        settings::RemoteImagesSetting::Never => markdown::RemoteImages::Blocked,
+        settings::RemoteImagesSetting::Ask => {
+            let once = REMOTE_IMAGES_ONCE.with(|o| o.borrow().as_deref() == Some(file_path));
+            if once {
+                markdown::RemoteImages::Allowed
+            } else {
+                markdown::RemoteImages::AskToLoad
+            }
+        }
     }
 }
 
@@ -1285,86 +1319,109 @@ fn is_internal_virtual_url(url: &str) -> bool {
     url.starts_with("https://mdview.example/") || url.starts_with("http://mdview.example/")
 }
 
-fn should_allow_webview_navigation(url: &str, user_initiated: bool) -> bool {
-    !user_initiated
-        || is_internal_virtual_url(url)
-        || url == "about:blank"
-        || url.starts_with("about:blank#")
-        || url.starts_with("data:")
+/// Only MDView's own pages may be shown: Markdown documents on the virtual
+/// origin, and the welcome page MDView itself loads with NavigateToString.
+/// Everything else (script or <meta refresh> navigation, other files, other
+/// sites) is cancelled; a link the user clicked goes through `queue_link`.
+fn navigation_allowed(url: &str) -> bool {
+    if is_internal_virtual_url(url) {
+        return resolve_virtual_mdview_url(url)
+            .is_some_and(|path| links::is_markdown(Path::new(&path)));
+    }
+    if url.starts_with("data:") || url == "about:blank" {
+        return EXPECT_STRING_PAGE.with(|e| e.replace(false));
+    }
+    false
 }
 
-fn open_resolved_or_external_url(url: &str) {
-    if let Some(resolved_path) = resolve_virtual_mdview_url(url) {
-        open_url_in_browser(&resolved_path);
-    } else {
-        open_url_in_browser(url);
+/// Whether a message comes from a page MDView itself loaded.
+fn is_trusted_page(source: &str) -> bool {
+    if is_internal_virtual_url(source) {
+        return resolve_virtual_mdview_url(source)
+            .is_some_and(|path| links::is_markdown(Path::new(&path)));
+    }
+    source.starts_with("data:") || source == "about:blank"
+}
+
+/// Handle a link outside of the WebView2 event that reported it, so the
+/// confirmation dialog is not shown from inside a WebView2 callback.
+fn queue_link(url: String) {
+    PENDING_LINKS.with(|q| q.borrow_mut().push_back(url));
+    if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+        let _ = unsafe { PostMessageW(Some(hwnd), WM_MDVIEW_LINK, WPARAM(0), LPARAM(0)) };
     }
 }
 
-/// Handle a regular click on a link in the viewer
-fn handle_follow_link(url: &str) {
-    if let Some(resolved_path) = resolve_virtual_mdview_url(url) {
-        let ext = Path::new(&resolved_path)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
+fn handle_queued_links(hwnd: HWND) {
+    while let Some(url) = PENDING_LINKS.with(|q| q.borrow_mut().pop_front()) {
+        let action = links::classify_url(&url, |u| {
+            resolve_virtual_mdview_url(u).map(std::path::PathBuf::from)
+        });
+        links::perform(action, hwnd, |path| {
+            load_file_into_webview(hwnd, &path.to_string_lossy())
+        });
+    }
+}
 
-        if ext == "md" || ext == "markdown" {
-            MAIN_HWND.with(|h| {
-                if let Some(hwnd) = h.borrow().as_ref() {
-                    load_file_into_webview(*hwnd, &resolved_path);
-                }
-            });
-            return;
+/// A message from MDView's page script.
+fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap<String, String>) {
+    match msg.get("type").map(String::as_str) {
+        Some("close") => {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
+        Some("openLink") => {
+            if let Some(url) = msg.get("url") {
+                queue_link(url.clone());
+            }
+        }
+        Some("remoteImages") => {
+            if let (Some(choice), Some(path)) = (msg.get("choice"), resolve_virtual_mdview_url(source)) {
+                handle_remote_images_choice(hwnd, choice, Path::new(&path));
+            }
+        }
+        _ => {}
     }
+}
 
-    // External URLs: open in browser
-    if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("mailto:") {
-        open_url_in_browser(url);
-        return;
-    }
-
-    // Strip fragment (#section) for file path resolution
-    let path_part = url.split('#').next().unwrap_or(url);
-
-    // Check if it's a markdown file
-    let ext = Path::new(path_part)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-
-    if ext == "md" || ext == "markdown" {
-        // Resolve relative path against current file's directory
-        let resolved = CURRENT_FILE.with(|f| {
-            let current = f.borrow();
-            if let Some(current_path) = current.as_ref() {
-                if let Some(dir) = Path::new(current_path).parent() {
-                    let target = dir.join(path_part);
-                    target
-                        .canonicalize()
-                        .ok()
-                        .map(|p| p.to_string_lossy().to_string())
-                } else {
-                    None
+/// The user's answer in the remote-images banner.
+fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
+    let reload = match choice {
+        "once" => {
+            REMOTE_IMAGES_ONCE.with(|o| *o.borrow_mut() = Some(document.to_path_buf()));
+            true
+        }
+        "always" => save_remote_images_setting(hwnd, settings::RemoteImagesSetting::Always),
+        "never" => {
+            save_remote_images_setting(hwnd, settings::RemoteImagesSetting::Never);
+            false
+        }
+        _ => false,
+    };
+    if reload {
+        CONTROLLER.with(|c| {
+            if let Some(controller) = c.borrow().as_ref() {
+                if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                    let _ = unsafe { webview.Reload() };
                 }
-            } else {
-                None
             }
         });
+    }
+}
 
-        if let Some(resolved_path) = resolved {
-            MAIN_HWND.with(|h| {
-                if let Some(hwnd) = h.borrow().as_ref() {
-                    load_file_into_webview(*hwnd, &resolved_path);
-                }
-            });
-            return;
+fn save_remote_images_setting(hwnd: HWND, setting: settings::RemoteImagesSetting) -> bool {
+    match settings::set_remote_images_setting(setting) {
+        Ok(()) => true,
+        Err(e) => {
+            let text: Vec<u16> = format!("Could not save the remote images setting:\n\n{e}\0")
+                .encode_utf16()
+                .collect();
+            let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+            unsafe {
+                MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+            }
+            false
         }
     }
-
-    // Fallback: try to open with default handler
-    open_url_in_browser(url);
 }
 
 /// Load a file into the WebView
@@ -2056,7 +2113,19 @@ thread_local! {
     static ACCEL_HANDLE: RefCell<Option<HACCEL>> = const { RefCell::new(None) };
     static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
     static ENVIRONMENT: RefCell<Option<ICoreWebView2Environment>> = const { RefCell::new(None) };
+    /// Links waiting to be handled outside the WebView2 event that reported them.
+    static PENDING_LINKS: RefCell<std::collections::VecDeque<String>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Set just before MDView calls NavigateToString, so only that navigation
+    /// to a data:/about:blank page is allowed.
+    static EXPECT_STRING_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The document for which the user chose "Load images" in the banner.
+    static REMOTE_IMAGES_ONCE: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
+    /// Whether the page being shown may load remote images (set when MDView serves it).
+    static PAGE_ALLOWS_REMOTE_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Posted to the main window to handle queued links (see `queue_link`).
+const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2174,9 +2243,15 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 let _ = settings.SetIsWebMessageEnabled(true);
                                 let _ = settings.SetAreDefaultContextMenusEnabled(true);
                                 let _ = settings.SetIsStatusBarEnabled(false);
+                                let _ = settings.SetAreHostObjectsAllowed(false);
                             }
 
-                            let filter = pwstr_from_str("https://mdview.example/*");
+                            // Every request goes through MDView: its own files are
+                            // served from disk, and nothing else reaches the network
+                            // except remote images the user chose to load. (A
+                            // cancelled navigation, e.g. <meta refresh>, can already
+                            // have sent its request; this answers it locally.)
+                            let filter = pwstr_from_str("*");
                             let _ = webview.AddWebResourceRequestedFilter(
                                 PCWSTR(filter.as_ptr()),
                                 COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
@@ -2198,12 +2273,22 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                     windows::Win32::System::Com::CoTaskMemFree(
                                                         Some(uri_ptr.0 as *const _),
                                                     );
-                                                    if let Some(response) =
+                                                    let response = if is_internal_virtual_url(&uri) {
                                                         create_response_for_virtual_url(
                                                             &resource_environment,
                                                             &uri,
                                                         )
-                                                    {
+                                                    } else {
+                                                        let mut context =
+                                                            COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
+                                                        let _ = args.ResourceContext(&mut context);
+                                                        if remote_request_allowed(&uri, context) {
+                                                            None
+                                                        } else {
+                                                            create_blocked_response(&resource_environment)
+                                                        }
+                                                    };
+                                                    if let Some(response) = response {
                                                         let _ = args.SetResponse(&response);
                                                     }
                                                 }
@@ -2216,6 +2301,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let _ = webview
                                 .add_WebResourceRequested(&resource_handler, &mut resource_token);
 
+                            // Only MDView's own pages may load; a link the user
+                            // clicked is handled by the link policy instead.
                             let nav_handler = webview2_com::NavigationStartingEventHandler::create(
                                 Box::new(move |_webview, args| {
                                     if let Some(args) = args {
@@ -2228,13 +2315,14 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             windows::Win32::System::Com::CoTaskMemFree(Some(
                                                 uri_ptr.0 as *const _,
                                             ));
-                                            if !should_allow_webview_navigation(
-                                                &uri,
-                                                user_initiated.as_bool(),
-                                            ) {
+                                            if !navigation_allowed(&uri) {
                                                 let _ = args.SetCancel(true);
-                                                open_url_in_browser(&uri);
+                                                if user_initiated.as_bool() {
+                                                    queue_link(uri);
+                                                }
                                             }
+                                        } else {
+                                            let _ = args.SetCancel(true);
                                         }
                                     }
                                     Ok(())
@@ -2243,6 +2331,62 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
 
+                            // No new windows: a link the user opened in a new
+                            // window goes through the link policy.
+                            let new_window_handler =
+                                webview2_com::NewWindowRequestedEventHandler::create(Box::new(
+                                    move |_webview, args| {
+                                        if let Some(args) = args {
+                                            let _ = args.SetHandled(true);
+                                            let mut user_initiated = windows::core::BOOL(0);
+                                            let _ = args.IsUserInitiated(&mut user_initiated);
+                                            let mut uri_ptr = windows::core::PWSTR::null();
+                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                                let uri = uri_ptr.to_string().unwrap_or_default();
+                                                windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                    uri_ptr.0 as *const _,
+                                                ));
+                                                if user_initiated.as_bool() {
+                                                    queue_link(uri);
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    },
+                                ));
+                            let mut new_window_token: i64 = 0;
+                            let _ = webview
+                                .add_NewWindowRequested(&new_window_handler, &mut new_window_token);
+
+                            // No downloads and no permissions (camera, location, ...).
+                            if let Ok(webview4) = webview.cast::<ICoreWebView2_4>() {
+                                let download_handler =
+                                    webview2_com::DownloadStartingEventHandler::create(Box::new(
+                                        |_webview, args| {
+                                            if let Some(args) = args {
+                                                let _ = args.SetCancel(true);
+                                                let _ = args.SetHandled(true);
+                                            }
+                                            Ok(())
+                                        },
+                                    ));
+                                let mut download_token: i64 = 0;
+                                let _ = webview4
+                                    .add_DownloadStarting(&download_handler, &mut download_token);
+                            }
+                            let permission_handler =
+                                webview2_com::PermissionRequestedEventHandler::create(Box::new(
+                                    |_webview, args| {
+                                        if let Some(args) = args {
+                                            let _ = args.SetState(COREWEBVIEW2_PERMISSION_STATE_DENY);
+                                        }
+                                        Ok(())
+                                    },
+                                ));
+                            let mut permission_token: i64 = 0;
+                            let _ = webview
+                                .add_PermissionRequested(&permission_handler, &mut permission_token);
+
                             if let Some(current_file) = CURRENT_FILE.with(|f| f.borrow().clone()) {
                                 if let Some(url) = virtual_url_for_file(Path::new(&current_file)) {
                                     let url_wide = pwstr_from_str(&url);
@@ -2250,55 +2394,44 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 }
                             } else {
                                 let html_wide = pwstr_from_str(&html_for_nav);
+                                EXPECT_STRING_PAGE.with(|e| e.set(true));
                                 if let Err(e) = webview.NavigateToString(PCWSTR(html_wide.as_ptr()))
                                 {
                                     eprintln!("NavigateToString failed: {:?}", e);
                                 }
                             }
 
-                            // Add message handler for link clicks
+                            // Messages from MDView's own page script only.
                             let main_hwnd = hwnd;
                             let handler = webview2_com::WebMessageReceivedEventHandler::create(
                                 Box::new(move |_webview, args| {
                                     if let Some(args) = args {
+                                        let mut source_ptr = windows::core::PWSTR::null();
+                                        let source = if args.Source(&mut source_ptr).is_ok()
+                                            && !source_ptr.is_null()
+                                        {
+                                            let s = source_ptr.to_string().unwrap_or_default();
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(
+                                                source_ptr.0 as *const _,
+                                            ));
+                                            s
+                                        } else {
+                                            String::new()
+                                        };
+                                        if !is_trusted_page(&source) {
+                                            return Ok(());
+                                        }
                                         let mut message_ptr: windows::core::PWSTR =
                                             windows::core::PWSTR::null();
                                         if args.WebMessageAsJson(&mut message_ptr).is_ok()
                                             && !message_ptr.is_null()
                                         {
-                                            let msg_str =
-                                                message_ptr.to_string().unwrap_or_default();
+                                            let json = message_ptr.to_string().unwrap_or_default();
                                             windows::Win32::System::Com::CoTaskMemFree(Some(
                                                 message_ptr.0 as *const _,
                                             ));
-
-                                            if msg_str.contains("\"close\"") {
-                                                let _ = PostMessageW(
-                                                    Some(main_hwnd),
-                                                    WM_CLOSE,
-                                                    WPARAM(0),
-                                                    LPARAM(0),
-                                                );
-                                                return Ok(());
-                                            }
-
-                                            // Extract URL from JSON message
-                                            if let Some(start) = msg_str.find("\"url\":\"") {
-                                                let url_start = start + 7;
-                                                if let Some(end) = msg_str[url_start..].find('"') {
-                                                    let url = msg_str[url_start..url_start + end]
-                                                        .to_string();
-                                                    // Unescape JSON backslashes
-                                                    let url = url
-                                                        .replace("\\\\", "\\")
-                                                        .replace("\\/", "/");
-
-                                                    if msg_str.contains("openLink") {
-                                                        open_resolved_or_external_url(&url);
-                                                    } else if msg_str.contains("followLink") {
-                                                        handle_follow_link(&url);
-                                                    }
-                                                }
+                                            if let Some(msg) = links::parse_page_message(&json) {
+                                                handle_page_message(main_hwnd, &source, &msg);
                                             }
                                         }
                                     }
@@ -2395,6 +2528,10 @@ unsafe extern "system" fn window_proc(
                 });
             }
             return result;
+        }
+        WM_MDVIEW_LINK => {
+            handle_queued_links(hwnd);
+            LRESULT(0)
         }
         // Windows gives focus to this window when it is activated; pass it on
         // to the document.

@@ -3,6 +3,18 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
+## v0.2.6
+
+### Hardening
+MDView now treats Markdown files as untrusted content. Updating is recommended.
+- **Scripts in documents don't run.** Markdown can contain HTML, including scripts. MDView only runs its own scripts and only shows its own pages, also when viewing with F3 in Total Commander.
+- **Links don't start programs.** Links to programs and scripts (`.exe`, `.cmd`, `.ps1`, `.lnk`, …) are refused with a message. Other local files open after you confirm. Web and mail links open in your browser or mail app, as before.
+- **Remote images are blocked by default** for privacy. A bar at the top offers **Load images**, **Always load** or **Never**.
+- **Terminal output:** escape sequences in a document are not passed to the terminal.
+
+### Other
+- The README shows all views in one overview image.
+
 ## v0.2.5
 
 ### Fixes
