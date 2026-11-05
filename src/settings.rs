@@ -1,5 +1,13 @@
-//! Settings shared by the standalone viewer and the Total Commander plugin,
-//! stored under `HKCU\Software\MDView`.
+//! Settings of the standalone viewer and the Total Commander plugin.
+//!
+//! Each program keeps its own settings, and answers to bars and prompts are
+//! stored where they were given (#34):
+//! - standalone viewer: `HKCU\Software\MDView`
+//! - TC plugin: `mdview.ini` in TC's ini folder (next to wincmd.ini), as
+//!   reported by TC through `ListSetDefaultParams` (WLX SDK)
+
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
@@ -22,12 +30,130 @@ pub const REGISTRY_KEY: &str = concat!("Software\\", app_name!());
 
 const REMOTE_IMAGES: &str = "RemoteImages";
 
+/// The plugin's own settings file, in TC's ini folder. Not TC's shared
+/// lsplugin.ini: that file is shared with other plugins (WLX SDK).
+#[allow(dead_code)] // plugin only; settings.rs is compiled into both binaries
+pub const PLUGIN_INI_NAME: &str = concat!(app_name!(), ".ini");
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Read a DWORD value; `None` if the key or value does not exist.
+/// Where this program keeps its settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Store {
+    /// Standalone viewer: `HKCU\Software\MDView`.
+    Registry,
+    /// TC plugin: `mdview.ini` in TC's ini folder.
+    #[allow(dead_code)] // constructed by the plugin only
+    Ini(PathBuf),
+    /// TC plugin without a usable ini folder from TC: nothing can be stored.
+    Unavailable(String),
+}
+
+static STORE: OnceLock<Store> = OnceLock::new();
+
+/// This program's settings store. The standalone viewer always uses the
+/// registry; the plugin uses what `ListSetDefaultParams` set, and nothing if TC
+/// never reported its ini folder (MDView only supports TC as plugin host).
+fn store() -> &'static Store {
+    STORE.get_or_init(|| {
+        if crate::IS_PLUGIN {
+            Store::Unavailable("Total Commander did not report its settings folder".to_string())
+        } else {
+            Store::Registry
+        }
+    })
+}
+
+/// The plugin's store for TC's ini folder (the folder of `DefaultIniName`).
+#[allow(dead_code)] // plugin only
+pub fn ini_store_for(ini_folder: &Path) -> Store {
+    if ini_folder.as_os_str().is_empty() {
+        Store::Unavailable("Total Commander reported an empty settings folder".to_string())
+    } else if !ini_folder.is_dir() {
+        Store::Unavailable(format!(
+            "Total Commander's settings folder {} was not found",
+            ini_folder.display()
+        ))
+    } else {
+        Store::Ini(ini_folder.join(PLUGIN_INI_NAME.to_ascii_lowercase()))
+    }
+}
+
+/// Set the plugin's settings store; called once, from ListSetDefaultParams.
+/// Returns the store now in use (TC loads the plugin once per process).
+#[allow(dead_code)] // plugin only
+pub fn use_store(store: Store) -> &'static Store {
+    let _ = STORE.set(store);
+    self::store()
+}
+
+/// Read a numeric setting; `None` if it was never saved or cannot be read.
 pub fn read_dword(name: &str) -> Option<u32> {
+    read_dword_in(store(), name)
+}
+
+/// Save a numeric setting.
+pub fn write_dword(name: &str, value: u32) -> Result<(), String> {
+    write_dword_in(store(), name, value)
+}
+
+fn read_dword_in(store: &Store, name: &str) -> Option<u32> {
+    match store {
+        Store::Registry => registry_read_dword(name),
+        Store::Ini(path) => ini_read_dword(path, name),
+        Store::Unavailable(_) => None,
+    }
+}
+
+fn write_dword_in(store: &Store, name: &str, value: u32) -> Result<(), String> {
+    match store {
+        Store::Registry => registry_write_dword(name, value),
+        Store::Ini(path) => ini_write_dword(path, name, value),
+        Store::Unavailable(reason) => Err(reason.clone()),
+    }
+}
+
+/// `[MDView] name=value` in the plugin's ini file.
+fn ini_read_dword(path: &Path, name: &str) -> Option<u32> {
+    use windows::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
+    let section = wide(APP_NAME);
+    let key = wide(name);
+    let file = wide(&path.to_string_lossy());
+    let empty = wide("");
+    let mut buffer = [0u16; 32];
+    let len = unsafe {
+        GetPrivateProfileStringW(
+            PCWSTR(section.as_ptr()),
+            PCWSTR(key.as_ptr()),
+            PCWSTR(empty.as_ptr()),
+            Some(&mut buffer),
+            PCWSTR(file.as_ptr()),
+        )
+    } as usize;
+    String::from_utf16_lossy(&buffer[..len]).trim().parse().ok()
+}
+
+fn ini_write_dword(path: &Path, name: &str, value: u32) -> Result<(), String> {
+    use windows::Win32::System::WindowsProgramming::WritePrivateProfileStringW;
+    let section = wide(APP_NAME);
+    let key = wide(name);
+    let text = wide(&value.to_string());
+    let file = wide(&path.to_string_lossy());
+    unsafe {
+        WritePrivateProfileStringW(
+            PCWSTR(section.as_ptr()),
+            PCWSTR(key.as_ptr()),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(file.as_ptr()),
+        )
+    }
+    .map_err(|e| format!("cannot write {name} to {}: {}", path.display(), e.message()))
+}
+
+/// Read a DWORD value; `None` if the key or value does not exist.
+fn registry_read_dword(name: &str) -> Option<u32> {
     let subkey = wide(REGISTRY_KEY);
     let name = wide(name);
     unsafe {
@@ -54,7 +180,7 @@ pub fn read_dword(name: &str) -> Option<u32> {
 }
 
 /// Write a DWORD value, creating the key if needed.
-pub fn write_dword(name: &str, value: u32) -> Result<(), String> {
+fn registry_write_dword(name: &str, value: u32) -> Result<(), String> {
     let subkey = wide(REGISTRY_KEY);
     let name_wide = wide(name);
     unsafe {
@@ -228,6 +354,60 @@ mod tests {
         assert!(folder.starts_with(local.join(APP_NAME).join("WebView2")), "{}", folder.display());
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with("-normal") || name.ends_with("-elevated"), "{name}");
+    }
+
+    /// A fresh folder for one test, removed afterwards.
+    struct TempFolder(PathBuf);
+    impl TempFolder {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "mdview-settings-test-{name}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TempFolder(dir)
+        }
+    }
+    impl Drop for TempFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // #34: the plugin keeps its settings in its own mdview.ini in TC's ini folder.
+    #[test]
+    fn test_ini_store_round_trips_settings() {
+        let dir = TempFolder::new("roundtrip");
+        let store = ini_store_for(&dir.0);
+        assert_eq!(store, Store::Ini(dir.0.join("mdview.ini")));
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), None, "nothing saved yet");
+        write_dword_in(&store, REMOTE_IMAGES, 1).unwrap();
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), Some(1));
+        write_dword_in(&store, REMOTE_IMAGES, 2).unwrap();
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), Some(2));
+        let text = std::fs::read_to_string(dir.0.join("mdview.ini")).unwrap();
+        assert!(text.contains("[MDView]") && text.contains("RemoteImages=2"), "{text:?}");
+    }
+
+    #[test]
+    fn test_ini_store_ignores_other_sections_and_bad_values() {
+        let dir = TempFolder::new("sections");
+        let path = dir.0.join("mdview.ini");
+        std::fs::write(&path, "[Other]\r\nRemoteImages=1\r\n[MDView]\r\nRemoteImages=abc\r\n").unwrap();
+        let store = Store::Ini(path);
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), None);
+    }
+
+    #[test]
+    fn test_unusable_ini_folder_cannot_store() {
+        let missing = std::env::temp_dir().join("mdview-settings-test-does-not-exist-34");
+        let store = ini_store_for(&missing);
+        assert!(matches!(&store, Store::Unavailable(reason) if reason.contains("was not found")), "{store:?}");
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), None);
+        let err = write_dword_in(&store, REMOTE_IMAGES, 1).unwrap_err();
+        assert!(err.contains("was not found"), "{err}");
+        assert!(matches!(ini_store_for(Path::new("")), Store::Unavailable(_)));
     }
 
     #[test]

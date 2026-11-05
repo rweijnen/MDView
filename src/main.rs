@@ -458,6 +458,9 @@ const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 // The product name is defined once, in settings::app_name!().
 use settings::{APP_NAME, REGISTRY_KEY, app_name};
 
+/// This crate is the standalone viewer, not the TC plugin (see settings::store).
+pub(crate) const IS_PLUGIN: bool = false;
+
 // File association registration
 const PROGID: &str = concat!(app_name!(), ".Markdown");
 const PROGID_DESCRIPTION: &str = "Markdown Document";

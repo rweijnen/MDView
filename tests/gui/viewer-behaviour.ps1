@@ -81,7 +81,35 @@ function Set-TestRegistry($remoteImages) {
     }
     if ($null -ne $remoteImages) { Set-ItemProperty -Path $key -Name RemoteImages -Value $remoteImages -Type DWord }
 }
-function Get-RemoteImagesSetting { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).RemoteImages }
+function Get-RegistryRemoteImages { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).RemoteImages }
+
+# ---- the plugin's settings: mdview.ini in the folder TC reports (#34)
+$tcIni = Join-Path $work 'tc-ini'
+New-Item -ItemType Directory $tcIni | Out-Null
+$pluginIni = Join-Path $tcIni 'mdview.ini'
+function Get-IniRemoteImages {
+    if (-not (Test-Path $pluginIni)) { return $null }
+    $inSection = $false
+    foreach ($line in Get-Content $pluginIni) {
+        if ($line -match '^\s*\[(.+)\]\s*$') { $inSection = ($Matches[1] -eq 'MDView'); continue }
+        if ($inSection -and $line -match '^\s*RemoteImages\s*=\s*(\d+)\s*$') { return [int]$Matches[1] }
+    }
+    $null
+}
+function Set-IniRemoteImages($value) {
+    if ($null -eq $value) { Remove-Item $pluginIni -ErrorAction SilentlyContinue }
+    else { Set-Content -Path $pluginIni -Value "[MDView]`r`nRemoteImages=$value`r`n" -NoNewline }
+}
+# Where each host keeps its remote-images choice: the standalone viewer in the
+# registry, the plugin in mdview.ini.
+function Get-RemoteImagesSetting($hostKind) { if ($hostKind -eq 'exe') { Get-RegistryRemoteImages } else { Get-IniRemoteImages } }
+function Get-OtherRemoteImagesSetting($hostKind) { if ($hostKind -eq 'exe') { Get-IniRemoteImages } else { Get-RegistryRemoteImages } }
+function Set-RemoteImagesSetting($hostKind, $value) {
+    Set-TestRegistry $null
+    Set-IniRemoteImages $null
+    if ($hostKind -eq 'exe') { if ($null -ne $value) { Set-ItemProperty -Path $key -Name RemoteImages -Value $value -Type DWord } }
+    else { Set-IniRemoteImages $value }
+}
 
 # ---- viewer control
 function Start-Viewer($hostKind, $doc) {
@@ -92,7 +120,7 @@ function Start-Viewer($hostKind, $doc) {
         else {
             $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hostScript`"", '-Dll', "`"$Dll`"", '-Doc', "`"$doc`"",
-                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"")
+                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$tcIni`"")
         }
     } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     [void]$started.Add($p)
@@ -155,7 +183,7 @@ function Check($name, $ok, $detail) {
         Stop-Viewer $v
 
         # Remote images: blocked with a banner; "Load images" loads them once
-        Set-TestRegistry $null
+        Set-RemoteImagesSetting $hostKind $null
         $before = Get-PixelHits
         $v = Start-Viewer $hostKind (Join-Path $work 'remote.md')
         [void](Wait-Element $v $CT::Text '^Remote$')
@@ -168,19 +196,21 @@ function Check($name, $ok, $detail) {
         Check "${hostKind}: 'Load images' loads the remote image" ((Get-PixelHits) -gt $before) "requests=$((Get-PixelHits) - $before)"
         $bannerAfter = Find-Element $v $CT::Text 'Remote images in this document were blocked'
         Check "${hostKind}: banner is gone after loading" (-not $bannerAfter) "banner shown=$([bool]$bannerAfter)"
-        Check "${hostKind}: 'Load images' does not change the saved setting" ($null -eq (Get-RemoteImagesSetting)) "RemoteImages=$(Get-RemoteImagesSetting)"
+        Check "${hostKind}: 'Load images' does not change the saved setting" ($null -eq (Get-RemoteImagesSetting $hostKind)) "RemoteImages=$(Get-RemoteImagesSetting $hostKind)"
         Stop-Viewer $v
 
         # "Always" is saved, and then images load without a banner
-        Set-TestRegistry $null
+        Set-RemoteImagesSetting $hostKind $null
         $v = Start-Viewer $hostKind (Join-Path $work 'remote.md')
         [void](Wait-Element $v $CT::Text '^Remote$')
         $always = Wait-Element $v $CT::Button '^Always load$' 8
         if ($always) { Invoke-Element $always; Start-Sleep -Seconds 2 }
-        $saved = Get-RemoteImagesSetting
+        $saved = Get-RemoteImagesSetting $hostKind
+        $other = Get-OtherRemoteImagesSetting $hostKind
         Stop-Viewer $v
-        Check "${hostKind}: 'Always load' saves RemoteImages=1" ($saved -eq 1) "RemoteImages=$saved"
-        Set-TestRegistry 1
+        Check "${hostKind}: 'Always load' saves RemoteImages=1 in its own settings" ($saved -eq 1) "RemoteImages=$saved"
+        Check "${hostKind}: 'Always load' does not change the other program's settings" ($null -eq $other) "other=$other"
+        Set-RemoteImagesSetting $hostKind 1
         $before = Get-PixelHits
         $v = Start-Viewer $hostKind (Join-Path $work 'remote.md')
         [void](Wait-Element $v $CT::Text '^Remote$')
@@ -190,15 +220,17 @@ function Check($name, $ok, $detail) {
         Stop-Viewer $v
 
         # "Never" is saved, and then there is no banner and no request
-        Set-TestRegistry $null
+        Set-RemoteImagesSetting $hostKind $null
         $v = Start-Viewer $hostKind (Join-Path $work 'remote.md')
         [void](Wait-Element $v $CT::Text '^Remote$')
         $never = Wait-Element $v $CT::Button '^Never$' 8
         if ($never) { Invoke-Element $never; Start-Sleep -Seconds 2 }
-        $saved = Get-RemoteImagesSetting
+        $saved = Get-RemoteImagesSetting $hostKind
+        $other = Get-OtherRemoteImagesSetting $hostKind
         Stop-Viewer $v
-        Check "${hostKind}: 'Never' saves RemoteImages=2" ($saved -eq 2) "RemoteImages=$saved"
-        Set-TestRegistry 2
+        Check "${hostKind}: 'Never' saves RemoteImages=2 in its own settings" ($saved -eq 2) "RemoteImages=$saved"
+        Check "${hostKind}: 'Never' does not change the other program's settings" ($null -eq $other) "other=$other"
+        Set-RemoteImagesSetting $hostKind 2
         $before = Get-PixelHits
         $v = Start-Viewer $hostKind (Join-Path $work 'remote.md')
         [void](Wait-Element $v $CT::Text '^Remote$')
@@ -208,8 +240,24 @@ function Check($name, $ok, $detail) {
         Stop-Viewer $v
     }
 
+    # Each program keeps its own answer (#34): "Always" in the registry (the
+    # standalone viewer, or left by the v0.2.6 plugin) doesn't apply to the
+    # plugin, and "Always" in the plugin's mdview.ini doesn't apply to the viewer.
+    foreach ($case in @(@{ Store = 'exe'; Viewer = 'plugin' }, @{ Store = 'plugin'; Viewer = 'exe' })) {
+        Set-RemoteImagesSetting $case.Store 1
+        $before = Get-PixelHits
+        $v = Start-Viewer $case.Viewer (Join-Path $work 'remote.md')
+        [void](Wait-Element $v $CT::Text '^Remote$')
+        $banner = Wait-Element $v $CT::Text 'Remote images in this document were blocked' 8
+        Start-Sleep -Milliseconds 800
+        $requests = (Get-PixelHits) - $before
+        Stop-Viewer $v
+        $from = if ($case.Store -eq 'exe') { 'the registry (standalone viewer / v0.2.6)' } else { "the plugin's mdview.ini" }
+        Check "$($case.Viewer): 'Always' in $from does not apply here; it still asks" ([bool]$banner -and $requests -eq 0) "banner=$([bool]$banner) requests=$requests"
+    }
+
     # Welcome screen (standalone viewer without a file)
-    Set-TestRegistry $null
+    Set-RemoteImagesSetting 'exe' $null
     $v = Start-Viewer 'exe' $null
     $welcome = Wait-Element $v $CT::Text 'Open a Markdown file using' 15
     Check 'exe: welcome screen is shown without a file' ([bool]$welcome) "welcome text shown=$([bool]$welcome)"
