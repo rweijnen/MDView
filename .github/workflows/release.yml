@@ -83,6 +83,54 @@ jobs:
             echo "New version: $newVersion"
           }
 
+      - name: Release notes from CHANGELOG.md
+        if: env.IS_RELEASE == 'true'
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.current }}"
+          $lines = @(Get-Content CHANGELOG.md)
+          $start = [Array]::IndexOf($lines, "## v$version")
+          if ($start -lt 0) {
+            Write-Error "CHANGELOG.md has no '## v$version' section. Add the release notes for v$version before releasing."
+            exit 1
+          }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { $end = $i; break }
+          }
+          $notes = if ($end -gt $start + 1) { ($lines[($start + 1)..($end - 1)] -join "`n").Trim() } else { '' }
+          if (-not $notes) {
+            Write-Error "The '## v$version' section in CHANGELOG.md is empty. Add the release notes for v$version before releasing."
+            exit 1
+          }
+          $body = @(
+            "## MDView v$version",
+            '',
+            'Markdown viewer for Windows - Total Commander Lister plugin and standalone executable.',
+            '',
+            "## What's new",
+            '',
+            $notes,
+            '',
+            '## Installation',
+            '',
+            '**Total Commander Plugin:**',
+            '1. Download the ZIP file',
+            '2. Open it in Total Commander',
+            '3. Follow the plugin installation prompts',
+            '',
+            '**Standalone:**',
+            'Extract `mdview.exe` and run it from command line or associate with `.md` files.',
+            '',
+            '## Contents',
+            '- `mdview.exe` - Standalone viewer (x64)',
+            '- `mdview.wlx` - Total Commander plugin (x86)',
+            '- `mdview.wlx64` - Total Commander plugin (x64)',
+            '- `pluginst.inf` - Plugin installer configuration'
+          ) -join "`n"
+          Set-Content -Path release-notes.md -Value $body -NoNewline
+          Write-Output $body
+
       - name: Create release directory
         if: env.IS_RELEASE == 'true'
         shell: pwsh
@@ -115,26 +163,7 @@ jobs:
         with:
           tag_name: v${{ steps.version.outputs.current }}
           name: MDView v${{ steps.version.outputs.current }}
-          body: |
-            ## MDView v${{ steps.version.outputs.current }}
-
-            Markdown viewer for Windows - Total Commander Lister plugin and standalone executable.
-
-            ### Installation
-
-            **Total Commander Plugin:**
-            1. Download the ZIP file
-            2. Open it in Total Commander
-            3. Follow the plugin installation prompts
-
-            **Standalone:**
-            Extract `mdview.exe` and run it from command line or associate with `.md` files.
-
-            ### Contents
-            - `mdview.exe` - Standalone viewer (x64)
-            - `mdview.wlx` - Total Commander plugin (x86)
-            - `mdview.wlx64` - Total Commander plugin (x64)
-            - `pluginst.inf` - Plugin installer configuration
+          body_path: release-notes.md
           files: |
             MDView-v${{ steps.version.outputs.current }}.zip
           draft: false
