@@ -7,6 +7,8 @@ release workflow refuses to publish a version without a section here.
 
 ### Fixes
 - The standalone viewer and the Total Commander plugin can be used at the same time. Before, with MDView open in TC's Lister, a double-clicked `.md` showed nothing (and the other way round). WebView2 data now lives in `%LOCALAPPDATA%\MDView\WebView2`, one folder per program. (#33)
+- This also fixes keyboard shortcuts such as **Ctrl+C** and **Esc** not working in the standalone viewer while MDView was open in TC. (#22, #23)
+- **File → Register as .md Viewer** opens Windows Settings on MDView's default-apps page (Windows 11), instead of only showing "To change your default apps, go to Settings". If registering fails, MDView now says so. (#36)
 
 ## v0.2.6
 

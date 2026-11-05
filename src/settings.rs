@@ -8,7 +8,17 @@ use windows::Win32::System::Registry::{
 };
 use windows::core::PCWSTR;
 
-pub const REGISTRY_KEY: &str = "Software\\MDView";
+/// The product name, defined once. A macro so that compile-time constants
+/// (registry keys, ProgID, message texts) can be built from it with `concat!`.
+macro_rules! app_name {
+    () => {
+        "MDView"
+    };
+}
+pub(crate) use app_name;
+
+pub const APP_NAME: &str = app_name!();
+pub const REGISTRY_KEY: &str = concat!("Software\\", app_name!());
 
 const REMOTE_IMAGES: &str = "RemoteImages";
 
@@ -126,7 +136,7 @@ pub fn set_remote_images_setting(setting: RemoteImagesSetting) -> Result<(), Str
 pub fn webview2_data_folder() -> Result<std::path::PathBuf, String> {
     let local_app_data = local_app_data_folder()?;
     Ok(local_app_data
-        .join("MDView")
+        .join(APP_NAME)
         .join("WebView2")
         .join(data_folder_name(&host_program_name()?, is_elevated()?)))
 }
@@ -215,7 +225,7 @@ mod tests {
     fn test_data_folder_is_in_local_app_data_for_this_program() {
         let folder = webview2_data_folder().expect("data folder");
         let local = local_app_data_folder().expect("local app data");
-        assert!(folder.starts_with(local.join("MDView").join("WebView2")), "{}", folder.display());
+        assert!(folder.starts_with(local.join(APP_NAME).join("WebView2")), "{}", folder.display());
         let name = folder.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with("-normal") || name.ends_with("-elevated"), "{name}");
     }

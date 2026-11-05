@@ -323,7 +323,7 @@ fn create_blocked_response(
         environment,
         b"",
         403,
-        "Blocked by MDView",
+        concat!("Blocked by ", crate::settings::app_name!()),
         "text/plain; charset=utf-8",
         PASSIVE_FILE_HEADERS,
     )
@@ -1080,7 +1080,7 @@ fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::RemoteImages
             let text: Vec<u16> = format!("Could not save the remote images setting:\n\n{e}\0")
                 .encode_utf16()
                 .collect();
-            let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+            let title: Vec<u16> = format!("{}\0", crate::settings::APP_NAME).encode_utf16().collect();
             unsafe {
                 MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
             }
