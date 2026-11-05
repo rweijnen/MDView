@@ -3,6 +3,11 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
+## v0.2.7
+
+### Fixes
+- The standalone viewer and the Total Commander plugin can be used at the same time. Before, with MDView open in TC's Lister, a double-clicked `.md` showed nothing (and the other way round). WebView2 data now lives in `%LOCALAPPDATA%\MDView\WebView2`, one folder per program. (#33)
+
 ## v0.2.6
 
 ### Hardening

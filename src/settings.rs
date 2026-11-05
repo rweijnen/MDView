@@ -115,9 +115,110 @@ pub fn set_remote_images_setting(setting: RemoteImagesSetting) -> Result<(), Str
     write_dword(REMOTE_IMAGES, setting.to_dword())
 }
 
+/// WebView2 data folder (cache, cookies; not settings) for this process.
+///
+/// A WebView2 data folder can only be used by one host program at a time:
+/// with MDView open in Total Commander's Lister, a standalone viewer using the
+/// same folder fails to load (and the other way round, #33). So each host
+/// program gets its own folder, and elevated and normal processes are kept
+/// apart, so files created elevated never have to be written by a normal
+/// process. Lives in %LOCALAPPDATA%: local, per user, not roaming.
+pub fn webview2_data_folder() -> Result<std::path::PathBuf, String> {
+    let local_app_data = local_app_data_folder()?;
+    Ok(local_app_data
+        .join("MDView")
+        .join("WebView2")
+        .join(data_folder_name(&host_program_name()?, is_elevated()?)))
+}
+
+/// `<host program>-<elevated|normal>`, using only characters that are safe
+/// in a folder name.
+fn data_folder_name(host_program: &str, elevated: bool) -> String {
+    let host: String = host_program
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("{}-{}", host, if elevated { "elevated" } else { "normal" })
+}
+
+/// The program MDView runs in: `mdview` for the standalone viewer, the file
+/// manager (e.g. `totalcmd64`) for the plugin.
+fn host_program_name() -> Result<String, String> {
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+    let mut buffer = vec![0u16; 32768];
+    let len = unsafe { GetModuleFileNameW(None, &mut buffer) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return Err("cannot determine the host program".to_string());
+    }
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len]));
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("cannot determine the host program from {}", path.display()))
+}
+
+fn is_elevated() -> Result<bool, String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| format!("cannot open the process token: {}", e.message()))?;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut size = 0u32;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut size,
+        );
+        let _ = CloseHandle(token);
+        result.map_err(|e| format!("cannot read the process elevation: {}", e.message()))?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+fn local_app_data_folder() -> Result<std::path::PathBuf, String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_LocalAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    unsafe {
+        let path = SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_DEFAULT, None)
+            .map_err(|e| format!("cannot find the local application data folder: {}", e.message()))?;
+        let result = path.to_string();
+        CoTaskMemFree(Some(path.0 as *const _));
+        result
+            .map(std::path::PathBuf::from)
+            .map_err(|_| "the local application data folder path is not valid".to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_data_folder_name_per_host_and_elevation() {
+        assert_eq!(data_folder_name("mdview", false), "mdview-normal");
+        assert_eq!(data_folder_name("TOTALCMD64", true), "totalcmd64-elevated");
+        // Different programs and elevation never share a folder.
+        assert_ne!(data_folder_name("mdview", false), data_folder_name("TOTALCMD64", false));
+        assert_ne!(data_folder_name("mdview", false), data_folder_name("mdview", true));
+        // Only safe characters end up in the folder name.
+        assert_eq!(data_folder_name("Double Commander", false), "double_commander-normal");
+        assert_eq!(data_folder_name("a.b\\c:d", true), "a_b_c_d-elevated");
+    }
+
+    #[test]
+    fn test_data_folder_is_in_local_app_data_for_this_program() {
+        let folder = webview2_data_folder().expect("data folder");
+        let local = local_app_data_folder().expect("local app data");
+        assert!(folder.starts_with(local.join("MDView").join("WebView2")), "{}", folder.display());
+        let name = folder.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with("-normal") || name.ends_with("-elevated"), "{name}");
+    }
 
     #[test]
     fn test_remote_images_setting_round_trips_and_defaults_to_ask() {

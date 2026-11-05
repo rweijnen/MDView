@@ -2459,10 +2459,18 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
         },
     ));
 
-    // Use TEMP folder for WebView2 (auto-cleaned by Windows)
-    let user_data_folder = std::env::var("TEMP")
-        .map(|p| format!("{}\\MDView_WebView2", p))
-        .unwrap_or_else(|_| ".".to_string());
+    // Own WebView2 data folder for this host program (#33)
+    let user_data_folder = match settings::webview2_data_folder() {
+        Ok(folder) => folder.to_string_lossy().into_owned(),
+        Err(e) => {
+            let text: Vec<u16> = format!("MDView cannot start its viewer:\n\n{e}\0").encode_utf16().collect();
+            let title: Vec<u16> = "MDView\0".encode_utf16().collect();
+            unsafe {
+                MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+            }
+            return Err(windows::core::Error::new(E_FAIL, e));
+        }
+    };
     let user_data_wide = pwstr_from_str(&user_data_folder);
     unsafe {
         let _ = CreateCoreWebView2EnvironmentWithOptions(
