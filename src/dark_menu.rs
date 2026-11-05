@@ -4,6 +4,7 @@
 use std::mem;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::HiDpi::{GetDpiForWindow, SystemParametersInfoForDpi};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PWSTR;
 
@@ -138,7 +139,7 @@ pub fn handle_uah_draw_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 }
 
 /// Handle WM_UAHDRAWMENUITEM - draw menu bar item
-pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
+pub fn handle_uah_draw_menu_item(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     unsafe {
         let pudmi = lparam.0 as *mut UAHDRAWMENUITEM;
         if !pudmi.is_null() {
@@ -168,44 +169,32 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
                 ..Default::default()
             };
             if GetMenuItemInfoW(udmi.um.hmenu, udmi.umi.i_position as u32, true, &mut mii).is_ok() {
-                // Get system menu font and scale up slightly to match popup menu size
-                let menu_font = {
-                    let mut ncm = NONCLIENTMETRICSW {
-                        cbSize: mem::size_of::<NONCLIENTMETRICSW>() as u32,
-                        ..Default::default()
-                    };
-                    if SystemParametersInfoW(
-                        SPI_GETNONCLIENTMETRICS,
-                        ncm.cbSize,
-                        Some(&mut ncm as *mut _ as *mut _),
-                        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+                // The menu font for the scale of the monitor the window is on (#41).
+                let dpi = match GetDpiForWindow(hwnd) {
+                    0 => 96,
+                    dpi => dpi,
+                };
+                let menu_font = if let Some(lf) = menu_font_for_dpi(dpi) {
+                    CreateFontIndirectW(&lf)
+                } else {
+                    // Windows could not provide the menu font: Segoe UI, at the same scale.
+                    let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+                    CreateFontW(
+                        -(16 * dpi as i32 / 96),
+                        0,
+                        0,
+                        0,
+                        FW_NORMAL.0 as i32,
+                        0,
+                        0,
+                        0,
+                        DEFAULT_CHARSET,
+                        OUT_DEFAULT_PRECIS,
+                        CLIP_DEFAULT_PRECIS,
+                        CLEARTYPE_QUALITY,
+                        DEFAULT_PITCH.0 as u32,
+                        windows::core::PCWSTR(font_name.as_ptr()),
                     )
-                    .is_ok()
-                    {
-                        // Scale up font height to match popup menu (lfHeight is negative)
-                        let mut lf = ncm.lfMenuFont;
-                        lf.lfHeight = (lf.lfHeight as f32 * 1.12) as i32;
-                        CreateFontIndirectW(&lf)
-                    } else {
-                        // Fallback to hardcoded font if system call fails
-                        let font_name: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-                        CreateFontW(
-                            -16,
-                            0,
-                            0,
-                            0,
-                            FW_NORMAL.0 as i32,
-                            0,
-                            0,
-                            0,
-                            DEFAULT_CHARSET,
-                            OUT_DEFAULT_PRECIS,
-                            CLIP_DEFAULT_PRECIS,
-                            CLEARTYPE_QUALITY,
-                            DEFAULT_PITCH.0 as u32,
-                            windows::core::PCWSTR(font_name.as_ptr()),
-                        )
-                    }
                 };
                 let old_font = SelectObject(dis.hdc, menu_font.into());
 
@@ -224,4 +213,46 @@ pub fn handle_uah_draw_menu_item(lparam: LPARAM) -> LRESULT {
         }
     }
     LRESULT(0)
+}
+
+/// The menu font for a window at `dpi` (96 = 100%), scaled up slightly to
+/// match the popup menus. `None` if Windows cannot provide it.
+pub fn menu_font_for_dpi(dpi: u32) -> Option<LOGFONTW> {
+    // For the given DPI, not the system DPI: the window may be on a monitor
+    // with a different scale than the primary one (#41).
+    let mut ncm = NONCLIENTMETRICSW {
+        cbSize: mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        SystemParametersInfoForDpi(
+            SPI_GETNONCLIENTMETRICS.0,
+            ncm.cbSize,
+            Some(&mut ncm as *mut _ as *mut _),
+            0,
+            dpi,
+        )
+    }
+    .ok()?;
+    // Scale up font height to match popup menu (lfHeight is negative)
+    let mut lf = ncm.lfMenuFont;
+    lf.lfHeight = (lf.lfHeight as f32 * 1.12) as i32;
+    Some(lf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #41: after moving the window to a monitor with a different scale, the
+    // menu text must be drawn for that monitor's scale.
+    #[test]
+    fn test_menu_font_follows_the_monitor_scale() {
+        let at_100 = menu_font_for_dpi(96).expect("menu font at 100%").lfHeight.abs();
+        let at_200 = menu_font_for_dpi(192).expect("menu font at 200%").lfHeight.abs();
+        let at_150 = menu_font_for_dpi(144).expect("menu font at 150%").lfHeight.abs();
+        assert!(at_100 > 0, "height at 100%: {at_100}");
+        assert!((at_200 - 2 * at_100).abs() <= 2, "200%: {at_200}, expected about {}", 2 * at_100);
+        assert!((2 * at_150 - 3 * at_100).abs() <= 3, "150%: {at_150}, expected about {}", 3 * at_100 / 2);
+    }
 }

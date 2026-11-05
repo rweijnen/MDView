@@ -2544,7 +2544,7 @@ unsafe extern "system" fn window_proc(
             return dark_menu::handle_uah_draw_menu(hwnd, lparam);
         }
         dark_menu::WM_UAHDRAWMENUITEM => {
-            return dark_menu::handle_uah_draw_menu_item(lparam);
+            return dark_menu::handle_uah_draw_menu_item(hwnd, lparam);
         }
         WM_NCPAINT | WM_NCACTIVATE => {
             // Let Windows draw first, then paint over the menu bar separator line

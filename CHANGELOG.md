@@ -9,6 +9,7 @@ release workflow refuses to publish a version without a section here.
 - The standalone viewer and the Total Commander plugin can be used at the same time. Before, with MDView open in TC's Lister, a double-clicked `.md` showed nothing (and the other way round). WebView2 data now lives in `%LOCALAPPDATA%\MDView\WebView2`, one folder per program. (#33)
 - This also fixes keyboard shortcuts such as **Ctrl+C** and **Esc** not working in the standalone viewer while MDView was open in TC. (#22, #23)
 - **File → Register as .md Viewer** opens Windows Settings on MDView's default-apps page (Windows 11), instead of only showing "To change your default apps, go to Settings". If registering fails, MDView now says so. (#36)
+- Standalone viewer, dark mode: the menu bar text is no longer too large and overlapping after moving the window to a monitor with a different display scale. (#41)
 
 ### Changes
 - The Total Commander plugin keeps its settings in its own `mdview.ini` in TC's settings folder (next to `wincmd.ini`), separate from the standalone viewer, which keeps using the registry. Answers given in TC (for example "Always load" remote images) apply to TC only. A choice made in the v0.2.6 plugin is asked once more. (#34)
