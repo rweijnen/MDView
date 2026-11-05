@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
+mod links;
 mod markdown;
+mod settings;
 mod viewer;
 
 use std::ffi::{CStr, c_char, c_int};
@@ -72,7 +74,8 @@ fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
 
     // Convert to HTML
     let html_body = markdown::markdown_to_html(&markdown_content);
-    let full_html = markdown::wrap_html(&html_body, dark_mode);
+    // Only shown if the viewer cannot load the file itself (no remote images, no banner).
+    let full_html = markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Blocked);
 
     // Create viewer window with WebView2
     match viewer::create_viewer(parent, &full_html, Some(file_path), dark_mode) {

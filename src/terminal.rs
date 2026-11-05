@@ -157,6 +157,16 @@ mod unicode {
 }
 
 /// Render markdown to terminal with ANSI formatting
+/// Remove control characters (ESC, BEL, C1 codes, ...) from document text,
+/// keeping newlines and tabs. A document must not be able to send its own
+/// escape sequences to the terminal (set the title, write the clipboard with
+/// OSC 52, fake hyperlinks); only MDView's own styling codes are emitted.
+fn strip_control_chars(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+        .collect()
+}
+
 pub fn render_to_terminal(markdown: &str, caps: &TerminalCaps) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -229,8 +239,8 @@ impl TerminalRenderer {
         match event {
             Event::Start(tag) => self.start_tag(tag),
             Event::End(tag) => self.end_tag(tag),
-            Event::Text(text) => self.text(&text),
-            Event::Code(code) => self.inline_code(&code),
+            Event::Text(text) => self.text(&strip_control_chars(&text)),
+            Event::Code(code) => self.inline_code(&strip_control_chars(&code)),
             Event::SoftBreak => self.soft_break(),
             Event::HardBreak => self.hard_break(),
             Event::Rule => self.horizontal_rule(),
@@ -344,7 +354,8 @@ impl TerminalRenderer {
             Tag::Link {
                 dest_url, title, ..
             } => {
-                self.pending_link = Some((dest_url.to_string(), title.to_string()));
+                self.pending_link =
+                    Some((strip_control_chars(&dest_url), strip_control_chars(&title)));
                 self.link_text.clear();
             }
             Tag::Image {
@@ -353,9 +364,11 @@ impl TerminalRenderer {
                 if self.caps.basic_ansi {
                     self.output.push_str(ansi::DIM);
                 }
-                self.output.push_str(&format!("[Image: {} ", dest_url));
+                self.output
+                    .push_str(&format!("[Image: {} ", strip_control_chars(&dest_url)));
                 if !title.is_empty() {
-                    self.output.push_str(&format!("\"{}\" ", title));
+                    self.output
+                        .push_str(&format!("\"{}\" ", strip_control_chars(&title)));
                 }
                 self.output.push(']');
                 if self.caps.basic_ansi {
@@ -769,6 +782,31 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Security: escape sequences in a document must not reach the terminal.
+    #[test]
+    fn test_document_escape_sequences_are_not_written_to_the_terminal() {
+        // Everything on, as in Windows Terminal (colors and OSC 8 hyperlinks).
+        let caps = TerminalCaps { true_color: true, hyperlinks: true, unicode: true, basic_ansi: true };
+        let md = "# T\n\nbefore \u{1b}]0;PWNED\u{7} middle \u{1b}]52;c;UFdORUQ=\u{7} \u{9b}31m end \
+                  `x\u{1b}[2J` **bold** [link](https://example.com/a)";
+        let output = render_to_terminal(md, &caps);
+        assert!(!output.contains("\u{1b}]0;"), "title sequence from the document written: {output:?}");
+        assert!(!output.contains("\u{1b}]52;"), "clipboard sequence from the document written");
+        assert!(!output.contains('\u{7}'), "BEL from the document written");
+        assert!(!output.contains('\u{9b}'), "C1 CSI from the document written");
+        assert!(!output.contains("\u{1b}[2J"), "clear-screen from inline code written");
+        assert!(output.contains("before ]0;PWNED middle"), "visible text is kept: {output:?}");
+        // MDView's own styling and hyperlinks still work
+        assert!(output.contains(ansi::BOLD));
+        assert!(output.contains(&ansi::hyperlink_start("https://example.com/a")));
+    }
+
+    #[test]
+    fn test_control_chars_are_stripped_but_newlines_and_tabs_kept() {
+        assert_eq!(strip_control_chars("a\u{1b}b\u{7}c\u{0}d\u{7f}e\u{85}f"), "abcdef");
+        assert_eq!(strip_control_chars("line 1\nline\t2"), "line 1\nline\t2");
+    }
 
     #[test]
     fn test_basic_rendering() {

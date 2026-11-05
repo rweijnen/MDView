@@ -84,7 +84,57 @@ fn unique_slug(base: String, occurrences: &mut HashMap<String, usize>) -> String
     result
 }
 
-pub fn wrap_html(content: &str, dark_mode: bool) -> String {
+/// Whether a page may load remote (http/https) images.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteImages {
+    /// Load them.
+    Allowed,
+    /// Block them and show a banner offering to load them.
+    AskToLoad,
+    /// Block them without asking.
+    Blocked,
+}
+
+/// A random value for the page's Content-Security-Policy nonce. Documents are
+/// written before they are shown, so they cannot know it, and only MDView's
+/// own scripts carry it. RandomState keys come from the OS random generator.
+fn new_nonce() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let part = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(time);
+        h.write_u64(salt);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(1), part(2))
+}
+
+/// Content-Security-Policy for a page: only MDView's own (nonced) scripts run,
+/// nothing is fetched or framed, no forms or <base>, and images only come from
+/// the document's own files, unless remote images are allowed.
+fn content_security_policy(nonce: &str, remote_images: RemoteImages) -> String {
+    let img_src = match remote_images {
+        RemoteImages::Allowed => "https://mdview.example data: https: http:",
+        RemoteImages::AskToLoad | RemoteImages::Blocked => "https://mdview.example data:",
+    };
+    format!(
+        "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; \
+         img-src {img_src}; media-src https://mdview.example; font-src 'none'; \
+         connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; \
+         form-action 'none'"
+    )
+}
+
+pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages) -> String {
+    let nonce = new_nonce();
+    let csp = content_security_policy(&nonce, remote_images);
+    let ask_remote_images = remote_images == RemoteImages::AskToLoad;
+    let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
+    let banner_border = if dark_mode { "#6b5b2a" } else { "#d4a72c" };
     let bg_color = if dark_mode { "#1e1e1e" } else { "#ffffff" };
     let text_color = if dark_mode { "#d4d4d4" } else { "#24292e" };
     let code_bg = if dark_mode { "#2d2d2d" } else { "#f6f8fa" };
@@ -101,7 +151,33 @@ pub fn wrap_html(content: &str, dark_mode: bool) -> String {
 <html>
 <head>
 <meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="{csp}">
+<script nonce="{nonce}">
+// Registered before the document's images start loading, so no blocked
+// remote image is missed.
+window.__mdviewBlockedRemoteImages = false;
+document.addEventListener('securitypolicyviolation', function(e) {{
+    if (String(e.violatedDirective).indexOf('img-src') === 0 && /^https?:/i.test(e.blockedURI)) {{
+        window.__mdviewBlockedRemoteImages = true;
+        if (window.__mdviewShowRemoteImagesBanner) window.__mdviewShowRemoteImagesBanner();
+    }}
+}});
+</script>
 <style>
+#mdview-remote-images {{
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: -8px 0 16px 0;
+    padding: 6px 10px;
+    border: 1px solid {banner_border};
+    border-radius: 6px;
+    background-color: {banner_bg};
+    font-size: 13px;
+}}
+#mdview-remote-images span {{ flex: 1; }}
+#mdview-remote-images button {{ font: inherit; cursor: pointer; }}
 body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     font-size: 14px;
@@ -169,8 +245,35 @@ a {{ cursor: pointer; }}
 </head>
 <body>
 {content}
-<script>
+<script nonce="{nonce}">
 (function() {{
+    var askRemoteImages = {ask_remote_images};
+
+    // Outlook-style bar when remote images were blocked: load them this time,
+    // always, or never ask again. MDView itself reloads the page as needed.
+    window.__mdviewShowRemoteImagesBanner = function() {{
+        var webview = window.chrome && window.chrome.webview;
+        if (!askRemoteImages || !webview || document.getElementById('mdview-remote-images')) return;
+        var bar = document.createElement('div');
+        bar.id = 'mdview-remote-images';
+        bar.setAttribute('role', 'alert');
+        var text = document.createElement('span');
+        text.textContent = 'Remote images in this document were blocked to protect your privacy.';
+        bar.appendChild(text);
+        [['once', 'Load images'], ['always', 'Always load'], ['never', 'Never']].forEach(function(c) {{
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = c[1];
+            b.addEventListener('click', function() {{
+                webview.postMessage({{type: 'remoteImages', choice: c[0]}});
+                if (c[0] === 'never') bar.remove();
+            }});
+            bar.appendChild(b);
+        }});
+        document.body.insertBefore(bar, document.body.firstChild);
+    }};
+    if (window.__mdviewBlockedRemoteImages) window.__mdviewShowRemoteImagesBanner();
+
     // Heading ids are generated server-side (markdown::assign_heading_ids).
     function scrollToHash(hash) {{
         if (!hash || hash.charAt(0) !== '#') return false;
@@ -271,6 +374,57 @@ pub fn markdown_to_plain_text(markdown: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nonce_of(page: &str) -> String {
+        let start = page.find("'nonce-").expect("CSP has a nonce") + 7;
+        page[start..start + 32].to_string()
+    }
+
+    // Security: a document's own <script> and on...= handlers must not run;
+    // only MDView's scripts carry the CSP nonce.
+    #[test]
+    fn test_page_csp_only_lets_mdview_scripts_run() {
+        let body = markdown_to_html("# T\n\n<script>evil()</script>\n\n<img src=x onerror=\"evil()\">");
+        let page = wrap_html(&body, false, RemoteImages::AskToLoad);
+        let nonce = nonce_of(&page);
+        assert_eq!(nonce.len(), 32);
+        let meta_at = page.find("<meta http-equiv=\"Content-Security-Policy\"").expect("CSP meta");
+        assert!(meta_at < page.find("<style>").unwrap() && meta_at < page.find("<body>").unwrap());
+        for directive in [
+            "default-src 'none'",
+            &format!("script-src 'nonce-{nonce}';"),
+            "connect-src 'none'",
+            "frame-src 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+        ] {
+            assert!(page.contains(directive), "missing {directive}");
+        }
+        assert_eq!(page.matches(&format!("<script nonce=\"{nonce}\">")).count(), 2);
+        assert!(page.contains("<script>evil()</script>"), "document script is kept but not nonced");
+        assert!(!page.contains("script-src 'unsafe-inline'"));
+    }
+
+    #[test]
+    fn test_page_nonce_is_new_for_every_page() {
+        let a = nonce_of(&wrap_html("", false, RemoteImages::Blocked));
+        let b = nonce_of(&wrap_html("", false, RemoteImages::Blocked));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_remote_images_load_only_when_allowed() {
+        let allowed = wrap_html("", false, RemoteImages::Allowed);
+        assert!(allowed.contains("img-src https://mdview.example data: https: http:;"));
+        assert!(allowed.contains("var askRemoteImages = false"));
+        let ask = wrap_html("", false, RemoteImages::AskToLoad);
+        assert!(ask.contains("img-src https://mdview.example data:;"));
+        assert!(ask.contains("var askRemoteImages = true"));
+        let blocked = wrap_html("", false, RemoteImages::Blocked);
+        assert!(blocked.contains("img-src https://mdview.example data:;"));
+        assert!(blocked.contains("var askRemoteImages = false"));
+    }
 
     #[test]
     fn test_basic_markdown() {
