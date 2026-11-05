@@ -5,8 +5,12 @@
 # STA thread, which 5.1 uses by default. Writes a status line to -StatusFile:
 #   loaded | load-failed | closed-by-plugin | timeout
 #
+# Like TC, it calls ListSetDefaultParams right after loading the plugin (if the
+# plugin exports it), with DefaultIniName = <IniFolder>\lsplugin.ini. TC puts
+# that file next to wincmd.ini.
+#
 # Usage:
-#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text]
+#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text] [-IniFolder dir]
 param(
     [Parameter(Mandatory)] [string]$Dll,
     [Parameter(Mandatory)] [string]$Doc,
@@ -14,7 +18,9 @@ param(
     [Parameter(Mandatory)] [string]$StatusFile,
     [string]$Search,
     # Use this folder as TEMP (an elevated host does not inherit the caller's environment)
-    [string]$Temp
+    [string]$Temp,
+    # Folder TC would report as its ini folder (where wincmd.ini is); default: next to the status file
+    [string]$IniFolder
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,9 +47,23 @@ public static class ListerHost
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     delegate int ListSearchTextWFn(IntPtr window, [MarshalAs(UnmanagedType.LPWStr)] string text, int flags);
 
+    // WLX SDK: ListDefaultParamStruct (DefaultIniName is ANSI, MAX_PATH)
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct ListDefaultParamStruct
+    {
+        public int size;
+        public uint PluginInterfaceVersionLow;
+        public uint PluginInterfaceVersionHi;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string DefaultIniName;
+    }
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    delegate void ListSetDefaultParamsFn(ref ListDefaultParamStruct dps);
+
     static ListLoadWFn load;
     static ListCloseWindowFn close;
     static ListSearchTextWFn search;
+    static ListSetDefaultParamsFn setDefaultParams;
 
     public static void Init(string dll)
     {
@@ -53,6 +73,10 @@ public static class ListerHost
         load = Get<ListLoadWFn>(module, "ListLoadW");
         close = Get<ListCloseWindowFn>(module, "ListCloseWindow");
         search = Get<ListSearchTextWFn>(module, "ListSearchTextW");
+        // Optional export, as in TC: older plugins don't have it.
+        IntPtr p = GetProcAddress(module, "ListSetDefaultParams");
+        if (p != IntPtr.Zero)
+            setDefaultParams = Marshal.GetDelegateForFunctionPointer(p, typeof(ListSetDefaultParamsFn)) as ListSetDefaultParamsFn;
     }
 
     static T Get<T>(IntPtr module, string name) where T : class
@@ -60,6 +84,19 @@ public static class ListerHost
         IntPtr p = GetProcAddress(module, name);
         if (p == IntPtr.Zero) throw new Exception("export not found: " + name);
         return Marshal.GetDelegateForFunctionPointer(p, typeof(T)) as T;
+    }
+
+    /// Like TC right after loading the plugin; returns false if the plugin has no ListSetDefaultParams.
+    public static bool SetDefaultParams(string iniName)
+    {
+        if (setDefaultParams == null) return false;
+        var dps = new ListDefaultParamStruct();
+        dps.size = Marshal.SizeOf(typeof(ListDefaultParamStruct));
+        dps.PluginInterfaceVersionLow = 12;   // interface 2.12, as in current TC versions
+        dps.PluginInterfaceVersionHi = 2;
+        dps.DefaultIniName = iniName;
+        setDefaultParams(ref dps);
+        return true;
     }
 
     public static IntPtr Load(IntPtr parent, string file) { return load(parent, file, 0); }
@@ -71,6 +108,9 @@ public static class ListerHost
 function Write-Status($s) { Set-Content -Path $StatusFile -Value $s -NoNewline }
 
 [ListerHost]::Init((Resolve-Path $Dll).Path)
+if (-not $IniFolder) { $IniFolder = Split-Path -Parent ([IO.Path]::GetFullPath($StatusFile)) }
+New-Item -ItemType Directory -Force $IniFolder | Out-Null
+[void][ListerHost]::SetDefaultParams((Join-Path $IniFolder 'lsplugin.ini'))
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Lister (mdview) - test host'

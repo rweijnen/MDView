@@ -10,8 +10,59 @@ use std::ptr;
 use widestring::U16CStr;
 use windows::Win32::Foundation::HWND;
 
+/// This crate is the Total Commander plugin (see settings::store).
+pub(crate) const IS_PLUGIN: bool = true;
+
 // WLX Plugin Constants
 const LCP_DARKMODE: c_int = 128;
+
+/// WLX SDK ListDefaultParamStruct. `default_ini_name` is ANSI (MAX_PATH).
+#[repr(C)]
+pub struct ListDefaultParamStruct {
+    size: c_int,
+    plugin_interface_version_low: u32,
+    plugin_interface_version_hi: u32,
+    default_ini_name: [c_char; 260],
+}
+
+/// Called by TC right after loading the plugin, before ListLoad (TC 5.51+).
+/// `DefaultIniName` is in the folder of wincmd.ini; MDView keeps its own
+/// mdview.ini there (#34).
+#[unsafe(no_mangle)]
+pub extern "system" fn ListSetDefaultParams(dps: *const ListDefaultParamStruct) {
+    let store = match unsafe { dps.as_ref() } {
+        None => settings::Store::Unavailable("Total Commander passed no settings".to_string()),
+        Some(dps) => match ini_folder_from_default_ini_name(&dps.default_ini_name) {
+            Ok(folder) => settings::ini_store_for(&folder),
+            Err(reason) => settings::Store::Unavailable(reason),
+        },
+    };
+    let in_use = settings::use_store(store);
+    viewer::log_debug(&format!("settings: {in_use:?}"));
+}
+
+/// The folder of TC's `DefaultIniName` (ANSI, NUL-terminated, MAX_PATH).
+fn ini_folder_from_default_ini_name(name: &[c_char; 260]) -> Result<std::path::PathBuf, String> {
+    use windows::Win32::Globalization::{CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar};
+    let bytes: Vec<u8> = name.iter().map(|&c| c as u8).collect();
+    let len = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| "Total Commander's settings path is not terminated".to_string())?;
+    if len == 0 {
+        return Err("Total Commander reported an empty settings path".to_string());
+    }
+    let mut wide = vec![0u16; len * 2 + 1];
+    let n = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), &bytes[..len], Some(&mut wide)) };
+    if n <= 0 {
+        return Err("Total Commander's settings path could not be read".to_string());
+    }
+    let path = std::path::PathBuf::from(String::from_utf16_lossy(&wide[..n as usize]));
+    path.parent()
+        .map(|p| p.to_path_buf())
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| format!("Total Commander's settings path {} has no folder", path.display()))
+}
 
 /// Detection string for Total Commander - handles .md and .markdown files
 #[unsafe(no_mangle)]
@@ -162,5 +213,32 @@ pub extern "system" fn ListSendCommand(list_win: HWND, command: c_int, _paramete
             1
         }
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ini_name(s: &[u8]) -> [c_char; 260] {
+        let mut buf = [0 as c_char; 260];
+        for (i, &b) in s.iter().enumerate() {
+            buf[i] = b as c_char;
+        }
+        buf
+    }
+
+    // #34: MDView's settings go next to TC's DefaultIniName (wincmd.ini's folder).
+    #[test]
+    fn test_ini_folder_is_the_folder_of_default_ini_name() {
+        let folder = ini_folder_from_default_ini_name(&ini_name(b"C:\\Users\\x\\AppData\\Roaming\\GHISLER\\lsplugin.ini")).unwrap();
+        assert_eq!(folder, std::path::PathBuf::from("C:\\Users\\x\\AppData\\Roaming\\GHISLER"));
+    }
+
+    #[test]
+    fn test_unusable_default_ini_names_are_rejected() {
+        assert!(ini_folder_from_default_ini_name(&ini_name(b"")).unwrap_err().contains("empty"));
+        assert!(ini_folder_from_default_ini_name(&[b'a' as c_char; 260]).unwrap_err().contains("not terminated"));
+        assert!(ini_folder_from_default_ini_name(&ini_name(b"lsplugin.ini")).unwrap_err().contains("no folder"));
     }
 }

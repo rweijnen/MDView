@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 /// Simple debug logging to file (only in debug builds or when MDVIEW_DEBUG env is set)
 #[allow(dead_code)]
-fn log_debug(msg: &str) {
+pub(crate) fn log_debug(msg: &str) {
     if cfg!(debug_assertions) || env::var("MDVIEW_DEBUG").is_ok() {
         if let Ok(temp) = env::var("TEMP") {
             let log_path = format!("{}\\mdview_debug.log", temp);
