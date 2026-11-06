@@ -251,6 +251,17 @@ pub fn set_remote_images_setting(setting: RemoteImagesSetting) -> Result<(), Str
     write_dword(REMOTE_IMAGES, setting.to_dword())
 }
 
+/// "Don't ask again" on the page shown instead of a downloaded document (#24).
+const OPEN_DOWNLOADED_WITHOUT_ASKING: &str = "OpenDownloadedWithoutAsking";
+
+pub fn open_downloaded_without_asking() -> bool {
+    read_dword(OPEN_DOWNLOADED_WITHOUT_ASKING) == Some(1)
+}
+
+pub fn set_open_downloaded_without_asking() -> Result<(), String> {
+    write_dword(OPEN_DOWNLOADED_WITHOUT_ASKING, 1)
+}
+
 /// WebView2 data folder (cache, cookies; not settings) for this process.
 ///
 /// A WebView2 data folder can only be used by one host program at a time:

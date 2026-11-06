@@ -1,10 +1,12 @@
 #![windows_subsystem = "windows"]
 
 mod dark_menu;
+mod files;
 mod links;
 mod markdown;
 mod settings;
 mod terminal;
+mod zone;
 
 use std::cell::RefCell;
 use std::env;
@@ -267,7 +269,7 @@ fn read_input(file_path: Option<&str>) -> io::Result<String> {
                     format!("File not found: {}", path.display()),
                 ));
             }
-            fs::read_to_string(path)
+            files::read_text(path).map_err(|e| io::Error::other(format!("{}: {e}", path.display())))
         }
         None => {
             let mut buffer = String::new();
@@ -336,18 +338,14 @@ fn main() {
     if opts.gui_mode {
         // GUI mode - open window with WebView2
         let (title, full_html) = if let Some(ref path) = opts.file_path {
-            let markdown_content = match read_input(Some(path)) {
-                Ok(content) => content,
-                Err(e) => {
-                    eprintln!("Error reading input: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let html_body = markdown::markdown_to_html(&markdown_content);
-            let dark_mode = is_windows_dark_mode();
-            // Not shown for a file: the document is loaded through its virtual URL
-            // and served by create_virtual_resource_response (with its bars).
-            let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images_for(Path::new(path)), &[]);
+            // The document is not read here: it is loaded through its virtual
+            // URL and served by create_virtual_resource_response, which first
+            // checks its Mark of the Web (#24).
+            if !Path::new(path).exists() {
+                eprintln!("Error reading input: File not found: {path}");
+                std::process::exit(1);
+            }
+            let full_html = String::new();
             let title = Path::new(path)
                 .file_name()
                 .unwrap_or_default()
@@ -357,7 +355,11 @@ fn main() {
         } else {
             // No file - show welcome screen
             let dark_mode = is_windows_dark_mode();
-            let welcome_bars = markdown::document_bars(markdown::RemoteImages::Blocked, ask_to_register());
+            let welcome_bars = markdown::document_bars(&markdown::PageBars {
+                remote_images: markdown::RemoteImages::Blocked,
+                ask_to_register: ask_to_register(),
+                closed: &[],
+            });
             let welcome_html = markdown::wrap_html(
                 "<div style=\"text-align: center; margin-top: 100px; color: #888;\">\
                  <h1>MDView</h1>\
@@ -1184,11 +1186,32 @@ fn create_virtual_resource_response(
     dark_mode: bool,
 ) -> Option<ICoreWebView2WebResourceResponse> {
     if links::is_markdown(file_path) {
-        let markdown_content = fs::read_to_string(file_path).ok()?;
-        let html_body = markdown::markdown_to_html(&markdown_content);
-        let remote_images = remote_images_for(file_path);
+        let (html_body, remote_images, bars) = if let Some(mark) = download_gate(file_path) {
+            // Downloaded from the internet (#24): nothing from the document
+            // is shown until the user chooses to open it.
+            let gate = markdown::download_gate_html(&file_path.display().to_string(), mark.host_url.as_deref());
+            (gate, markdown::RemoteImages::Blocked, vec![markdown::download_gate_bar()])
+        } else {
+            match files::read_text(file_path) {
+                Ok(markdown_content) => {
+                    let remote_images = remote_images_for(file_path);
+                    let bars = DOCUMENT_CHOICES.with(|c| {
+                        markdown::document_bars(&markdown::PageBars {
+                            remote_images,
+                            ask_to_register: ask_to_register(),
+                            closed: c.borrow_mut().closed_bars(file_path),
+                        })
+                    });
+                    (markdown::markdown_to_html(&markdown_content), remote_images, bars)
+                }
+                Err(reason) => (
+                    markdown::read_error_html(&file_path.display().to_string(), &reason),
+                    markdown::RemoteImages::Blocked,
+                    Vec::new(),
+                ),
+            }
+        };
         PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.set(remote_images == markdown::RemoteImages::Allowed));
-        let bars = markdown::document_bars(remote_images, ask_to_register());
         let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
         PAGE_BARS.with(|b| *b.borrow_mut() = bars);
         create_web_resource_response(
@@ -1200,7 +1223,19 @@ fn create_virtual_resource_response(
             "",
         )
     } else {
-        let bytes = fs::read(file_path).ok()?;
+        let bytes = match files::read_bytes(file_path) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                return create_web_resource_response(
+                    environment,
+                    format!("Could not read {}: {reason}", file_path.display()).as_bytes(),
+                    500,
+                    "Could not read",
+                    "text/plain; charset=utf-8",
+                    PASSIVE_FILE_HEADERS,
+                );
+            }
+        };
         create_web_resource_response(
             environment,
             &bytes,
@@ -1233,6 +1268,18 @@ fn remote_request_allowed(uri: &str, context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT)
     context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE
         && (lower.starts_with("https://") || lower.starts_with("http://"))
         && PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.get())
+}
+
+/// The mark of a downloaded document that MDView must ask about before
+/// showing it: not if the user chose "Don't ask again" or already chose Open
+/// while this document is open.
+fn download_gate(file_path: &Path) -> Option<zone::Mark> {
+    if settings::open_downloaded_without_asking() {
+        return None;
+    }
+    let mark = zone::mark_of_the_web(file_path)?;
+    let opened = DOCUMENT_CHOICES.with(|c| c.borrow_mut().opened_download(file_path));
+    (!opened).then_some(mark)
 }
 
 /// Remote images for a document: the saved choice, or "load once" if the user
@@ -1395,7 +1442,18 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
             if !PAGE_BARS.with(|b| markdown::bar_choice_offered(&b.borrow(), bar, choice)) {
                 return;
             }
+            if choice == markdown::CLOSE_CHOICE {
+                if let Some(path) = resolve_virtual_mdview_url(source) {
+                    DOCUMENT_CHOICES.with(|c| c.borrow_mut().close_bar(Path::new(&path), bar));
+                }
+                return;
+            }
             match bar.as_str() {
+                markdown::DOWNLOAD_GATE => {
+                    if let Some(path) = resolve_virtual_mdview_url(source) {
+                        handle_download_gate_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
                 markdown::REMOTE_IMAGES_BAR => {
                     if let Some(path) = resolve_virtual_mdview_url(source) {
                         handle_remote_images_choice(hwnd, choice, Path::new(&path));
@@ -1407,6 +1465,39 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
         }
         _ => {}
     }
+}
+
+/// The user's answer on the page shown instead of a downloaded document
+/// (#24). The document is shown only if the choice worked.
+fn handle_download_gate_choice(hwnd: HWND, choice: &str, document: &Path) {
+    let result = match choice {
+        "open" => {
+            DOCUMENT_CHOICES.with(|c| c.borrow_mut().open_download(document));
+            Ok(())
+        }
+        "unblock" => zone::remove_mark(document).map_err(|e| format!("Could not remove the mark of the web from\n{e}")),
+        "never" => settings::set_open_downloaded_without_asking()
+            .map_err(|e| format!("Could not save \"Don't ask again\":\n\n{e}")),
+        "closeWindow" => {
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+            return;
+        }
+        _ => return,
+    };
+    match result {
+        Ok(()) => reload_page(),
+        Err(message) => show_message(Some(hwnd), &message, MB_OK | MB_ICONERROR),
+    }
+}
+
+fn reload_page() {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { webview.Reload() };
+            }
+        }
+    });
 }
 
 /// The user's answer in the remote-images banner.
@@ -1424,13 +1515,7 @@ fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
         _ => false,
     };
     if reload {
-        CONTROLLER.with(|c| {
-            if let Some(controller) = c.borrow().as_ref() {
-                if let Ok(webview) = unsafe { controller.CoreWebView2() } {
-                    let _ = unsafe { webview.Reload() };
-                }
-            }
-        });
+        reload_page();
     }
 }
 
@@ -2092,6 +2177,8 @@ thread_local! {
     static PAGE_BARS: RefCell<Vec<markdown::Bar>> = const { RefCell::new(Vec::new()) };
     /// "Not now" in the registration bar: don't ask again in this session.
     static REGISTER_BAR_DISMISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// What the user chose while the document being shown is open (#24).
+    static DOCUMENT_CHOICES: RefCell<markdown::DocumentChoices> = RefCell::new(markdown::DocumentChoices::default());
 }
 
 /// Posted to the main window to handle queued links (see `queue_link`).

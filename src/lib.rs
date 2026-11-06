@@ -1,9 +1,11 @@
 #![allow(non_snake_case)]
 
+mod files;
 mod links;
 mod markdown;
 mod settings;
 mod viewer;
+mod zone;
 
 use std::ffi::{CStr, c_char, c_int};
 use std::ptr;
@@ -117,19 +119,14 @@ pub extern "system" fn ListCloseWindow(list_win: HWND) {
 }
 
 fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
-    // Read the markdown file
-    let markdown_content = match std::fs::read_to_string(file_path) {
-        Ok(content) => content,
-        Err(_) => return HWND::default(),
-    };
-
-    // Convert to HTML
-    let html_body = markdown::markdown_to_html(&markdown_content);
-    // Only shown if the viewer cannot load the file itself (no remote images, no banner).
-    let full_html = markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Blocked, &[]);
+    // Only check that the file can be opened; TC shows its own message if not.
+    // The content is read later, after its Mark of the Web was checked (#24).
+    if files::open_read_only(std::path::Path::new(file_path)).is_err() {
+        return HWND::default();
+    }
 
     // Create viewer window with WebView2
-    match viewer::create_viewer(parent, &full_html, Some(file_path), dark_mode) {
+    match viewer::create_viewer(parent, "", Some(file_path), dark_mode) {
         Ok(hwnd) => hwnd,
         Err(_) => HWND::default(),
     }

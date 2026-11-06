@@ -104,7 +104,13 @@ pub struct Bar {
     pub text: String,
     pub buttons: Vec<BarButton>,
     pub show: BarShow,
+    /// Has a close button ([x], choice `close`). The host keeps a closed bar
+    /// away until another document is opened (#24).
+    pub closable: bool,
 }
+
+/// The answer posted by a bar's close button.
+pub const CLOSE_CHOICE: &str = "close";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BarButton {
@@ -128,11 +134,124 @@ pub const REMOTE_IMAGES_BAR: &str = "remote-images";
 /// Standalone viewer only: asks to register MDView as .md viewer (#37).
 pub const REGISTER_BAR: &str = "register";
 
-/// The bars MDView puts on a page. `ask_to_register` is only ever true in the
-/// standalone viewer; its bar comes first, so it is on top.
-pub fn document_bars(remote_images: RemoteImages, ask_to_register: bool) -> Vec<Bar> {
+/// Mark of the Web (#24): shown instead of a downloaded document until the
+/// user chooses to open it.
+pub const DOWNLOAD_GATE: &str = "download-gate";
+
+/// What a page needs bars for.
+#[derive(Debug, Clone, Copy)]
+pub struct PageBars<'a> {
+    pub remote_images: RemoteImages,
+    /// Only ever true in the standalone viewer.
+    pub ask_to_register: bool,
+    /// Bars the user closed while this document is open.
+    pub closed: &'a [String],
+}
+
+/// What the user chose while a document is open (#24): bars they closed, and
+/// whether they opened it although it was downloaded from the internet.
+/// Reloading the same document keeps these; another document starts fresh.
+#[derive(Debug, Default)]
+pub struct DocumentChoices {
+    document: Option<std::path::PathBuf>,
+    closed_bars: Vec<String>,
+    opened_download: bool,
+}
+
+impl DocumentChoices {
+    /// Switch to `document`; choices made for another document are dropped.
+    fn switch_to(&mut self, document: &std::path::Path) {
+        if self.document.as_deref() != Some(document) {
+            self.document = Some(document.to_path_buf());
+            self.closed_bars.clear();
+            self.opened_download = false;
+        }
+    }
+
+    /// The closed bars for `document`, which is about to be shown.
+    pub fn closed_bars(&mut self, document: &std::path::Path) -> &[String] {
+        self.switch_to(document);
+        &self.closed_bars
+    }
+
+    /// Whether the user chose Open for `document` while it is open.
+    pub fn opened_download(&mut self, document: &std::path::Path) -> bool {
+        self.switch_to(document);
+        self.opened_download
+    }
+
+    /// The user closed `bar` on `document`.
+    pub fn close_bar(&mut self, document: &std::path::Path, bar: &str) {
+        self.switch_to(document);
+        if !self.closed_bars.iter().any(|id| id == bar) {
+            self.closed_bars.push(bar.to_string());
+        }
+    }
+
+    /// The user chose Open for the downloaded `document`.
+    pub fn open_download(&mut self, document: &std::path::Path) {
+        self.switch_to(document);
+        self.opened_download = true;
+    }
+}
+
+/// The gate's question and buttons. None of them close the bar: the host
+/// either shows the document or, if that fails, says why and keeps the gate.
+pub fn download_gate_bar() -> Bar {
+    Bar {
+        id: DOWNLOAD_GATE,
+        text: "This document was downloaded from the internet.".to_string(),
+        buttons: vec![
+            BarButton { choice: "open", label: "Open", closes_bar: false },
+            BarButton { choice: "unblock", label: "Open and remove the mark", closes_bar: false },
+            BarButton { choice: "never", label: "Don't ask again", closes_bar: false },
+            BarButton { choice: "closeWindow", label: "Close", closes_bar: false },
+        ],
+        show: BarShow::Now,
+        closable: false,
+    }
+}
+
+/// The page shown instead of a downloaded document. It contains nothing from
+/// the document: only its path and, if known, where it came from, as text.
+pub fn download_gate_html(path: &str, host_url: Option<&str>) -> String {
+    let mut html = format!("<div class=\"mdview-gate\"><p><code>{}</code></p>", html_text(path));
+    if let Some(url) = host_url {
+        html.push_str(&format!("<p>From: <code>{}</code></p>", html_text(url)));
+    }
+    html.push_str("</div>");
+    html
+}
+
+/// The page shown when a document cannot be read, instead of an empty window.
+pub fn read_error_html(path: &str, reason: &str) -> String {
+    format!(
+        "<div class=\"mdview-gate\"><p><strong>Could not read</strong></p><p><code>{}</code></p><p>{}</p></div>",
+        html_text(path),
+        html_text(reason)
+    )
+}
+
+/// Text for HTML element content and attributes.
+fn html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The bars MDView puts on a document, top first: registration, remote images.
+pub fn document_bars(page: &PageBars) -> Vec<Bar> {
     let mut bars = Vec::new();
-    if ask_to_register {
+    if page.ask_to_register {
         bars.push(Bar {
             id: REGISTER_BAR,
             text: concat!(
@@ -147,9 +266,10 @@ pub fn document_bars(remote_images: RemoteImages, ask_to_register: bool) -> Vec<
                 BarButton { choice: "never", label: "Don't ask again", closes_bar: true },
             ],
             show: BarShow::Now,
+            closable: false,
         });
     }
-    if remote_images == RemoteImages::AskToLoad {
+    if page.remote_images == RemoteImages::AskToLoad {
         bars.push(Bar {
             id: REMOTE_IMAGES_BAR,
             text: "Remote images in this document were blocked to protect your privacy.".to_string(),
@@ -159,15 +279,20 @@ pub fn document_bars(remote_images: RemoteImages, ask_to_register: bool) -> Vec<
                 BarButton { choice: "never", label: "Never", closes_bar: true },
             ],
             show: BarShow::WhenRemoteImageBlocked,
+            closable: true,
         });
     }
+    bars.retain(|bar| !page.closed.iter().any(|closed| closed == bar.id));
     bars
 }
 
 /// Whether `choice` is an answer to a bar that is on the page.
 pub fn bar_choice_offered(bars: &[Bar], bar: &str, choice: &str) -> bool {
-    bars.iter()
-        .any(|b| b.id == bar && b.buttons.iter().any(|button| button.choice == choice))
+    bars.iter().any(|b| {
+        b.id == bar
+            && ((b.closable && choice == CLOSE_CHOICE)
+                || b.buttons.iter().any(|button| button.choice == choice))
+    })
 }
 
 /// A JSON string literal that is also safe inside an HTML <script>: `<`, `>`
@@ -212,10 +337,11 @@ fn bars_json(bars: &[Bar]) -> String {
                 BarShow::WhenRemoteImageBlocked => "remoteImageBlocked",
             };
             format!(
-                r#"{{"id":{},"text":{},"buttons":[{}],"show":"{show}"}}"#,
+                r#"{{"id":{},"text":{},"buttons":[{}],"show":"{show}","closable":{}}}"#,
                 script_string(bar.id),
                 script_string(&bar.text),
-                buttons.join(",")
+                buttons.join(","),
+                bar.closable
             )
         })
         .collect();
@@ -310,6 +436,15 @@ document.addEventListener('securitypolicyviolation', function(e) {{
 }}
 .mdview-bar span {{ flex: 1; }}
 .mdview-bar button {{ font: inherit; cursor: pointer; }}
+.mdview-gate code {{ word-break: break-all; }}
+.mdview-bar button.mdview-bar-close {{
+    border: none;
+    background: transparent;
+    color: inherit;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 4px;
+}}
 body {{
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     font-size: 14px;
@@ -399,19 +534,28 @@ a {{ cursor: pointer; }}
         var text = document.createElement('span');
         text.textContent = def.text;
         bar.appendChild(text);
-        def.buttons.forEach(function(button) {{
+        function addButton(label, choice, closesBar, name) {{
             var b = document.createElement('button');
             b.type = 'button';
-            b.textContent = button.label;
+            b.textContent = label;
+            if (name) {{
+                b.setAttribute('aria-label', name);
+                b.title = name;
+                b.className = 'mdview-bar-close';
+            }}
             b.addEventListener('click', function() {{
-                webview.postMessage({{type: 'bar', bar: def.id, choice: button.choice}});
-                if (button.closesBar) {{
+                webview.postMessage({{type: 'bar', bar: def.id, choice: choice}});
+                if (closesBar) {{
                     bar.remove();
                     if (!stack.firstChild) stack.remove();
                 }}
             }});
             bar.appendChild(b);
+        }}
+        def.buttons.forEach(function(button) {{
+            addButton(button.label, button.choice, button.closesBar);
         }});
+        if (def.closable) addButton('×', 'close', true, 'Close');
         stack.appendChild(bar);
     }}
 
@@ -532,7 +676,7 @@ mod tests {
     #[test]
     fn test_page_csp_only_lets_mdview_scripts_run() {
         let body = markdown_to_html("# T\n\n<script>evil()</script>\n\n<img src=x onerror=\"evil()\">");
-        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad, false));
+        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
         let nonce = nonce_of(&page);
         assert_eq!(nonce.len(), 32);
         let meta_at = page.find("<meta http-equiv=\"Content-Security-Policy\"").expect("CSP meta");
@@ -577,10 +721,14 @@ mod tests {
     fn test_remote_images_load_only_when_allowed() {
         let allowed = wrap_html("", false, RemoteImages::Allowed, &[]);
         assert!(allowed.contains("img-src https://mdview.example data: https: http:;"));
-        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad, false));
+        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
         assert!(ask.contains("img-src https://mdview.example data:;"));
         let blocked = wrap_html("", false, RemoteImages::Blocked, &[]);
         assert!(blocked.contains("img-src https://mdview.example data:;"));
+    }
+
+    fn page(remote_images: RemoteImages, ask_to_register: bool) -> PageBars<'static> {
+        PageBars { remote_images, ask_to_register, closed: &[] }
     }
 
     // #40: one bar component; MDView decides which bars a page gets.
@@ -593,6 +741,7 @@ mod tests {
                 .map(|&(choice, label, closes_bar)| BarButton { choice, label, closes_bar })
                 .collect(),
             show,
+            closable: false,
         }
     }
 
@@ -641,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_document_bars_follow_remote_images() {
-        let bars = document_bars(RemoteImages::AskToLoad, false);
+        let bars = document_bars(&page(RemoteImages::AskToLoad, false));
         assert_eq!(bars.len(), 1);
         let remote = &bars[0];
         assert_eq!(remote.id, REMOTE_IMAGES_BAR);
@@ -652,14 +801,14 @@ mod tests {
             buttons,
             [("once", "Load images", false), ("always", "Always load", false), ("never", "Never", true)]
         );
-        assert!(document_bars(RemoteImages::Allowed, false).is_empty());
-        assert!(document_bars(RemoteImages::Blocked, false).is_empty());
+        assert!(document_bars(&page(RemoteImages::Allowed, false)).is_empty());
+        assert!(document_bars(&page(RemoteImages::Blocked, false)).is_empty());
     }
 
     // #37: the registration question is a bar on top, not a dialog.
     #[test]
     fn test_registration_bar_comes_first_and_only_when_asked() {
-        let bars = document_bars(RemoteImages::AskToLoad, true);
+        let bars = document_bars(&page(RemoteImages::AskToLoad, true));
         let ids: Vec<_> = bars.iter().map(|b| b.id).collect();
         assert_eq!(ids, [REGISTER_BAR, REMOTE_IMAGES_BAR], "registration bar on top");
         let register = &bars[0];
@@ -674,7 +823,7 @@ mod tests {
             [("register", "Register", true), ("notNow", "Not now", true), ("never", "Don't ask again", true)]
         );
         assert!(bar_choice_offered(&bars, REGISTER_BAR, "notNow"));
-        let without = document_bars(RemoteImages::AskToLoad, false);
+        let without = document_bars(&page(RemoteImages::AskToLoad, false));
         assert!(without.iter().all(|b| b.id != REGISTER_BAR));
         assert!(!bar_choice_offered(&without, REGISTER_BAR, "never"), "not offered, not accepted");
     }
@@ -682,12 +831,108 @@ mod tests {
     // The host only acts on an answer to a bar it put on the current page.
     #[test]
     fn test_only_offered_bar_choices_are_accepted() {
-        let bars = document_bars(RemoteImages::AskToLoad, false);
+        let bars = document_bars(&page(RemoteImages::AskToLoad, false));
         assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "once"));
         assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "never"));
         assert!(!bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "delete"), "unknown choice");
         assert!(!bar_choice_offered(&bars, "register", "yes"), "bar not on this page");
         assert!(!bar_choice_offered(&[], REMOTE_IMAGES_BAR, "always"), "no bars offered");
+    }
+
+    // #24: a downloaded document is not shown; MDView's own page asks first.
+    #[test]
+    fn test_download_gate_asks_before_showing_the_document() {
+        let gate = download_gate_bar();
+        assert_eq!(gate.id, DOWNLOAD_GATE);
+        assert_eq!(gate.text, "This document was downloaded from the internet.");
+        assert_eq!(gate.show, BarShow::Now);
+        assert!(!gate.closable);
+        let buttons: Vec<_> = gate.buttons.iter().map(|b| (b.choice, b.label, b.closes_bar)).collect();
+        assert_eq!(
+            buttons,
+            [
+                ("open", "Open", false),
+                ("unblock", "Open and remove the mark", false),
+                ("never", "Don't ask again", false),
+                ("closeWindow", "Close", false),
+            ],
+            "the host decides: it shows the document, or says why not and keeps the gate"
+        );
+        let bars = [gate];
+        for choice in ["open", "unblock", "never", "closeWindow"] {
+            assert!(bar_choice_offered(&bars, DOWNLOAD_GATE, choice), "{choice}");
+        }
+        assert!(!bar_choice_offered(&bars, DOWNLOAD_GATE, "delete"));
+        assert!(!bar_choice_offered(&bars, DOWNLOAD_GATE, CLOSE_CHOICE), "the gate has no [x]");
+        assert!(!bar_choice_offered(&document_bars(&page(RemoteImages::AskToLoad, true)), DOWNLOAD_GATE, "open"),
+            "a document page has no gate, so no answer to it is accepted");
+    }
+
+    // #24: the gate shows only the path and the source, as text.
+    #[test]
+    fn test_download_gate_shows_path_and_source_as_text() {
+        let html = download_gate_html(r"C:\dl\<script>x()</script>&.md", Some("https://example.com/a?b=1&c=\"<i>\""));
+        assert!(html.contains(r"<code>C:\dl\&lt;script&gt;x()&lt;/script&gt;&amp;.md</code>"), "{html}");
+        assert!(html.contains("From: <code>https://example.com/a?b=1&amp;c=&quot;&lt;i&gt;&quot;</code>"), "{html}");
+        assert!(!html.contains("<a"), "the source is not a link: {html}");
+        assert!(!html.contains("<script"), "{html}");
+        let without = download_gate_html(r"C:\dl\a.md", None);
+        assert!(!without.contains("From:"), "{without}");
+        let page_html = wrap_html(&without, false, RemoteImages::Blocked, &[download_gate_bar()]);
+        assert!(page_html.contains(r#""id":"download-gate""#));
+    }
+
+    // A document that cannot be read gets a clear page, not an empty window.
+    #[test]
+    fn test_read_error_page_says_which_file_and_why() {
+        let html = read_error_html(r"C:\docs\<b>.md", "denied & <gone>");
+        assert!(html.contains("Could not read"), "{html}");
+        assert!(html.contains(r"<code>C:\docs\&lt;b&gt;.md</code>"), "{html}");
+        assert!(html.contains("<p>denied &amp; &lt;gone&gt;</p>"), "{html}");
+    }
+
+    // #24: document bars can be closed; the registration bar has "Not now".
+    #[test]
+    fn test_only_document_bars_can_be_closed() {
+        let bars = document_bars(&page(RemoteImages::AskToLoad, true));
+        let closable: Vec<_> = bars.iter().map(|b| (b.id, b.closable)).collect();
+        assert_eq!(closable, [(REGISTER_BAR, false), (REMOTE_IMAGES_BAR, true)]);
+        assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, CLOSE_CHOICE));
+        assert!(!bar_choice_offered(&bars, REGISTER_BAR, CLOSE_CHOICE), "no close button, no close");
+        let page_html = wrap_html("", false, RemoteImages::AskToLoad, &bars);
+        assert!(page_html.contains(r#""show":"now","closable":false}"#));
+        assert!(page_html.contains(r#""show":"remoteImageBlocked","closable":true}"#));
+    }
+
+    // #24: choices last while the document is open, and are gone when it is
+    // opened again.
+    #[test]
+    fn test_document_choices_last_until_another_document_is_shown() {
+        let a = std::path::Path::new(r"C:\docs\a.md");
+        let b = std::path::Path::new(r"C:\docs\b.md");
+        let mut choices = DocumentChoices::default();
+        assert!(choices.closed_bars(a).is_empty());
+        assert!(!choices.opened_download(a));
+        choices.close_bar(a, REMOTE_IMAGES_BAR);
+        choices.close_bar(a, REMOTE_IMAGES_BAR);
+        choices.open_download(a);
+        assert_eq!(choices.closed_bars(a), [REMOTE_IMAGES_BAR], "reloading a keeps it closed");
+        assert!(choices.opened_download(a), "reloading a keeps it open");
+        assert!(choices.closed_bars(b).is_empty(), "another document");
+        assert!(!choices.opened_download(a), "a opened again asks again");
+        assert!(choices.closed_bars(a).is_empty(), "a opened again shows its bars");
+        choices.open_download(b);
+        assert!(!choices.opened_download(a), "opening b says nothing about a");
+    }
+
+    // #24: a closed bar stays away while its document is open.
+    #[test]
+    fn test_closed_bars_are_left_out() {
+        let closed = [REMOTE_IMAGES_BAR.to_string()];
+        let bars = document_bars(&PageBars { closed: &closed, ..page(RemoteImages::AskToLoad, true) });
+        let ids: Vec<_> = bars.iter().map(|b| b.id).collect();
+        assert_eq!(ids, [REGISTER_BAR]);
+        assert!(!bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "once"), "a closed bar takes no answers");
     }
 
     #[test]
