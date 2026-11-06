@@ -1,7 +1,8 @@
 # End-to-end check that normal viewing still works with the security
 # hardening, in the standalone viewer and in the Total Commander plugin:
 # local images, .md links, #anchor links, the remote-images banner
-# (Load images / Always / Never) and the welcome screen.
+# (Load images / Always / Never), the registration bar (#37: no dialog, Not now,
+# Don't ask again, Esc) and the welcome screen.
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -161,6 +162,60 @@ function Wait-Element($v, $type, $nameRegex, $seconds = 15) {
 }
 function Invoke-Element($e) { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
 
+Add-Type -Namespace Win32 -Name Behaviour -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+public delegate bool EnumProc(IntPtr h, IntPtr l);
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+'@
+# Windows only lets a process take the foreground under some conditions; a
+# synthetic F24 tap satisfies them and means nothing to MDView (see focus.ps1).
+function Set-Foreground($hwnd) {
+    if ([Win32.Behaviour]::GetForegroundWindow() -eq $hwnd) { return $true }
+    [Win32.Behaviour]::keybd_event(0x87, 0, 0, [UIntPtr]::Zero)
+    [Win32.Behaviour]::keybd_event(0x87, 0, 2, [UIntPtr]::Zero)
+    [Win32.Behaviour]::SetForegroundWindow($hwnd) | Out-Null
+    Start-Sleep -Milliseconds 800
+    [Win32.Behaviour]::GetForegroundWindow() -eq $hwnd
+}
+function Send-Escape {
+    [Win32.Behaviour]::keybd_event(0x1B, 0x01, 0, [UIntPtr]::Zero)
+    [Win32.Behaviour]::keybd_event(0x1B, 0x01, 2, [UIntPtr]::Zero)
+}
+# A visible message box (dialog class #32770) of the viewer process, if one is
+# open. Found with EnumWindows: UI Automation files an owned dialog under its
+# owner window, not under the desktop.
+function Get-Dialog($v) {
+    $script:dialogFound = $null
+    $targetPid = $v.Proc.Id
+    $cb = [Win32.Behaviour+EnumProc]{
+        param($h, $l)
+        $procId = 0
+        [void][Win32.Behaviour]::GetWindowThreadProcessId($h, [ref]$procId)
+        if ($procId -eq $targetPid -and [Win32.Behaviour]::IsWindowVisible($h)) {
+            $c = New-Object System.Text.StringBuilder 64
+            [void][Win32.Behaviour]::GetClassName($h, $c, 64)
+            if ($c.ToString() -eq '#32770') { $script:dialogFound = $AE::FromHandle($h); return $false }
+        }
+        $true
+    }
+    [void][Win32.Behaviour]::EnumWindows($cb, [IntPtr]::Zero)
+    $script:dialogFound
+}
+# Answers "No" in the old registration dialog, so the remaining checks can run.
+function Close-Dialog($v) {
+    $d = Get-Dialog $v
+    if (-not $d) { return }
+    $no = $d.FindFirst($TS::Descendants, (New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button)),
+        (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'No')))))
+    if ($no) { Invoke-Element $no; Start-Sleep -Milliseconds 500 }
+}
+
 $failures = 0
 function Check($name, $ok, $detail) {
     $status = if ($ok) { 'PASS' } else { 'FAIL' }
@@ -274,6 +329,87 @@ function Check($name, $ok, $detail) {
         $from = if ($case.Store -eq 'exe') { 'the registry (standalone viewer / v0.2.6)' } else { "the plugin's mdview.ini" }
         Check "$($case.Viewer): 'Always' in $from does not apply here; it still asks" ([bool]$banner -and $requests -eq 0) "banner=$([bool]$banner) requests=$requests"
     }
+
+    # Registration question (#37): a bar in the document instead of a dialog.
+    # The test build is never the registered exe, so only DontAskRegister decides.
+    function Set-AskRegister { Set-TestRegistry $null; Remove-ItemProperty -Path $key -Name DontAskRegister -ErrorAction SilentlyContinue }
+    function Get-DontAskRegister { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).DontAskRegister }
+    $registerText = '^Do you want to make MDView the default viewer for Markdown \(\.md\) files\?$'
+
+    Set-AskRegister
+    $v = Start-Viewer 'exe' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Seconds 3
+    $dialog = Get-Dialog $v
+    Check 'exe: no registration dialog' (-not $dialog) "dialog shown=$([bool]$dialog)"
+    $fg = Set-Foreground $v.Proc.MainWindowHandle
+    $focused = $AE::FocusedElement
+    $focusDetail = "foreground=$fg dialog=$([bool]$dialog) focused=$($focused.Current.ControlType.ProgrammaticName) '$($focused.Current.Name)'"
+    # The document itself has focus (it lives in WebView2's own process).
+    Check 'exe: the registration question does not take keyboard focus' ($fg -and -not $dialog -and $focused.Current.ControlType -eq $CT::Document) $focusDetail
+    Close-Dialog $v
+    $bar = Wait-Element $v $CT::Text $registerText 5
+    $found = foreach ($b in 'Register', 'Not now', "Don't ask again") { [bool](Find-Element $v $CT::Button "^$([regex]::Escape($b))$") }
+    Check "exe: bar offers Register / Not now / Don't ask again" ([bool]$bar -and -not ($found -contains $false)) "bar=$([bool]$bar) buttons=$($found -join ',')"
+    $notNow = Find-Element $v $CT::Button '^Not now$'
+    if ($notNow) { Invoke-Element $notNow; Start-Sleep -Milliseconds 800 }
+    $barAfter = Find-Element $v $CT::Text $registerText
+    $link = Find-Element $v $CT::Hyperlink 'Go to second'
+    if ($link) { Invoke-Element $link }
+    [void](Wait-Element $v $CT::Text '^Second$' 10)
+    Start-Sleep -Milliseconds 800
+    $barOnSecond = Find-Element $v $CT::Text $registerText
+    $dont = Get-DontAskRegister
+    Stop-Viewer $v
+    Check "exe: 'Not now' closes the bar and saves nothing" ([bool]$notNow -and -not $barAfter -and $null -eq $dont) "clicked=$([bool]$notNow) bar after=$([bool]$barAfter) DontAskRegister=$dont"
+    Check "exe: after 'Not now' the next document does not ask again" ([bool]$notNow -and -not $barOnSecond) "clicked=$([bool]$notNow) bar on second=$([bool]$barOnSecond)"
+
+    Set-AskRegister
+    $v = Start-Viewer 'exe' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Seconds 2
+    Close-Dialog $v
+    $never = Wait-Element $v $CT::Button "^Don't ask again$" 5
+    if ($never) { Invoke-Element $never; Start-Sleep -Seconds 1 }
+    $dont = Get-DontAskRegister
+    Stop-Viewer $v
+    Check "exe: 'Don't ask again' saves DontAskRegister=1" ($dont -eq 1) "DontAskRegister=$dont"
+    $v = Start-Viewer 'exe' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Seconds 3
+    $dialog = Get-Dialog $v
+    $bar = Find-Element $v $CT::Text $registerText
+    Stop-Viewer $v
+    Check "exe: after 'Don't ask again' no bar and no dialog" ($dont -eq 1 -and -not $dialog -and -not $bar) "DontAskRegister=$dont dialog=$([bool]$dialog) bar=$([bool]$bar)"
+
+    # Esc closes the window as always; it must not mean "never ask again".
+    Set-AskRegister
+    $v = Start-Viewer 'exe' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Seconds 3
+    $fg = Set-Foreground $v.Proc.MainWindowHandle
+    Send-Escape
+    $closed = $v.Proc.WaitForExit(5000)
+    $dont = Get-DontAskRegister
+    Stop-Viewer $v
+    Check "exe: Esc closes the window and saves no 'never ask'" ($closed -and $null -eq $dont) "foreground=$fg closed=$closed DontAskRegister=$dont"
+
+    Set-AskRegister
+    $v = Start-Viewer 'exe' $null
+    [void](Wait-Element $v $CT::Text 'Open a Markdown file using' 15)
+    Start-Sleep -Seconds 3
+    $dialog = Get-Dialog $v
+    $bar = Find-Element $v $CT::Text $registerText
+    Stop-Viewer $v
+    Check 'exe: the welcome screen asks in the bar' ([bool]$bar -and -not $dialog) "bar=$([bool]$bar) dialog=$([bool]$dialog)"
+
+    Set-AskRegister
+    $v = Start-Viewer 'plugin' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Seconds 2
+    $bar = Find-Element $v $CT::Text $registerText
+    Stop-Viewer $v
+    Check 'plugin: never asks to register' (-not $bar) "bar=$([bool]$bar)"
 
     # Welcome screen (standalone viewer without a file)
     Set-RemoteImagesSetting 'exe' $null

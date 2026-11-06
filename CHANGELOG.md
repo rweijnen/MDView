@@ -13,6 +13,7 @@ release workflow refuses to publish a version without a section here.
 
 ### Changes
 - The Total Commander plugin keeps its settings in its own `mdview.ini` in TC's settings folder (next to `wincmd.ini`), separate from the standalone viewer, which keeps using the registry. Answers given in TC (for example "Always load" remote images) apply to TC only. A choice made in the v0.2.6 plugin is asked once more. (#34)
+- Standalone viewer: the question whether to register MDView as .md viewer is now a bar at the top of the document instead of a dialog (**Register**, **Not now**, **Don't ask again**). It doesn't take focus, and Esc no longer means "never ask again". (#37)
 
 ## v0.2.6
 
