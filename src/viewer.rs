@@ -60,6 +60,8 @@ thread_local! {
     static PAGE_ALLOWS_REMOTE_IMAGES: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
     /// Per viewer: the bars MDView put on the page being shown; only answers to these are accepted.
     static PAGE_BARS: RefCell<HashMap<isize, Vec<crate::markdown::Bar>>> = RefCell::new(HashMap::new());
+    /// Per viewer: what the user chose while the document being shown is open (#24).
+    static DOCUMENT_CHOICES: RefCell<HashMap<isize, crate::markdown::DocumentChoices>> = RefCell::new(HashMap::new());
 }
 
 /// Posted to a viewer window to handle its queued links (see `queue_link`).
@@ -279,6 +281,19 @@ fn create_not_found_response(
     )
 }
 
+/// The mark of a downloaded document that MDView must ask about before
+/// showing it in this viewer: not if the user chose "Don't ask again" or
+/// already chose Open while this document is open.
+fn download_gate(hwnd: HWND, file_path: &Path) -> Option<crate::zone::Mark> {
+    if crate::settings::open_downloaded_without_asking() {
+        return None;
+    }
+    let mark = crate::zone::mark_of_the_web(file_path)?;
+    let opened = DOCUMENT_CHOICES
+        .with(|c| c.borrow_mut().entry(hwnd.0 as isize).or_default().opened_download(file_path));
+    (!opened).then_some(mark)
+}
+
 fn create_virtual_resource_response(
     hwnd: HWND,
     environment: &ICoreWebView2Environment,
@@ -286,17 +301,39 @@ fn create_virtual_resource_response(
     dark_mode: bool,
 ) -> Option<ICoreWebView2WebResourceResponse> {
     if crate::links::is_markdown(file_path) {
-        let markdown_content = std::fs::read_to_string(file_path).ok()?;
-        let html_body = crate::markdown::markdown_to_html(&markdown_content);
-        let remote_images = remote_images_for(hwnd, file_path);
+        let (html_body, remote_images, bars) = if let Some(mark) = download_gate(hwnd, file_path) {
+            // Downloaded from the internet (#24): nothing from the document
+            // is shown until the user chooses to open it.
+            let gate = crate::markdown::download_gate_html(&file_path.display().to_string(), mark.host_url.as_deref());
+            (gate, crate::markdown::RemoteImages::Blocked, vec![crate::markdown::download_gate_bar()])
+        } else {
+            match crate::files::read_text(file_path) {
+                Ok(markdown_content) => {
+                    let remote_images = remote_images_for(hwnd, file_path);
+                    // The plugin never asks to register (#37): TC is the host.
+                    let bars = DOCUMENT_CHOICES.with(|c| {
+                        let mut choices = c.borrow_mut();
+                        crate::markdown::document_bars(&crate::markdown::PageBars {
+                            remote_images,
+                            ask_to_register: false,
+                            closed: choices.entry(hwnd.0 as isize).or_default().closed_bars(file_path),
+                        })
+                    });
+                    (crate::markdown::markdown_to_html(&markdown_content), remote_images, bars)
+                }
+                Err(reason) => (
+                    crate::markdown::read_error_html(&file_path.display().to_string(), &reason),
+                    crate::markdown::RemoteImages::Blocked,
+                    Vec::new(),
+                ),
+            }
+        };
         PAGE_ALLOWS_REMOTE_IMAGES.with(|a| {
             a.borrow_mut().insert(
                 hwnd.0 as isize,
                 remote_images == crate::markdown::RemoteImages::Allowed,
             )
         });
-        // The plugin never asks to register (#37): TC is the host.
-        let bars = crate::markdown::document_bars(remote_images, false);
         let full_html = crate::markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
         PAGE_BARS.with(|b| b.borrow_mut().insert(hwnd.0 as isize, bars));
         create_web_resource_response(
@@ -308,7 +345,19 @@ fn create_virtual_resource_response(
             "",
         )
     } else {
-        let bytes = std::fs::read(file_path).ok()?;
+        let bytes = match crate::files::read_bytes(file_path) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
+                return create_web_resource_response(
+                    environment,
+                    format!("Could not read {}: {reason}", file_path.display()).as_bytes(),
+                    500,
+                    "Could not read",
+                    "text/plain; charset=utf-8",
+                    PASSIVE_FILE_HEADERS,
+                );
+            }
+        };
         create_web_resource_response(
             environment,
             &bytes,
@@ -808,6 +857,7 @@ fn cleanup_viewer_state(hwnd: HWND) {
     REMOTE_IMAGES_ONCE.with(|o| o.borrow_mut().remove(&key));
     PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.borrow_mut().remove(&key));
     PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
+    DOCUMENT_CHOICES.with(|c| c.borrow_mut().remove(&key));
 }
 
 fn unregister_window_class_if_unused() {
@@ -1026,14 +1076,7 @@ fn handle_queued_links(hwnd: HWND) {
 /// A message from MDView's page script.
 fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) {
     match msg.get("type").map(String::as_str) {
-        Some("close") => {
-            // Close Total Commander's Lister window
-            if let Ok(parent) = unsafe { GetParent(hwnd) } {
-                if !parent.is_invalid() {
-                    let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
-                }
-            }
-        }
+        Some("close") => close_lister(hwnd),
         Some("openLink") => {
             if let Some(url) = msg.get("url") {
                 queue_link(hwnd, url.clone());
@@ -1050,7 +1093,20 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
                 log_debug(&format!("ignored answer to a bar not on this page: {bar} / {choice}"));
                 return;
             }
+            if choice == crate::markdown::CLOSE_CHOICE {
+                if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
+                    DOCUMENT_CHOICES.with(|c| {
+                        c.borrow_mut().entry(hwnd.0 as isize).or_default().close_bar(Path::new(&path), bar)
+                    });
+                }
+                return;
+            }
             match bar.as_str() {
+                crate::markdown::DOWNLOAD_GATE => {
+                    if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
+                        handle_download_gate_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
                 crate::markdown::REMOTE_IMAGES_BAR => {
                     if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
                         handle_remote_images_choice(hwnd, choice, Path::new(&path));
@@ -1061,6 +1117,50 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
         }
         _ => {}
     }
+}
+
+/// Close Total Commander's Lister window.
+fn close_lister(hwnd: HWND) {
+    if let Ok(parent) = unsafe { GetParent(hwnd) } {
+        if !parent.is_invalid() {
+            let _ = unsafe { PostMessageW(Some(parent), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// The user's answer on the page shown instead of a downloaded document
+/// (#24). The document is shown only if the choice worked.
+fn handle_download_gate_choice(hwnd: HWND, choice: &str, document: &Path) {
+    let result = match choice {
+        "open" => {
+            DOCUMENT_CHOICES
+                .with(|c| c.borrow_mut().entry(hwnd.0 as isize).or_default().open_download(document));
+            Ok(())
+        }
+        "unblock" => crate::zone::remove_mark(document)
+            .map_err(|e| format!("Could not remove the mark of the web from\n{e}")),
+        "never" => crate::settings::set_open_downloaded_without_asking()
+            .map_err(|e| format!("Could not save \"Don't ask again\":\n\n{e}")),
+        "closeWindow" => {
+            close_lister(hwnd);
+            return;
+        }
+        _ => return,
+    };
+    match result {
+        Ok(()) => reload_page(hwnd),
+        Err(message) => show_error(hwnd, &message),
+    }
+}
+
+fn reload_page(hwnd: HWND) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { webview.Reload() };
+            }
+        }
+    });
 }
 
 /// The user's answer in the remote-images banner.
@@ -1080,13 +1180,7 @@ fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
         _ => false,
     };
     if reload {
-        CONTROLLERS.with(|c| {
-            if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
-                if let Ok(webview) = unsafe { controller.CoreWebView2() } {
-                    let _ = unsafe { webview.Reload() };
-                }
-            }
-        });
+        reload_page(hwnd);
     }
 }
 
@@ -1094,17 +1188,20 @@ fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::RemoteImages
     match crate::settings::set_remote_images_setting(setting) {
         Ok(()) => true,
         Err(e) => {
-            log_debug(&format!("cannot save remote images setting: {e}"));
-            let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
-            let text: Vec<u16> = format!("Could not save the remote images setting:\n\n{e}\0")
-                .encode_utf16()
-                .collect();
-            let title: Vec<u16> = format!("{}\0", crate::settings::APP_NAME).encode_utf16().collect();
-            unsafe {
-                MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-            }
+            show_error(hwnd, &format!("Could not save the remote images setting:\n\n{e}"));
             false
         }
+    }
+}
+
+/// Something the user asked for failed: say so, owned by TC's Lister window.
+fn show_error(hwnd: HWND, message: &str) {
+    log_debug(message);
+    let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
+    let text: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+    let title: Vec<u16> = format!("{}\0", crate::settings::APP_NAME).encode_utf16().collect();
+    unsafe {
+        MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
     }
 }
 

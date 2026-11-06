@@ -3,6 +3,14 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
+## v0.2.8
+
+### New
+- Documents downloaded from the internet (Mark of the Web) are not shown until you choose **Open**, **Open and remove the mark** or **Don't ask again**. (#24)
+
+### Changes
+- The remote-images bar can be closed with ×; it stays closed while the document is open.
+
 ## v0.2.7
 
 ### Fixes

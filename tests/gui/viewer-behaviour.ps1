@@ -2,7 +2,9 @@
 # hardening, in the standalone viewer and in the Total Commander plugin:
 # local images, .md links, #anchor links, the remote-images banner
 # (Load images / Always / Never), the registration bar (#37: no dialog, Not now,
-# Don't ask again, Esc) and the welcome screen.
+# Don't ask again, Esc), the gate before documents downloaded from the internet
+# (#24: Open, remove the mark, Don't ask again, Close), Close on the
+# remote-images bar, and the welcome screen.
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -67,10 +69,26 @@ Set-Content (Join-Path $work 'fake-bar.md') -NoNewline -Value ("# Fake bar`n`n" 
     "<span>Remote images in this document were blocked to protect your privacy.</span>" +
     "<button type=`"button`" onclick=`"chrome.webview.postMessage({type:'bar',bar:'remote-images',choice:'always'})`">Always load</button>" +
     "</div></div>`n`nText.")
+# Mark of the Web (#24): the Zone.Identifier stream browsers write on download.
+function Set-Zone($name, $content) {
+    Set-Content -LiteralPath (Join-Path $work $name) -Stream Zone.Identifier -Value $content -NoNewline
+}
+foreach ($z in @(@('zone3.md', 'Zone 3', "[ZoneTransfer]`r`nZoneId=3`r`nHostUrl=https://example.com/zone3.md`r`n"),
+                 @('zone4.md', 'Zone 4', "[ZoneTransfer]`r`nZoneId=4`r`n"),
+                 @('zone2.md', 'Zone 2', "[ZoneTransfer]`r`nZoneId=2`r`n"),
+                 @('zonebad.md', 'Zone garbage', "not a zone identifier"))) {
+    Set-Content (Join-Path $work $z[0]) -Value "# $($z[1])`n`ntext`n`n![local image](local.jpg)" -NoNewline
+    Set-Zone $z[0] $z[2]
+}
+Set-Content (Join-Path $work 'zonenone.md') -Value "# Zone none`n`ntext" -NoNewline
+Set-Content (Join-Path $work 'zoneremote.md') -NoNewline -Value (
+    "# Zone remote`n`n[Go away](zoneaway.md)`n`n![remote pixel](http://127.0.0.1:$port/pixel.png)")
+Set-Zone 'zoneremote.md' "[ZoneTransfer]`r`nZoneId=3`r`n"
+Set-Content (Join-Path $work 'zoneaway.md') -Value "# Zone away`n`n[Go back](zoneremote.md)" -NoNewline
 
 # ---- registry
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages'
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking'
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
@@ -83,6 +101,7 @@ function Restore-Registry {
 }
 function Set-TestRegistry($remoteImages) {
     Restore-Registry
+    Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
@@ -94,15 +113,16 @@ function Get-RegistryRemoteImages { (Get-ItemProperty -Path $key -ErrorAction Si
 $tcIni = Join-Path $work 'tc-ini'
 New-Item -ItemType Directory $tcIni | Out-Null
 $pluginIni = Join-Path $tcIni 'mdview.ini'
-function Get-IniRemoteImages {
+function Get-IniValue($name) {
     if (-not (Test-Path $pluginIni)) { return $null }
     $inSection = $false
     foreach ($line in Get-Content $pluginIni) {
         if ($line -match '^\s*\[(.+)\]\s*$') { $inSection = ($Matches[1] -eq 'MDView'); continue }
-        if ($inSection -and $line -match '^\s*RemoteImages\s*=\s*(\d+)\s*$') { return [int]$Matches[1] }
+        if ($inSection -and $line -match "^\s*$name\s*=\s*(\d+)\s*$") { return [int]$Matches[1] }
     }
     $null
 }
+function Get-IniRemoteImages { Get-IniValue 'RemoteImages' }
 function Set-IniRemoteImages($value) {
     if ($null -eq $value) { Remove-Item $pluginIni -ErrorAction SilentlyContinue }
     else { Set-Content -Path $pluginIni -Value "[MDView]`r`nRemoteImages=$value`r`n" -NoNewline }
@@ -411,6 +431,221 @@ function Check($name, $ok, $detail) {
     Stop-Viewer $v
     Check 'plugin: never asks to register' (-not $bar) "bar=$([bool]$bar)"
 
+    # Mark of the Web (#24): a downloaded document is not shown until the
+    # user chooses Open, Open and remove the mark, or Don't ask again.
+    $gateText = '^This document was downloaded from the internet\.$'
+    $gateButtons = 'Open', 'Open and remove the mark', "Don't ask again", 'Close'
+    $remoteText = 'Remote images in this document were blocked'
+    function Get-OpenWithoutAsking($hostKind) {
+        if ($hostKind -eq 'exe') { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).OpenDownloadedWithoutAsking } else { Get-IniValue 'OpenDownloadedWithoutAsking' }
+    }
+    function Get-OtherOpenWithoutAsking($hostKind) { Get-OpenWithoutAsking $(if ($hostKind -eq 'exe') { 'plugin' } else { 'exe' }) }
+    function Test-Marked($name) { [bool](Get-Item -LiteralPath (Join-Path $work $name) -Stream Zone.Identifier -ErrorAction SilentlyContinue) }
+    function Find-GateButton($v, $name) { Find-Element $v $CT::Button "^$([regex]::Escape($name))$" }
+
+    foreach ($hostKind in 'exe', 'plugin') {
+        foreach ($z in @(@('zone3.md', '^Zone 3$', 'internet (ZoneId=3)'), @('zone4.md', '^Zone 4$', 'restricted (ZoneId=4)'), @('zonebad.md', '^Zone garbage$', 'unreadable Zone.Identifier'))) {
+            Set-RemoteImagesSetting $hostKind $null
+            $v = Start-Viewer $hostKind (Join-Path $work $z[0])
+            $gate = Wait-Element $v $CT::Text $gateText 15
+            $found = foreach ($b in $gateButtons) { [bool](Find-GateButton $v $b) }
+            $pathShown = [bool](Find-Element $v $CT::Text ([regex]::Escape((Join-Path $work $z[0]).Split('\')[-1]) + '$'))
+            Start-Sleep -Seconds 1
+            $heading = Find-Element $v $CT::Text $z[1]
+            $img = Find-Element $v $CT::Image 'local image'
+            Stop-Viewer $v
+            Check "${hostKind}: $($z[2]): the gate is shown with Open / remove the mark / Don't ask again / Close" ([bool]$gate -and -not ($found -contains $false) -and $pathShown) "gate=$([bool]$gate) buttons=$($found -join ',') path shown=$pathShown"
+            Check "${hostKind}: $($z[2]): nothing from the document is shown" ([bool]$gate -and -not $heading -and -not $img) "heading=$([bool]$heading) image=$([bool]$img)"
+        }
+
+        # Where it came from: as text, never as a link.
+        $v = Start-Viewer $hostKind (Join-Path $work 'zone3.md')
+        [void](Wait-Element $v $CT::Text $gateText 15)
+        $from = Find-Element $v $CT::Text 'https://example\.com/zone3\.md'
+        $fromLink = Find-Element $v $CT::Hyperlink 'example\.com'
+        Stop-Viewer $v
+        Check "${hostKind}: the gate shows where the file came from, as text" ([bool]$from -and -not $fromLink) "text=$([bool]$from) link=$([bool]$fromLink)"
+
+        foreach ($z in @(@('zone2.md', '^Zone 2$', 'trusted sites (ZoneId=2)'), @('zonenone.md', '^Zone none$', 'no Zone.Identifier'))) {
+            Set-RemoteImagesSetting $hostKind $null
+            $v = Start-Viewer $hostKind (Join-Path $work $z[0])
+            $heading = Wait-Element $v $CT::Text $z[1]
+            $gate = Find-Element $v $CT::Text $gateText
+            Stop-Viewer $v
+            Check "${hostKind}: $($z[2]): shown directly" ([bool]$heading -and -not $gate) "document=$([bool]$heading) gate=$([bool]$gate)"
+        }
+
+        # Open: shown while the document is open, also after a reload ("Load
+        # images"); another document and back asks again.
+        Set-RemoteImagesSetting $hostKind $null
+        $before = Get-PixelHits
+        $v = Start-Viewer $hostKind (Join-Path $work 'zoneremote.md')
+        [void](Wait-Element $v $CT::Text $gateText 15)
+        $open = Find-GateButton $v 'Open'
+        if ($open) { Invoke-Element $open }
+        $shown = Wait-Element $v $CT::Text '^Zone remote$' 10
+        $load = Wait-Element $v $CT::Button '^Load images$' 8
+        if ($load) { Invoke-Element $load; Start-Sleep -Seconds 3 }
+        $reloaded = (Get-PixelHits) -gt $before
+        $afterReload = Find-Element $v $CT::Text '^Zone remote$'
+        $gateAfterReload = Find-Element $v $CT::Text $gateText
+        $away = Find-Element $v $CT::Hyperlink 'Go away'
+        if ($away) { Invoke-Element $away }
+        [void](Wait-Element $v $CT::Text '^Zone away$' 10)
+        $back = Wait-Element $v $CT::Hyperlink 'Go back' 5
+        if ($back) { Invoke-Element $back }
+        $again = Wait-Element $v $CT::Text $gateText 10
+        $stillMarked = Test-Marked 'zoneremote.md'
+        Stop-Viewer $v
+        Check "${hostKind}: Open shows the document" ([bool]$open -and [bool]$shown) "clicked=$([bool]$open) shown=$([bool]$shown)"
+        Check "${hostKind}: after Open, a reload shows the document, not the gate" ($reloaded -and [bool]$afterReload -and -not $gateAfterReload) "reloaded=$reloaded document=$([bool]$afterReload) gate=$([bool]$gateAfterReload)"
+        Check "${hostKind}: another document and back asks again; Open keeps the mark" ([bool]$again -and $stillMarked) "gate again=$([bool]$again) marked=$stillMarked"
+
+        # [x] on the remote-images bar: closed while the document is open.
+        Set-RemoteImagesSetting $hostKind $null
+        Set-Content (Join-Path $work 'remote2.md') -NoNewline -Value "# Remote two`n`n[Go away](zoneaway.md)`n`n![remote pixel](http://127.0.0.1:$port/pixel.png)"
+        Set-Content (Join-Path $work 'zoneaway.md') -NoNewline -Value "# Zone away`n`n[Go back](zoneremote.md)`n`n[Back to remote two](remote2.md)"
+        $v = Start-Viewer $hostKind (Join-Path $work 'remote2.md')
+        [void](Wait-Element $v $CT::Text '^Remote two$')
+        $remoteBar = Wait-Element $v $CT::Text $remoteText 8
+        $close = $null
+        if ($remoteBar) {
+            $bar = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($remoteBar)
+            $close = $bar.FindFirst($TS::Descendants, (New-Object System.Windows.Automation.AndCondition(
+                (New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button)),
+                (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, 'Close')))))
+        }
+        if ($close) { Invoke-Element $close; Start-Sleep -Milliseconds 800 }
+        $afterClose = Find-Element $v $CT::Text $remoteText
+        $away = Find-Element $v $CT::Hyperlink 'Go away'
+        if ($away) { Invoke-Element $away }
+        [void](Wait-Element $v $CT::Text '^Zone away$' 10)
+        $back = Wait-Element $v $CT::Hyperlink 'Back to remote two' 5
+        if ($back) { Invoke-Element $back }
+        [void](Wait-Element $v $CT::Text '^Remote two$' 10)
+        $againBar = Wait-Element $v $CT::Text $remoteText 8
+        $saved = Get-RemoteImagesSetting $hostKind
+        Stop-Viewer $v
+        Check "${hostKind}: Close hides the remote-images bar and saves nothing" ([bool]$close -and -not $afterClose -and $null -eq $saved) "close=$([bool]$close) bar after=$([bool]$afterClose) RemoteImages=$saved"
+        Check "${hostKind}: the remote-images bar is back after another document and back" ([bool]$close -and [bool]$againBar) "bar again=$([bool]$againBar)"
+
+        # Open and remove the mark: fails clearly while the mark is in use...
+        Set-Content (Join-Path $work 'unblock.md') -Value "# Unblock me`n`ntext" -NoNewline
+        Set-Zone 'unblock.md' "[ZoneTransfer]`r`nZoneId=3`r`n"
+        $held = [IO.File]::Open((Join-Path $work 'unblock.md:Zone.Identifier'), 'Open', 'Read', 'None')
+        try {
+            $v = Start-Viewer $hostKind (Join-Path $work 'unblock.md')
+            [void](Wait-Element $v $CT::Text $gateText 15)
+            $unblock = Find-GateButton $v 'Open and remove the mark'
+            if ($unblock) { Invoke-Element $unblock; Start-Sleep -Seconds 2 }
+            $dialog = Get-Dialog $v
+            $dialogText = if ($dialog) { ($dialog.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' } else { '' }
+            # Close it as the user would. (Invoking OK sends BM_CLICK, which
+            # does nothing while the dialog is not the active window.)
+            if ($dialog) {
+                $dialog.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
+                Start-Sleep -Milliseconds 800
+            }
+        } finally { $held.Close() }
+        $gateStays = Find-Element $v $CT::Text $gateText
+        $docShown = Find-Element $v $CT::Text '^Unblock me$'
+        Check "${hostKind}: removing the mark fails with a clear message, and the gate stays" ([bool]$dialog -and $dialogText -match 'Could not remove the mark' -and $dialogText -match 'unblock\.md' -and [bool]$gateStays -and -not $docShown) "dialog=$([bool]$dialog) text='$dialogText' gate=$([bool]$gateStays) document=$([bool]$docShown)"
+        # ...and works once it is no longer in use.
+        $dialogOpen = [bool](Get-Dialog $v)
+        $unblock = Find-GateButton $v 'Open and remove the mark'
+        if ($unblock) { Invoke-Element $unblock }
+        $docShown = Wait-Element $v $CT::Text '^Unblock me$' 10
+        $marked = Test-Marked 'unblock.md'
+        $dialog2 = Get-Dialog $v
+        $dialog2Text = if ($dialog2) { ($dialog2.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' } else { '' }
+        Stop-Viewer $v
+        Check "${hostKind}: 'Open and remove the mark' removes the stream and shows the document" ([bool]$docShown -and -not $marked) "document=$([bool]$docShown) still marked=$marked dialog before=$dialogOpen dialog after='$dialog2Text'"
+        $v = Start-Viewer $hostKind (Join-Path $work 'unblock.md')
+        $docShown = Wait-Element $v $CT::Text '^Unblock me$' 15
+        $gate = Find-Element $v $CT::Text $gateText
+        Stop-Viewer $v
+        Check "${hostKind}: after removing the mark, no gate" ([bool]$docShown -and -not $gate) "document=$([bool]$docShown) gate=$([bool]$gate)"
+
+        # Close: same as Esc; nothing is saved.
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'zone3.md')
+        [void](Wait-Element $v $CT::Text $gateText 15)
+        $close = Find-GateButton $v 'Close'
+        if ($close) { Invoke-Element $close }
+        $closed = $v.Proc.WaitForExit(8000)
+        $saved = Get-OpenWithoutAsking $hostKind
+        Stop-Viewer $v
+        Check "${hostKind}: Close closes the window and saves nothing" ([bool]$close -and $closed -and $null -eq $saved -and (Test-Marked 'zone3.md')) "clicked=$([bool]$close) closed=$closed saved=$saved"
+
+        # Don't ask again: saved in this program's own settings only.
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'zone3.md')
+        [void](Wait-Element $v $CT::Text $gateText 15)
+        $never = Find-GateButton $v "Don't ask again"
+        if ($never) { Invoke-Element $never }
+        $docShown = Wait-Element $v $CT::Text '^Zone 3$' 10
+        $saved = Get-OpenWithoutAsking $hostKind
+        $other = Get-OtherOpenWithoutAsking $hostKind
+        Stop-Viewer $v
+        Check "${hostKind}: 'Don't ask again' shows the document and saves OpenDownloadedWithoutAsking=1 in its own settings only" ([bool]$docShown -and $saved -eq 1 -and $null -eq $other) "document=$([bool]$docShown) saved=$saved other=$other"
+        $v = Start-Viewer $hostKind (Join-Path $work 'zone4.md')
+        $docShown = Wait-Element $v $CT::Text '^Zone 4$' 15
+        $gate = Find-Element $v $CT::Text $gateText
+        Stop-Viewer $v
+        Check "${hostKind}: after 'Don't ask again' downloaded documents open directly" ([bool]$docShown -and -not $gate -and (Test-Marked 'zone4.md')) "document=$([bool]$docShown) gate=$([bool]$gate)"
+        Set-Content (Join-Path $work 'zoneaway.md') -Value "# Zone away`n`n[Go back](zoneremote.md)" -NoNewline
+    }
+
+    # Nothing is read before the gate (#24): a downloaded document that another
+    # program has locked still gets the gate (its Zone.Identifier stream can be
+    # read); only after Open does MDView say clearly that it cannot be read.
+    Set-RemoteImagesSetting 'exe' $null
+    Set-Content (Join-Path $work 'locked.md') -Value "# Locked`n`ntext" -NoNewline
+    Set-Zone 'locked.md' "[ZoneTransfer]`r`nZoneId=3`r`n"
+    Set-Content (Join-Path $work 'locked-plain.md') -Value "# Locked plain`n`ntext" -NoNewline
+    $lock = [IO.File]::Open((Join-Path $work 'locked.md'), 'Open', 'Read', 'None')
+    $lockPlain = [IO.File]::Open((Join-Path $work 'locked-plain.md'), 'Open', 'Read', 'None')
+    try {
+        $v = $null
+        try { $v = Start-Viewer 'exe' (Join-Path $work 'locked.md') } catch { }
+        $gate = if ($v) { Wait-Element $v $CT::Text $gateText 15 } else { $null }
+        $open = if ($gate) { Find-GateButton $v 'Open' } else { $null }
+        if ($open) { Invoke-Element $open }
+        $errPage = if ($open) { Wait-Element $v $CT::Text '^Could not read$' 10 } else { $null }
+        $errorPath = if ($open) { Find-Element $v $CT::Text 'locked\.md$' } else { $null }
+        if ($v) { Stop-Viewer $v }
+        Check 'exe: a locked downloaded document still gets the gate (not read before)' ([bool]$gate) "window=$([bool]$v) gate=$([bool]$gate)"
+        Check "exe: after Open, a document that can't be read says so" ([bool]$errPage -and [bool]$errorPath) "error page=$([bool]$errPage) path=$([bool]$errorPath)"
+
+        $v = $null
+        try { $v = Start-Viewer 'exe' (Join-Path $work 'locked-plain.md') } catch { }
+        $errPage = if ($v) { Wait-Element $v $CT::Text '^Could not read$' 15 } else { $null }
+        if ($v) { Stop-Viewer $v }
+        Check "exe: a document that can't be read says so, no empty window" ([bool]$errPage) "window=$([bool]$v) error page=$([bool]$errPage)"
+
+        # The plugin declines a file it cannot open, so TC shows its own message.
+        Remove-Item (Join-Path $work 'status.txt') -ErrorAction SilentlyContinue
+        $v = $null
+        try { $v = Start-Viewer 'plugin' (Join-Path $work 'locked-plain.md') } catch { }
+        Start-Sleep -Seconds 2
+        $status = Get-Content (Join-Path $work 'status.txt') -ErrorAction SilentlyContinue
+        if ($v) { Stop-Viewer $v }
+        Check "plugin: a file it can't open is declined (TC shows its own message)" (-not $v -and ($status -contains 'load-failed')) "window=$([bool]$v) status=$($status -join ',')"
+    } finally { $lock.Close(); $lockPlain.Close() }
+    # After Open, the usual bars: registration on top, then remote images.
+    Set-AskRegister
+    $v = Start-Viewer 'exe' (Join-Path $work 'zoneremote.md')
+    [void](Wait-Element $v $CT::Text $gateText 15)
+    $gateRegister = Find-Element $v $CT::Text $registerText
+    $open = Find-GateButton $v 'Open'
+    if ($open) { Invoke-Element $open }
+    [void](Wait-Element $v $CT::Text '^Zone remote$' 10)
+    $remote = Wait-Element $v $CT::Text $remoteText 8
+    $register = Find-Element $v $CT::Text $registerText
+    $ys = foreach ($e in $register, $remote) { if ($e) { $e.Current.BoundingRectangle.Y } else { $null } }
+    Stop-Viewer $v
+    Check 'exe: the gate shows only the gate' (-not $gateRegister) "registration bar on the gate=$([bool]$gateRegister)"
+    Check 'exe: after Open, bars are stacked Register, Remote images' ($null -notin $ys -and $ys[0] -lt $ys[1]) "Y=$($ys -join ', ')"
     # Welcome screen (standalone viewer without a file)
     Set-RemoteImagesSetting 'exe' $null
     $v = Start-Viewer 'exe' $null
