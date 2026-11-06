@@ -357,6 +357,7 @@ fn main() {
         } else {
             // No file - show welcome screen
             let dark_mode = is_windows_dark_mode();
+            let welcome_bars = markdown::document_bars(markdown::RemoteImages::Blocked, ask_to_register());
             let welcome_html = markdown::wrap_html(
                 "<div style=\"text-align: center; margin-top: 100px; color: #888;\">\
                  <h1>MDView</h1>\
@@ -365,8 +366,9 @@ fn main() {
                  </div>",
                 dark_mode,
                 markdown::RemoteImages::Blocked,
-                &[],
+                &welcome_bars,
             );
+            PAGE_BARS.with(|b| *b.borrow_mut() = welcome_bars);
             (APP_NAME.to_string(), welcome_html)
         };
 
@@ -1186,7 +1188,7 @@ fn create_virtual_resource_response(
         let html_body = markdown::markdown_to_html(&markdown_content);
         let remote_images = remote_images_for(file_path);
         PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.set(remote_images == markdown::RemoteImages::Allowed));
-        let bars = markdown::document_bars(remote_images);
+        let bars = markdown::document_bars(remote_images, ask_to_register());
         let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
         PAGE_BARS.with(|b| *b.borrow_mut() = bars);
         create_web_resource_response(
@@ -1399,6 +1401,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
                         handle_remote_images_choice(hwnd, choice, Path::new(&path));
                     }
                 }
+                markdown::REGISTER_BAR => handle_register_choice(hwnd, choice),
                 _ => {}
             }
         }
@@ -1798,80 +1801,40 @@ fn is_file_association_registered() -> bool {
     }
 }
 
-/// Check if the user has opted out of the registration prompt
-fn should_prompt_registration() -> bool {
-    unsafe {
-        let mut hkey = std::mem::zeroed();
-        let subkey: Vec<u16> = format!("{}\0", REGISTRY_KEY).encode_utf16().collect();
+const DONT_ASK_REGISTER: &str = "DontAskRegister";
 
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_err()
-        {
-            return true;
-        }
-
-        let name_wide: Vec<u16> = "DontAskRegister\0".encode_utf16().collect();
-        let mut value: u32 = 0;
-        let mut size: u32 = 4;
-        let mut data_type = REG_VALUE_TYPE::default();
-
-        let result = RegQueryValueExW(
-            hkey,
-            PCWSTR(name_wide.as_ptr()),
-            None,
-            Some(&mut data_type),
-            Some(&mut value as *mut u32 as *mut u8),
-            Some(&mut size),
-        );
-        let _ = RegCloseKey(hkey);
-
-        !(result.is_ok() && value == 1)
-    }
+/// Whether to ask about registering MDView as .md viewer (#37): only while it
+/// is not registered, the user didn't choose "Don't ask again", and didn't
+/// choose "Not now" in this session.
+fn should_ask_to_register(registered: bool, dont_ask: bool, dismissed: bool) -> bool {
+    !registered && !dont_ask && !dismissed
 }
 
-/// Set the "don't ask again" flag for file association registration
-fn set_dont_ask_register() {
-    unsafe {
-        let mut hkey = std::mem::zeroed();
-        let subkey: Vec<u16> = format!("{}\0", REGISTRY_KEY).encode_utf16().collect();
-        let mut disposition = REG_CREATE_KEY_DISPOSITION::default();
-
-        if RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey.as_ptr()),
-            Some(0),
-            None,
-            windows::Win32::System::Registry::REG_OPTION_NON_VOLATILE,
-            KEY_WRITE,
-            None,
-            &mut hkey,
-            Some(&mut disposition),
-        )
-        .is_ok()
-        {
-            let name_wide: Vec<u16> = "DontAskRegister\0".encode_utf16().collect();
-            let value: u32 = 1;
-            let _ = RegSetValueExW(
-                hkey,
-                PCWSTR(name_wide.as_ptr()),
-                Some(0),
-                REG_DWORD,
-                Some(std::slice::from_raw_parts(
-                    &value as *const u32 as *const u8,
-                    4,
-                )),
-            );
-            let _ = RegCloseKey(hkey);
-        }
-    }
+fn ask_to_register() -> bool {
+    should_ask_to_register(
+        is_file_association_registered(),
+        settings::read_dword(DONT_ASK_REGISTER) == Some(1),
+        REGISTER_BAR_DISMISSED.with(|d| d.get()),
+    )
 }
 
+/// The user's answer in the registration bar.
+fn handle_register_choice(hwnd: HWND, choice: &str) {
+    match choice {
+        "register" => register_and_open_settings(Some(hwnd)),
+        "notNow" => REGISTER_BAR_DISMISSED.with(|d| d.set(true)),
+        "never" => {
+            if let Err(e) = settings::write_dword(DONT_ASK_REGISTER, 1) {
+                show_message(
+                    Some(hwnd),
+                    &format!("Could not save \"Don't ask again\":\n\n{e}"),
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
+        _ => {}
+    }
+}
 /// The Settings page for choosing MDView for .md files. Windows 11 opens
 /// MDView's own default-apps page; versions without that deep link open the
 /// general Default apps page.
@@ -2091,32 +2054,6 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         // take focus; hand it to the document now that the window is shown.
         focus_webview();
 
-        // Check file association and prompt if not registered
-        if !is_file_association_registered() && should_prompt_registration() {
-            let prompt_title: Vec<u16> = concat!(app_name!(), " - File Association\0").encode_utf16().collect();
-            let prompt_message: Vec<u16> = concat!(
-                "Would you like to register ", app_name!(), " as a viewer for .md files?\n\n",
-                "This will add ", app_name!(), " to the 'Open With' list.\n",
-                "You can then set it as default in Windows Settings.\n\n",
-                "Choose 'Cancel' to never ask again.\0"
-            )
-            .encode_utf16()
-            .collect();
-
-            let answer = MessageBoxW(
-                Some(hwnd),
-                PCWSTR(prompt_message.as_ptr()),
-                PCWSTR(prompt_title.as_ptr()),
-                MB_YESNOCANCEL | MB_ICONQUESTION,
-            );
-
-            if answer == IDYES {
-                register_and_open_settings(Some(hwnd));
-            } else if answer == IDCANCEL {
-                set_dont_ask_register();
-            }
-        }
-
         // Message loop with accelerator support
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -2153,6 +2090,8 @@ thread_local! {
     static PAGE_ALLOWS_REMOTE_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The bars MDView put on the page being shown; only answers to these are accepted.
     static PAGE_BARS: RefCell<Vec<markdown::Bar>> = const { RefCell::new(Vec::new()) };
+    /// "Not now" in the registration bar: don't ask again in this session.
+    static REGISTER_BAR_DISMISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Posted to the main window to handle queued links (see `queue_link`).
@@ -2709,6 +2648,23 @@ mod tests {
     fn test_settings_link_uses_the_registered_name() {
         assert_eq!(default_apps_settings_uri(), "ms-settings:defaultapps?registeredAppUser=MDView");
         assert!(default_apps_settings_uri().ends_with(&format!("={REGISTERED_APP_NAME}")));
+    }
+
+    // #37: ask only while not registered, not opted out, not dismissed now.
+    #[test]
+    fn test_registration_is_asked_only_when_it_should() {
+        assert!(should_ask_to_register(false, false, false));
+        for (registered, dont_ask, dismissed) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            assert!(
+                !should_ask_to_register(registered, dont_ask, dismissed),
+                "registered={registered} dont_ask={dont_ask} dismissed={dismissed}"
+            );
+        }
     }
 
     // The product name is defined once; everything else is derived from it.

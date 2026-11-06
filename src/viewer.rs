@@ -295,7 +295,8 @@ fn create_virtual_resource_response(
                 remote_images == crate::markdown::RemoteImages::Allowed,
             )
         });
-        let bars = crate::markdown::document_bars(remote_images);
+        // The plugin never asks to register (#37): TC is the host.
+        let bars = crate::markdown::document_bars(remote_images, false);
         let full_html = crate::markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
         PAGE_BARS.with(|b| b.borrow_mut().insert(hwnd.0 as isize, bars));
         create_web_resource_response(

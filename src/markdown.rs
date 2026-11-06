@@ -118,7 +118,6 @@ pub struct BarButton {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarShow {
     /// As soon as the page is shown.
-    #[allow(dead_code)] // for the registration (#37) and Mark of the Web (#24) bars
     Now,
     /// Only once a remote image was actually blocked.
     WhenRemoteImageBlocked,
@@ -126,9 +125,30 @@ pub enum BarShow {
 
 pub const REMOTE_IMAGES_BAR: &str = "remote-images";
 
-/// The bars MDView puts on a document page.
-pub fn document_bars(remote_images: RemoteImages) -> Vec<Bar> {
+/// Standalone viewer only: asks to register MDView as .md viewer (#37).
+pub const REGISTER_BAR: &str = "register";
+
+/// The bars MDView puts on a page. `ask_to_register` is only ever true in the
+/// standalone viewer; its bar comes first, so it is on top.
+pub fn document_bars(remote_images: RemoteImages, ask_to_register: bool) -> Vec<Bar> {
     let mut bars = Vec::new();
+    if ask_to_register {
+        bars.push(Bar {
+            id: REGISTER_BAR,
+            text: concat!(
+                "Do you want to make ",
+                crate::settings::app_name!(),
+                " the default viewer for Markdown (.md) files?"
+            )
+            .to_string(),
+            buttons: vec![
+                BarButton { choice: "register", label: "Register", closes_bar: true },
+                BarButton { choice: "notNow", label: "Not now", closes_bar: true },
+                BarButton { choice: "never", label: "Don't ask again", closes_bar: true },
+            ],
+            show: BarShow::Now,
+        });
+    }
     if remote_images == RemoteImages::AskToLoad {
         bars.push(Bar {
             id: REMOTE_IMAGES_BAR,
@@ -512,7 +532,7 @@ mod tests {
     #[test]
     fn test_page_csp_only_lets_mdview_scripts_run() {
         let body = markdown_to_html("# T\n\n<script>evil()</script>\n\n<img src=x onerror=\"evil()\">");
-        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad));
+        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad, false));
         let nonce = nonce_of(&page);
         assert_eq!(nonce.len(), 32);
         let meta_at = page.find("<meta http-equiv=\"Content-Security-Policy\"").expect("CSP meta");
@@ -557,7 +577,7 @@ mod tests {
     fn test_remote_images_load_only_when_allowed() {
         let allowed = wrap_html("", false, RemoteImages::Allowed, &[]);
         assert!(allowed.contains("img-src https://mdview.example data: https: http:;"));
-        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad));
+        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(RemoteImages::AskToLoad, false));
         assert!(ask.contains("img-src https://mdview.example data:;"));
         let blocked = wrap_html("", false, RemoteImages::Blocked, &[]);
         assert!(blocked.contains("img-src https://mdview.example data:;"));
@@ -621,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_document_bars_follow_remote_images() {
-        let bars = document_bars(RemoteImages::AskToLoad);
+        let bars = document_bars(RemoteImages::AskToLoad, false);
         assert_eq!(bars.len(), 1);
         let remote = &bars[0];
         assert_eq!(remote.id, REMOTE_IMAGES_BAR);
@@ -632,14 +652,37 @@ mod tests {
             buttons,
             [("once", "Load images", false), ("always", "Always load", false), ("never", "Never", true)]
         );
-        assert!(document_bars(RemoteImages::Allowed).is_empty());
-        assert!(document_bars(RemoteImages::Blocked).is_empty());
+        assert!(document_bars(RemoteImages::Allowed, false).is_empty());
+        assert!(document_bars(RemoteImages::Blocked, false).is_empty());
+    }
+
+    // #37: the registration question is a bar on top, not a dialog.
+    #[test]
+    fn test_registration_bar_comes_first_and_only_when_asked() {
+        let bars = document_bars(RemoteImages::AskToLoad, true);
+        let ids: Vec<_> = bars.iter().map(|b| b.id).collect();
+        assert_eq!(ids, [REGISTER_BAR, REMOTE_IMAGES_BAR], "registration bar on top");
+        let register = &bars[0];
+        assert_eq!(register.show, BarShow::Now);
+        assert_eq!(
+            register.text,
+            "Do you want to make MDView the default viewer for Markdown (.md) files?"
+        );
+        let buttons: Vec<_> = register.buttons.iter().map(|b| (b.choice, b.label, b.closes_bar)).collect();
+        assert_eq!(
+            buttons,
+            [("register", "Register", true), ("notNow", "Not now", true), ("never", "Don't ask again", true)]
+        );
+        assert!(bar_choice_offered(&bars, REGISTER_BAR, "notNow"));
+        let without = document_bars(RemoteImages::AskToLoad, false);
+        assert!(without.iter().all(|b| b.id != REGISTER_BAR));
+        assert!(!bar_choice_offered(&without, REGISTER_BAR, "never"), "not offered, not accepted");
     }
 
     // The host only acts on an answer to a bar it put on the current page.
     #[test]
     fn test_only_offered_bar_choices_are_accepted() {
-        let bars = document_bars(RemoteImages::AskToLoad);
+        let bars = document_bars(RemoteImages::AskToLoad, false);
         assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "once"));
         assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "never"));
         assert!(!bar_choice_offered(&bars, REMOTE_IMAGES_BAR, "delete"), "unknown choice");
