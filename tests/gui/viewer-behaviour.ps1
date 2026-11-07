@@ -1727,7 +1727,7 @@ function Press-DialogButton($d, $name) {
     # mouse onto MDView and releases it; DoDragDrop says whether MDView
     # accepted the drop (Copy) or refused it (None).
     # PowerShell 7 references only the listed assemblies: Thread lives in its own one.
-    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Windows.Forms.Primitives, System.Threading.Thread, System.ComponentModel.Primitives -TypeDefinition @'
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Windows.Forms.Primitives, System.Threading.Thread, System.ComponentModel.Primitives, System.Collections, System.Threading -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -1738,13 +1738,17 @@ public static class DragTest {
     [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
     // Returns DoDragDrop's effect (Copy / None), or "timeout (...)" with how far
-    // the drag got. A drag that doesn't end is cancelled (button up, Esc), so
+    // the drag got. A drag that doesn't end is cancelled by the source, so
     // the mouse is free for the next test and the thread never keeps the
     // test process alive.
+    // The effects the target answered during the last drag, in order.
+    public static string LastEffects = "";
     public static string Drag(string[] files, int fromX, int fromY, int toX, int toY) {
         string result = null;
         string stage = "thread started";
         bool buttonDown = false;
+        bool cancel = false;
+        var effects = new System.Collections.Generic.List<string>();
         Form form = null;
         var t = new Thread(() => {
             form = new Form { StartPosition = FormStartPosition.Manual, Left = fromX - 40, Top = fromY - 40, Width = 80, Height = 80, TopMost = true, ShowInTaskbar = false, Text = "drag source" };
@@ -1763,6 +1767,9 @@ public static class DragTest {
                 mover.IsBackground = true;
                 mover.Start();
                 stage = "dragging";
+                // What the window under the cursor answered (MDView's drop target, or none).
+                form.GiveFeedback += (s2, e2) => { var x = e2.Effect.ToString(); lock (effects) { if (effects.Count == 0 || effects[effects.Count - 1] != x) effects.Add(x); } };
+                form.QueryContinueDrag += (s2, e2) => { if (cancel) e2.Action = DragAction.Cancel; };
                 var effect = form.DoDragDrop(new DataObject(DataFormats.FileDrop, files), DragDropEffects.Copy);
                 result = effect.ToString();
                 form.Close();
@@ -1772,11 +1779,14 @@ public static class DragTest {
         t.IsBackground = true;
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
-        if (t.Join(20000)) return result ?? "no result";
+        bool ended = t.Join(20000);
+        lock (effects) { LastEffects = string.Join(">", effects); }
+        if (ended) return result ?? "no result";
         string seen = "timeout (stage: " + stage + ", button down after press: " + buttonDown + ")";
+        // No Esc: it would reach MDView and close it. The source cancels the drag.
+        cancel = true;
+        mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero);
         mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
-        keybd_event(0x1B, 0, 0, UIntPtr.Zero);
-        keybd_event(0x1B, 0, 2, UIntPtr.Zero);
         if (!t.Join(5000)) {
             try { if (form != null) form.BeginInvoke(new Action(() => form.Close())); } catch { }
             t.Join(3000);
@@ -1794,14 +1804,14 @@ public static class DragTest {
     $toX = [int]($wr.X + $wr.Width / 2); $toY = [int]($wr.Y + $wr.Height / 2)
     $fromX = [int]([Math]::Max(60, $wr.X - 60)); $fromY = $toY
     if ($fromX + 60 -gt $wr.X) { $fromX = [int]($wr.X + 20); $fromY = [int]($wr.Y + 5) }
-    $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY)
+    $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY); $txtFx = [DragTest]::LastEffects
     $two = [DragTest]::Drag(@((Join-Path $work 'dropped.md'), (Join-Path $work 'second.md')), $fromX, $fromY, $toX, $toY)
     $stillSecond = [bool](Find-Element $v $CT::Text '^Second$')
-    $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY)
+    $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY); $mdFx = [DragTest]::LastEffects
     $opened = Wait-Element $v $CT::Text '^Dropped document$' 10
     Stop-Viewer $v
-    Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt two files=$two document unchanged=$stillSecond"
-    Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md opened=$([bool]$opened)"
+    Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt (effects $txtFx) two files=$two document unchanged=$stillSecond"
+    Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md (effects $mdFx) opened=$([bool]$opened)"
 
     # ---- File > Recent Files shows the path (#44), shortened in the middle,
     # with & shown, and the full path as a tooltip on the highlighted item.

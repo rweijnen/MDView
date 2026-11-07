@@ -63,9 +63,11 @@ $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0
 $tcp.Start()
 $port = $tcp.LocalEndpoint.Port
 $hits = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+# Each request with the headers that say what sent it (prefetch, navigation, ...).
+$hitDetails = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $pages = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
-$serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token -ScriptBlock {
-    param($tcp, $hits, $pages, $token)
+$serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token, $hitDetails -ScriptBlock {
+    param($tcp, $hits, $pages, $token, $hitDetails)
     $png = [Convert]::FromBase64String('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')
     while ($true) {
         try { $client = $tcp.AcceptTcpClient() } catch { break }
@@ -73,11 +75,15 @@ $serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token -ScriptBl
             $stream = $client.GetStream()
             $reader = [System.IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 4096, $true)
             $requestLine = $reader.ReadLine()
-            while (($line = $reader.ReadLine()) -ne $null -and $line -ne '') { }
+            $seen = @()
+            while (($line = $reader.ReadLine()) -ne $null -and $line -ne '') {
+                if ($line -match '^(User-Agent|Sec-Purpose|Purpose|Sec-Fetch-Dest|Sec-Fetch-Mode|Sec-Fetch-User|Referer):') { $seen += $line }
+            }
             if (-not $requestLine) { continue }
             $parts = $requestLine.Split(' ')
             $method = $parts[0]; $path = $parts[1]
             $hits.Enqueue("$method $path")
+            $hitDetails.Enqueue("$((Get-Date).ToString('HH:mm:ss.fff')) $method $path | $($seen -join ' | ')")
             $headers = "Access-Control-Allow-Origin: *`r`nAccess-Control-Allow-Private-Network: true`r`nAccess-Control-Allow-Methods: *`r`nAccess-Control-Allow-Headers: *`r`n"
             $body = [byte[]]@(); $status = '204 No Content'; $type = 'text/plain'
             if ($method -eq 'OPTIONS') {
@@ -354,6 +360,10 @@ function Invoke-Case($case, $hostKind) {
     $result = if ($worked) { 'FAIL (attack worked)' } elseif ($notRun) { "ERROR (did not run: $notRun)" } else { 'PASS (blocked)' }
     # The plugin's debug log (debug builds always write it) shows what it saw.
     $pluginLog = Join-Path $wv2Temp 'mdview_debug.log'
+    if ($worked) {
+        Write-Host "  requests for this case:"
+        @($hitDetails.ToArray() | Where-Object { $_ -match "/page-$id|c=$id" }) | ForEach-Object { Write-Host "    $_" }
+    }
     if ($worked -and $hostKind -eq 'plugin' -and (Test-Path $pluginLog)) {
         Write-Host "  plugin log (navigation):"
         Get-Content $pluginLog | Select-String 'navigat|history|Navigate' | Select-Object -Last 30 | ForEach-Object { Write-Host "    $($_.Line)" }
