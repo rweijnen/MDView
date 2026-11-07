@@ -1735,31 +1735,53 @@ using System.Windows.Forms;
 public static class DragTest {
     [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    // Returns DoDragDrop's effect (Copy / None), or "timeout (...)" with how far
+    // the drag got. A drag that doesn't end is cancelled (button up, Esc), so
+    // the mouse is free for the next test and the thread never keeps the
+    // test process alive.
     public static string Drag(string[] files, int fromX, int fromY, int toX, int toY) {
-        string result = "timeout";
+        string result = null;
+        string stage = "thread started";
+        bool buttonDown = false;
+        Form form = null;
         var t = new Thread(() => {
-            var form = new Form { StartPosition = FormStartPosition.Manual, Left = fromX - 40, Top = fromY - 40, Width = 80, Height = 80, TopMost = true, ShowInTaskbar = false, Text = "drag source" };
+            form = new Form { StartPosition = FormStartPosition.Manual, Left = fromX - 40, Top = fromY - 40, Width = 80, Height = 80, TopMost = true, ShowInTaskbar = false, Text = "drag source" };
             form.Shown += (s, e) => {
+                stage = "form shown";
                 SetCursorPos(fromX, fromY);
                 mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
+                buttonDown = (GetAsyncKeyState(0x01) & 0x8000) != 0;
                 var mover = new Thread(() => {
                     Thread.Sleep(400);
                     for (int i = 1; i <= 25; i++) { SetCursorPos(fromX + (toX - fromX) * i / 25, fromY + (toY - fromY) * i / 25); mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); }
                     Thread.Sleep(600);
+                    stage = "button released";
                     mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
                 });
                 mover.IsBackground = true;
                 mover.Start();
+                stage = "dragging";
                 var effect = form.DoDragDrop(new DataObject(DataFormats.FileDrop, files), DragDropEffects.Copy);
                 result = effect.ToString();
                 form.Close();
             };
             Application.Run(form);
         });
+        t.IsBackground = true;
         t.SetApartmentState(ApartmentState.STA);
         t.Start();
-        t.Join(20000);
-        return result;
+        if (t.Join(20000)) return result ?? "no result";
+        string seen = "timeout (stage: " + stage + ", button down after press: " + buttonDown + ")";
+        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+        keybd_event(0x1B, 0, 0, UIntPtr.Zero);
+        keybd_event(0x1B, 0, 2, UIntPtr.Zero);
+        if (!t.Join(5000)) {
+            try { if (form != null) form.BeginInvoke(new Action(() => form.Close())); } catch { }
+            t.Join(3000);
+        }
+        return seen;
     }
 }
 '@
