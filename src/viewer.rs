@@ -485,6 +485,7 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             // clicked is handled by the link policy instead.
                             let nav_handler = webview2_com::NavigationStartingEventHandler::create(
                                 Box::new(move |_webview, args| {
+                                    crate::linkstatus::hide(hwnd);
                                     if let Some(args) = args {
                                         let mut uri_ptr: windows::core::PWSTR =
                                             windows::core::PWSTR::null();
@@ -852,6 +853,7 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_SIZE => {
+            crate::linkstatus::hide(hwnd);
             resize_webview(hwnd);
             LRESULT(0)
         }
@@ -863,7 +865,11 @@ unsafe extern "system" fn window_proc(
             post_network_blocked(hwnd);
             LRESULT(0)
         }
-        WM_DESTROY => LRESULT(0),
+        WM_DESTROY => {
+            // The tooltip's owner is TC's Lister window, so it would outlive this viewer.
+            crate::linkstatus::destroy(hwnd);
+            LRESULT(0)
+        }
         WM_NCDESTROY => {
             cleanup_viewer_state(hwnd);
             unregister_window_class_if_unused();
@@ -1096,6 +1102,17 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
             }
         }
         Some("networkStatus") => post_network_blocked(hwnd),
+        Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
+            None => crate::linkstatus::hide(hwnd),
+            Some(url) => {
+                let action = crate::links::classify_url(url, |u| {
+                    resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from)
+                }, |p| network_location(hwnd, p));
+                let href = msg.get("href").map(String::as_str).unwrap_or_default();
+                let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+                crate::linkstatus::show(hwnd, &crate::linkstatus::describe_url(url, href, &action), dark);
+            }
+        },
         Some("zoom") => {
             if let Some(direction) = msg.get("direction") {
                 handle_zoom(hwnd, direction);

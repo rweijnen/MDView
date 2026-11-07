@@ -3,6 +3,7 @@
 mod dark_menu;
 mod files;
 mod links;
+mod linkstatus;
 mod markdown;
 mod settings;
 mod terminal;
@@ -1440,6 +1441,16 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
             }
         }
         Some("networkStatus") => post_network_blocked(),
+        Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
+            None => linkstatus::hide(hwnd),
+            Some(url) => {
+                let action = links::classify_url(url, |u| {
+                    resolve_virtual_mdview_url(u).map(std::path::PathBuf::from)
+                }, network_location);
+                let href = msg.get("href").map(String::as_str).unwrap_or_default();
+                linkstatus::show(hwnd, &linkstatus::describe_url(url, href, &action), is_windows_dark_mode());
+            }
+        },
         Some("zoom") => {
             if let Some(direction) = msg.get("direction") {
                 handle_zoom(hwnd, direction);
@@ -2379,6 +2390,9 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             // clicked is handled by the link policy instead.
                             let nav_handler = webview2_com::NavigationStartingEventHandler::create(
                                 Box::new(move |_webview, args| {
+                                    if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+                                        linkstatus::hide(hwnd);
+                                    }
                                     if let Some(args) = args {
                                         let mut uri_ptr: windows::core::PWSTR =
                                             windows::core::PWSTR::null();
@@ -2599,6 +2613,11 @@ unsafe extern "system" fn window_proc(
             let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
             dark_menu::paint_menu_separator(hwnd);
 
+            // A link's tooltip belongs to where the mouse was (#60).
+            if msg == WM_SIZE || (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                linkstatus::hide(hwnd);
+            }
+
             // Also resize WebView on WM_SIZE
             if msg == WM_SIZE {
                 CONTROLLER.with(|c| {
@@ -2703,6 +2722,7 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             // Save window position before closing
             save_window_position(hwnd);
+            linkstatus::destroy(hwnd);
 
             CONTROLLER.with(|c| {
                 if let Some(controller) = c.borrow_mut().take() {

@@ -2,6 +2,7 @@
 
 mod files;
 mod links;
+mod linkstatus;
 mod markdown;
 mod settings;
 mod viewer;
