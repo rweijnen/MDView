@@ -288,7 +288,7 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l); [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
 [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -1563,8 +1563,11 @@ function Press-DialogButton($d, $name) {
             for ($try = 0; $try -lt 2; $try++) {
                 Send-Key 0x4E; Start-Sleep -Milliseconds 300
                 Send-Key 0x50; Start-Sleep -Milliseconds 300
-                Send-Key 0x33; Start-Sleep -Milliseconds 600
-                $keysSeen = Get-HostKeys
+                Send-Key 0x33
+                # Until all three arrived (or 3 s), so a late key isn't counted
+                # in the check with the panel open (seen on the GitHub runner).
+                $deadline = (Get-Date).AddSeconds(3)
+                do { Start-Sleep -Milliseconds 300; $keysSeen = @(Get-HostKeys) } while ($keysSeen.Count -lt 3 -and (Get-Date) -lt $deadline)
                 if ($keysSeen.Count) { break }
                 $keysRetried = $true
             }
@@ -1741,7 +1744,9 @@ function Press-DialogButton($d, $name) {
     $menuTexts = @(); $tips = @()
     for ($try = 0; $try -lt 2 -and -not $menuTexts.Count; $try++) {
         [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
-        [Win32.Behaviour]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); Send-Key 0x46; [Win32.Behaviour]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # Alt+F
+        # The File menu, as Alt+F opens it (WM_SYSCOMMAND SC_KEYMENU 'f'), without
+        # depending on which window has the keyboard focus.
+        [void][Win32.Behaviour]::PostMessage([IntPtr]$v.Win.Current.NativeWindowHandle, 0x0112, [IntPtr]0xF100, [IntPtr][int][char]'f')
         $deadline = (Get-Date).AddSeconds(3)
         do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
         if ($m -ne [IntPtr]::Zero) { $menuTexts = @(Get-MenuTexts $m) }
