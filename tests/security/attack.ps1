@@ -256,6 +256,8 @@ function Invoke-Case($case, $hostKind) {
     Remove-Item (Join-Path $attack "marker-$id.txt") -ErrorAction SilentlyContinue
     $calcBefore = Get-CalcIds
     $hitsBefore = $hits.Count
+    # A browser the viewer started (a document must never open one by itself).
+    $browserBefore = @(Get-Process msedge, chrome, firefox -ErrorAction SilentlyContinue | ForEach-Object Id)
     $dlBefore = @(Get-ChildItem $downloads -Filter "*$token*" -ErrorAction SilentlyContinue)
     Set-TestRegistry
     # Network files allowed in both programs' settings (registry; the plugin's
@@ -321,6 +323,17 @@ function Invoke-Case($case, $hostKind) {
     $pipeResult = $null
     if ($pipe) { $pipe.Cancel.Cancel(); $pipeResult = Receive-Job $pipe.Job -Wait; Remove-Job $pipe.Job -Force }
 
+    # A browser starts slowly: for cases that try to leave the document, wait
+    # for one (or its request) before the next case, so whatever this case
+    # caused is counted here, not in the next case.
+    $newBrowsers = { @(Get-Process msedge, chrome, firefox -ErrorAction SilentlyContinue | Where-Object { $browserBefore -notcontains $_.Id }) }
+    if ($navigatesAway) {
+        $deadline = (Get-Date).AddSeconds(12)
+        while ((Get-Date) -lt $deadline -and -not (& $newBrowsers).Count) { Start-Sleep -Milliseconds 500 }
+        if ((& $newBrowsers).Count) { Start-Sleep -Seconds 5 }
+    }
+    $browsers = & $newBrowsers
+    foreach ($b in $browsers) { Stop-Process -Id $b.Id -Force -ErrorAction SilentlyContinue }
     $newHits = @($hits.ToArray() | Select-Object -Skip $hitsBefore)
     $newCalc = @(Get-CalcIds | Where-Object { $calcBefore -notcontains $_ })
     foreach ($pidCalc in $newCalc) { Stop-Process -Id $pidCalc -Force -ErrorAction SilentlyContinue }
@@ -345,6 +358,7 @@ function Invoke-Case($case, $hostKind) {
         'download' { if ($dlNew.Count) { $observed += "file saved to Downloads ($($dlNew.Name -join ', '), deleted)"; $worked = $true } elseif (@($newHits | Where-Object { $_ -match '/download' }).Count) { $observed += 'download requested, not saved' } }
     }
     if ($id -in 'S5', 'B6') { if (@($newHits | Where-Object { $_ -match "/page-$id" }).Count) { $observed += "navigated to server page /page-$id"; $worked = $true } }
+    if ($browsers.Count) { $observed += "a browser was started ($((@($browsers | ForEach-Object ProcessName) | Sort-Object -Unique) -join ', '), closed)"; $worked = $true }
     if ($id -eq 'U1' -and $dlNew.Count) { $observed += 'canary saved to Downloads (deleted)'; $worked = $true }
     if ($pipeResult -eq 'CONNECTED') { $observed += "MDView connected to the named pipe $(Get-PipeName $id)"; $worked = $true }
     if ($dialogs.Count) { $observed += "dialog: $($dialogs -join ' | ')" }
