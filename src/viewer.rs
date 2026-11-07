@@ -533,12 +533,13 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                 uri_ptr.0 as *const _,
                                             ));
                                             log_debug(&format!("navigation starting: {uri} ({:?}, user={})", navigation_kind(&args), user_initiated.as_bool()));
+                                            // Never opened elsewhere from here: WebView2 can call a
+                                            // navigation the document started itself (<meta refresh>,
+                                            // S5) user-initiated. Clicked links reach the link policy
+                                            // through the page script (`openLink`).
                                             if !navigation_allowed(hwnd, &uri) {
                                                 let _ = args.SetCancel(true);
                                                 log_debug(&format!("blocked navigation to {uri}"));
-                                                if user_initiated.as_bool() {
-                                                    queue_link(hwnd, uri, false);
-                                                }
                                             } else if crate::vpath::is_document_origin(&uri) {
                                                 document_navigation(hwnd, navigation_kind(&args), &uri);
                                             }
@@ -588,26 +589,15 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let mut history_token: i64 = 0;
                             let _ = webview.add_HistoryChanged(&history_handler, &mut history_token);
 
-                            // No new windows: a link the user opened in a new
-                            // window goes through the link policy.
+                            // No new windows, and nothing opened from here (see S5 at
+                            // NavigationStarting): a link opened with Shift+click or the
+                            // middle button reaches the link policy through the page script.
                             let new_window_handler =
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
                                             let _ = args.SetHandled(true);
-                                            let mut user_initiated = windows::core::BOOL(0);
-                                            let _ = args.IsUserInitiated(&mut user_initiated);
-                                            let mut uri_ptr = windows::core::PWSTR::null();
-                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
-                                                let uri = uri_ptr.to_string().unwrap_or_default();
-                                                windows::Win32::System::Com::CoTaskMemFree(Some(
-                                                    uri_ptr.0 as *const _,
-                                                ));
-                                                log_debug(&format!("blocked new window for {uri}"));
-                                                if user_initiated.as_bool() {
-                                                    queue_link(hwnd, uri, false);
-                                                }
-                                            }
+                                            log_debug("blocked a new window");
                                         }
                                         Ok(())
                                     },
@@ -1449,9 +1439,11 @@ fn handle_queued_links(hwnd: HWND) {
 fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) {
     match msg.get("type").map(String::as_str) {
         Some("close") => close_lister(hwnd),
+        // A link the user clicked that isn't a Markdown document (S5): the
+        // link policy decides; `ctrl` for Ctrl+click.
         Some("openLink") => {
             if let Some(url) = msg.get("url") {
-                queue_link(hwnd, url.clone(), true);
+                queue_link(hwnd, url.clone(), msg.get("ctrl").map(String::as_str) == Some("true"));
             }
         }
         Some("networkStatus") => post_network_blocked(hwnd),

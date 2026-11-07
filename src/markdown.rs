@@ -1444,10 +1444,30 @@ a {{ cursor: pointer; }}
             return;
         }}
 
-        if (webview && e.ctrlKey) {{
+        // Only links to Markdown documents are navigations in the viewer (Back
+        // works for them). Every other link goes to MDView's link policy, as a
+        // click: MDView never opens a navigation the document started itself,
+        // such as <meta refresh> (attack case S5).
+        var target = link.href || href;
+        var parsed = null;
+        try {{ parsed = new URL(target); }} catch (err) {{ }}
+        var markdownDocument = parsed && parsed.origin === location.origin && /\.(md|markdown)$/i.test(parsed.pathname);
+        if (webview && (e.ctrlKey || e.shiftKey || !markdownDocument)) {{
             e.preventDefault();
-            webview.postMessage({{type: 'openLink', url: link.href || href}});
+            webview.postMessage({{type: 'openLink', url: target, ctrl: e.ctrlKey ? 'true' : 'false'}});
         }}
+    }});
+
+    // The middle button would ask for a new window, which MDView refuses: the
+    // link goes to the link policy instead, as a click.
+    document.addEventListener('auxclick', function(e) {{
+        var link = e.target.closest('a');
+        var webview = window.chrome && window.chrome.webview;
+        if (!link || e.button !== 1 || !webview) return;
+        var href = link.getAttribute('href');
+        if (!href || href.charAt(0) === '#') return;
+        e.preventDefault();
+        webview.postMessage({{type: 'openLink', url: link.href || href, ctrl: 'false'}});
     }});
 
     document.addEventListener('keydown', function(e) {{
