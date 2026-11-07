@@ -518,6 +518,7 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             windows::Win32::System::Com::CoTaskMemFree(Some(
                                                 uri_ptr.0 as *const _,
                                             ));
+                                            log_debug(&format!("navigation starting: {uri} ({:?}, user={})", navigation_kind(&args), user_initiated.as_bool()));
                                             if !navigation_allowed(hwnd, &uri) {
                                                 let _ = args.SetCancel(true);
                                                 log_debug(&format!("blocked navigation to {uri}"));

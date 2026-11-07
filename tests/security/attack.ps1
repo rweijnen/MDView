@@ -352,6 +352,12 @@ function Invoke-Case($case, $hostKind) {
     if (-not $observed.Count) { $observed += 'nothing happened' }
 
     $result = if ($worked) { 'FAIL (attack worked)' } elseif ($notRun) { "ERROR (did not run: $notRun)" } else { 'PASS (blocked)' }
+    # The plugin's debug log (debug builds always write it) shows what it saw.
+    $pluginLog = Join-Path $wv2Temp 'mdview_debug.log'
+    if ($worked -and $hostKind -eq 'plugin' -and (Test-Path $pluginLog)) {
+        Write-Host "  plugin log (navigation):"
+        Get-Content $pluginLog | Select-String 'navigat|history|Navigate' | Select-Object -Last 30 | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     [pscustomobject]@{ Case = $id; Host = $hostKind; Attack = $case.Title; Safe = $case.Safe; Result = $result; Observed = ($observed -join '; ') }
 }
 

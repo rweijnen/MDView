@@ -1474,9 +1474,10 @@ function Press-DialogButton($d, $name) {
         $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
         $texts = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) } else { @() }
         $findText = if ($hostKind -eq 'exe') { '&Find... | Ctrl+F' } else { '&Find... | F7' }
-        $expected = '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
+        $expected = '&Back | Alt+Left (greyed)', 'Forwar&d | Alt+Right (greyed)', '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
         $missing = @($expected | Where-Object { $texts -notcontains $_ })
-        $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Back|Refresh|Save as' })
+        # WebView2's own menu has these; MDView's Back has a key after it.
+        $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Refresh|Save as|^Back$' })
         Check "${hostKind}: right-click shows MDView's menu with the keys, not WebView2's" ($menu -ne [IntPtr]::Zero -and -not $missing -and -not $webview2Items) "menu=$($menu -ne [IntPtr]::Zero) missing=$($missing -join ',') webview2=$($webview2Items -join ',') items=$($texts -join ' / ')"
         if ($menu -ne [IntPtr]::Zero) { Send-Key 0x41 }   # A: Select all
         Start-Sleep -Milliseconds 600
@@ -1703,7 +1704,8 @@ function Press-DialogButton($d, $name) {
     # starts a real OLE drag with the files while a second thread moves the
     # mouse onto MDView and releases it; DoDragDrop says whether MDView
     # accepted the drop (Copy) or refused it (None).
-    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+    # PowerShell 7 references only the listed assemblies: Thread lives in its own one.
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Windows.Forms.Primitives, System.Threading.Thread, System.ComponentModel.Primitives -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
