@@ -13,6 +13,7 @@ mod settings_page;
 mod shortcuts;
 mod viewer;
 mod vpath;
+mod watch;
 mod zone;
 
 use std::ffi::{CStr, c_char, c_int};

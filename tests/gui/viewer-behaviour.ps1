@@ -1601,6 +1601,31 @@ function Press-DialogButton($d, $name) {
     }
 
 
+    # ---- Reload when the file changes (#17), keeping the scroll position.
+    $autoFile = Join-Path $work 'auto.md'
+    $filler = ('filler line' + "`n`n") * 60
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-Content $autoFile -NoNewline -Value ("# Before`n`n" + $filler + "## Bottom heading`n`nend")
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind $autoFile
+        [void](Wait-Element $v $CT::Text '^Before$')
+        Start-Sleep -Milliseconds 800
+        $bottomShown = $false
+        for ($try = 0; $try -lt 2 -and -not $bottomShown; $try++) {
+            [void](Focus-Document $v); Send-CtrlKey 0x23
+            $deadline = (Get-Date).AddSeconds(2)
+            do { $b = Find-Element $v $CT::Text '^Bottom heading$'; $bottomShown = $b -and -not $b.Current.IsOffscreen; Start-Sleep -Milliseconds 200 } while (-not $bottomShown -and (Get-Date) -lt $deadline)
+        }
+        $yBefore = if ($b) { $b.Current.BoundingRectangle.Y } else { $null }
+        Set-Content $autoFile -NoNewline -Value ("# After`n`n" + $filler + "## Bottom heading`n`nend")
+        $after = Wait-Element $v $CT::Text '^After$' 8
+        Start-Sleep -Milliseconds 800
+        $b2 = Find-Element $v $CT::Text '^Bottom heading$'
+        $yAfter = if ($b2) { $b2.Current.BoundingRectangle.Y } else { $null }
+        Stop-Viewer $v
+        Check "${hostKind}: a changed file is reloaded, keeping the scroll position" ([bool]$after -and $bottomShown -and $null -ne $yAfter -and [Math]::Abs($yAfter - $yBefore) -le 4) "reloaded=$([bool]$after) at bottom=$bottomShown Y before=$yBefore after=$yAfter"
+    }
+
     # ---- Drag and drop on the standalone viewer (#54). A small window here
     # starts a real OLE drag with the files while a second thread moves the
     # mouse onto MDView and releases it; DoDragDrop says whether MDView

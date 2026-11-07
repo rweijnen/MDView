@@ -15,6 +15,7 @@ mod settings_page;
 mod shortcuts;
 mod terminal;
 mod vpath;
+mod watch;
 mod zone;
 
 use std::cell::RefCell;
@@ -1232,6 +1233,8 @@ fn create_virtual_resource_response(
         } else {
             match files::read_text(file_path) {
                 Ok(markdown_content) => {
+                    // This version is the one shown: watch it for changes (#17).
+                    WATCH.with(|w| *w.borrow_mut() = Some(watch::Watch::new(file_path, watch::stamp(file_path))));
                     let remote_images = remote_images_for(file_path);
                     let bars = DOCUMENT_CHOICES.with(|c| {
                         let mut choices = c.borrow_mut();
@@ -1516,6 +1519,7 @@ fn run_menu_command(hwnd: HWND, command: shortcuts::MenuCommand, link: Option<&s
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Reload => reload_page(),
         Settings => open_settings(),
         Help => open_help(),
     }
@@ -2360,6 +2364,9 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             *h.borrow_mut() = Some(hwnd);
         });
 
+        // Check the shown document for changes (#17).
+        SetTimer(Some(hwnd), WATCH_TIMER, watch::INTERVAL_MS, None);
+
         // Dropping a Markdown file on the window (#54).
         if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
             message_box(
@@ -2460,6 +2467,8 @@ thread_local! {
     static DOCUMENT_CHOICES: RefCell<markdown::DocumentChoices> = RefCell::new(markdown::DocumentChoices::default());
     /// A settings or help panel is open on the page: no right-click menu (#59).
     static PANEL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The shown document's file, watched for changes (#17).
+    static WATCH: RefCell<Option<watch::Watch>> = const { RefCell::new(None) };
     /// The right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<Option<contextmenu::Request>> = const { RefCell::new(None) };
 }
@@ -2472,6 +2481,8 @@ const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
 /// A Markdown file was dropped on the window (#54): open it.
 const WM_MDVIEW_DROP: u32 = WM_APP + 4;
+/// Timer that checks the shown document's file for changes (#17).
+const WATCH_TIMER: usize = 0x4D57;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2920,6 +2931,19 @@ unsafe extern "system" fn window_proc(
         WM_EXITMENULOOP => {
             linkstatus::hide(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // #17: reload the shown document once its file has changed.
+        WM_TIMER if wparam.0 == WATCH_TIMER => {
+            let changed = WATCH.with(|w| {
+                w.borrow_mut().as_mut().is_some_and(|w| {
+                    let now = watch::stamp(&w.path);
+                    w.tick(now)
+                })
+            });
+            if changed {
+                reload_page();
+            }
+            LRESULT(0)
         }
         WM_MDVIEW_DROP => {
             if let Some(path) = droptarget::take_dropped() {

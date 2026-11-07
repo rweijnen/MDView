@@ -32,6 +32,7 @@ pub fn shortcuts(is_plugin: bool) -> Vec<Group> {
         window.push(("Esc", "Close Lister"));
     } else {
         window.push(("Ctrl+O", "Open a file"));
+        reading.push(("F5", "Reload the document (also automatic when the file changes)"));
         window.push(("Esc", "Close the window"));
     }
     window.extend([("Ctrl+,", "Settings"), ("F1", "These keyboard shortcuts"), ("Right-click", "Menu")]);
@@ -74,6 +75,7 @@ pub enum MenuCommand {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    Reload,
     Settings,
     Help,
 }
@@ -81,7 +83,7 @@ pub enum MenuCommand {
 impl MenuCommand {
     pub fn from_id(id: u32) -> Option<Self> {
         use MenuCommand::*;
-        [OpenLink, CopyLink, Copy, SelectAll, Find, Print, ZoomIn, ZoomOut, ZoomReset, Settings, Help]
+        [OpenLink, CopyLink, Copy, SelectAll, Find, Print, ZoomIn, ZoomOut, ZoomReset, Reload, Settings, Help]
             .into_iter()
             .find(|c| *c as u32 == id)
     }
@@ -115,6 +117,10 @@ pub fn menu_items(on_link: bool, has_selection: bool, zoom: u32, is_plugin: bool
     items.push(item(MenuCommand::ZoomOut, "Zoom o&ut\tCtrl+Minus", true));
     items.push(item(MenuCommand::ZoomReset, &format!("&Reset zoom ({zoom}%)\tCtrl+0"), zoom != 100));
     items.push(None);
+    if !is_plugin {
+        // In Total Commander, F5 is TC's own key.
+        items.push(item(MenuCommand::Reload, "Re&load\tF5", true));
+    }
     items.push(item(MenuCommand::Settings, "&Settings...\tCtrl+,", true));
     items.push(item(MenuCommand::Help, "&Keyboard shortcuts\tF1", true));
     items
@@ -177,6 +183,8 @@ mod tests {
         assert!(labels(&link).contains(&"&Reset zoom (125%)\tCtrl+0".to_string()));
         assert!(labels(&link).contains(&"&Find...\tF7".to_string()), "plugin: TC's search");
         assert!(labels(&plain).contains(&"&Find...\tCtrl+F".to_string()));
+        assert!(labels(&plain).contains(&"Re&load\tF5".to_string()), "viewer: reload");
+        assert!(!labels(&link).iter().any(|l| l.starts_with("Re&load")), "plugin: F5 is TC's");
         for item in link.iter().flatten() {
             assert_eq!(MenuCommand::from_id(item.command as u32), Some(item.command));
         }

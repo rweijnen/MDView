@@ -66,6 +66,8 @@ thread_local! {
     static DOCUMENT_CHOICES: RefCell<HashMap<isize, crate::markdown::DocumentChoices>> = RefCell::new(HashMap::new());
     /// Viewers with a settings or help panel open: no right-click menu (#59).
     static PANEL_OPEN: RefCell<std::collections::HashSet<isize>> = RefCell::new(std::collections::HashSet::new());
+    /// Per viewer: the shown document's file, watched for changes (#17).
+    static WATCH: RefCell<HashMap<isize, crate::watch::Watch>> = RefCell::new(HashMap::new());
     /// Per viewer: the right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<HashMap<isize, crate::contextmenu::Request>> = RefCell::new(HashMap::new());
 }
@@ -76,6 +78,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
+/// Timer that checks the shown document's file for changes (#17).
+const WATCH_TIMER: usize = 0x4D57;
 
 pub fn create_viewer(
     parent: HWND,
@@ -133,6 +137,9 @@ pub fn create_viewer(
             let _ = DestroyWindow(hwnd);
             return Err(e);
         }
+
+        // Check the shown document for changes (#17).
+        SetTimer(Some(hwnd), WATCH_TIMER, crate::watch::INTERVAL_MS, None);
 
         Ok(hwnd)
     }
@@ -244,6 +251,8 @@ fn create_virtual_resource_response(
         } else {
             match crate::files::read_text(file_path) {
                 Ok(markdown_content) => {
+                    // This version is the one shown: watch it for changes (#17).
+                    WATCH.with(|w| w.borrow_mut().insert(hwnd.0 as isize, crate::watch::Watch::new(file_path, crate::watch::stamp(file_path))));
                     let remote_images = remote_images_for(hwnd, file_path);
                     // The plugin never asks to register (#37): TC is the host.
                     let bars = DOCUMENT_CHOICES.with(|c| {
@@ -838,6 +847,7 @@ fn cleanup_viewer_state(hwnd: HWND) {
     PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.borrow_mut().remove(&key));
     PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
     DOCUMENT_CHOICES.with(|c| c.borrow_mut().remove(&key));
+    WATCH.with(|w| w.borrow_mut().remove(&key));
     PANEL_OPEN.with(|p| p.borrow_mut().remove(&key));
     PENDING_MENU.with(|m| m.borrow_mut().remove(&key));
 }
@@ -951,6 +961,19 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // #17: reload the shown document once its file has changed.
+        WM_TIMER if wparam.0 == WATCH_TIMER => {
+            let changed = WATCH.with(|w| {
+                w.borrow_mut().get_mut(&(hwnd.0 as isize)).is_some_and(|w| {
+                    let now = crate::watch::stamp(&w.path);
+                    w.tick(now)
+                })
+            });
+            if changed {
+                reload_page(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             crate::linkstatus::hide(hwnd);
             resize_webview(hwnd);
@@ -1159,6 +1182,7 @@ fn run_menu_command(hwnd: HWND, command: crate::shortcuts::MenuCommand, link: Op
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Reload => reload_page(hwnd),
         Settings => open_settings(hwnd),
         Help => open_help(hwnd),
     }
