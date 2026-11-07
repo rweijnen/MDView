@@ -22,11 +22,27 @@ pub enum LinkAction {
     /// (Markdown in MDView, other files with their default app) only after
     /// the user confirms, because opening it connects to that location.
     ConfirmOpenNetwork { path: PathBuf, location: String },
+    /// A program or script. A plain click never runs it; Ctrl+click runs it
+    /// after a clear warning (1.0.0). `location` is set when it is on another
+    /// share or a network drive.
+    Program { path: PathBuf, location: Option<String> },
     /// Never opened; tell the user why.
     Refuse { target: String, reason: &'static str },
 }
 
-use crate::settings::{APP_NAME, app_name};
+/// What the user agreed to in a question about a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmed {
+    /// Open with its default program (a local file or one on a network location).
+    OpenFile(PathBuf),
+    /// Show a Markdown file from a network location in MDView.
+    OpenMarkdown(PathBuf),
+    /// Start a program the user Ctrl+clicked.
+    RunProgram(PathBuf),
+}
+
+use crate::messages::{Message, Tone};
+use crate::settings::app_name;
 
 pub const REFUSED_PROGRAM: &str =
     concat!(app_name!(), " does not open programs or scripts from links in a document.");
@@ -91,10 +107,7 @@ pub fn classify_local_file(path: &Path, network: Option<String>) -> LinkAction {
             reason: REFUSED_LINK_TYPE,
         }
     } else if is_executable(path) {
-        LinkAction::Refuse {
-            target: path.display().to_string(),
-            reason: REFUSED_PROGRAM,
-        }
+        LinkAction::Program { path: path.to_path_buf(), location: network }
     } else if let Some(location) = network {
         LinkAction::ConfirmOpenNetwork { path: path.to_path_buf(), location }
     } else if is_markdown(path) {
@@ -144,70 +157,116 @@ fn hex(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-/// Carry out a link decision. `owner` is the window dialogs belong to;
-/// `open_markdown` shows a Markdown file in the viewer. Every outcome other
-/// than success is reported to the user.
-pub fn perform(
-    action: LinkAction,
-    owner: windows::Win32::Foundation::HWND,
-    open_markdown: impl FnOnce(&Path),
-) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_OK, MB_YESNO,
-    };
+/// The question or message for a link decision, or `None` when there is
+/// nothing to ask (web links, Markdown files). `ctrl`: the user Ctrl+clicked.
+pub fn question(action: &LinkAction, ctrl: bool) -> Option<(Message, Option<Confirmed>)> {
     match action {
-        LinkAction::OpenExternal(url) => shell_open(owner, &url),
-        LinkAction::OpenMarkdown(path) => open_markdown(&path),
-        LinkAction::ConfirmOpenFile(path) => {
-            let text = format!(
-                "This link opens a file on your computer with its default program:\n\n{}\n\nOnly open it if you trust this document. Open it?",
-                path.display()
-            );
-            if message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
-                shell_open(owner, &path.to_string_lossy());
-            }
-        }
-        LinkAction::ConfirmOpenNetwork { path, location } => {
-            let text = if is_markdown(&path) {
+        LinkAction::OpenExternal(_) | LinkAction::OpenMarkdown(_) => None,
+        LinkAction::ConfirmOpenFile(path) => Some((
+            Message::confirm(
+                Tone::Warning,
                 format!(
-                    "This link opens a document from a network location:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document. Open it?",
+                    "This link opens a file on your computer with its default program:\n\n{}\n\nOnly open it if you trust this document.",
                     path.display()
+                ),
+                "Open",
+            ),
+            Some(Confirmed::OpenFile(path.clone())),
+        )),
+        LinkAction::ConfirmOpenNetwork { path, location } => {
+            let (text, confirmed) = if is_markdown(path) {
+                (
+                    format!(
+                        "This link opens a document from a network location:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document.",
+                        path.display()
+                    ),
+                    Confirmed::OpenMarkdown(path.clone()),
                 )
             } else {
-                format!(
-                    "This link opens a file from a network location with its default program:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document. Open it?",
-                    path.display()
+                (
+                    format!(
+                        "This link opens a file from a network location with its default program:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document.",
+                        path.display()
+                    ),
+                    Confirmed::OpenFile(path.clone()),
                 )
             };
-            if message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
-                if is_markdown(&path) {
-                    open_markdown(&path);
-                } else {
-                    shell_open(owner, &path.to_string_lossy());
-                }
-            }
+            Some((Message::confirm(Tone::Warning, text, "Open"), Some(confirmed)))
         }
-        LinkAction::Refuse { target, reason } => {
-            message_box(owner, &format!("{reason}\n\n{target}"), MB_OK | MB_ICONWARNING);
+        LinkAction::Program { path, location } if ctrl => {
+            let network = location
+                .as_ref()
+                .map(|l| format!("\n\nRunning it connects to {l}."))
+                .unwrap_or_default();
+            Some((
+                Message::confirm(
+                    Tone::Error,
+                    format!(
+                        "This link starts a program:\n\n{}\n\nPrograms from a document can harm your computer. Only run it if you trust this document and the program.{network}",
+                        path.display()
+                    ),
+                    "Run program",
+                ),
+                Some(Confirmed::RunProgram(path.clone())),
+            ))
         }
+        LinkAction::Program { path, .. } => Some((
+            Message::warning(format!(
+                "{REFUSED_PROGRAM}\n\n{}\n\nTo run it anyway, Ctrl+click the link.",
+                path.display()
+            )),
+            None,
+        )),
+        LinkAction::Refuse { target, reason } => Some((Message::warning(format!("{reason}\n\n{target}")), None)),
     }
 }
 
-fn message_box(
+/// Carry out a link decision. `open_markdown` shows a Markdown file in the
+/// viewer; `tell` shows a message or asks a question (in the page), and a
+/// "yes" comes back through `run_confirmed`. Every outcome other than
+/// success is reported to the user.
+pub fn perform(
+    action: LinkAction,
+    ctrl: bool,
     owner: windows::Win32::Foundation::HWND,
-    text: &str,
-    style: windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE,
-) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
-    use windows::Win32::UI::WindowsAndMessaging::MessageBoxW;
-    use windows::core::PCWSTR;
-    let text: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-    let title: Vec<u16> = format!("{APP_NAME}\0").encode_utf16().collect();
-    unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) }
+    open_markdown: impl FnOnce(&Path),
+    tell: impl FnOnce(Message, Option<Confirmed>),
+) {
+    if let Some((message, confirmed)) = question(&action, ctrl) {
+        return tell(message, confirmed);
+    }
+    match action {
+        LinkAction::OpenExternal(url) => {
+            if let Err(message) = shell_open(owner, &url) {
+                tell(message, None);
+            }
+        }
+        LinkAction::OpenMarkdown(path) => open_markdown(&path),
+        _ => {}
+    }
 }
 
-fn shell_open(owner: windows::Win32::Foundation::HWND, target: &str) {
+/// The user said yes to a question from `perform`.
+pub fn run_confirmed(
+    confirmed: Confirmed,
+    owner: windows::Win32::Foundation::HWND,
+    open_markdown: impl FnOnce(&Path),
+    tell: impl FnOnce(Message, Option<Confirmed>),
+) {
+    let target = match confirmed {
+        Confirmed::OpenMarkdown(path) => return open_markdown(&path),
+        Confirmed::OpenFile(path) | Confirmed::RunProgram(path) => path,
+    };
+    if let Err(message) = shell_open(owner, &target.to_string_lossy()) {
+        tell(message, None);
+    }
+}
+
+/// Open with the default program, as Explorer would: Windows' own checks
+/// (SmartScreen, Mark of the Web) apply.
+fn shell_open(owner: windows::Win32::Foundation::HWND, target: &str) -> Result<(), Message> {
     use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, SW_SHOWNORMAL};
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
     use windows::core::PCWSTR;
     let target_wide: Vec<u16> = target.encode_utf16().chain(std::iter::once(0)).collect();
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
@@ -223,7 +282,9 @@ fn shell_open(owner: windows::Win32::Foundation::HWND, target: &str) {
     };
     // ShellExecute returns a value greater than 32 on success.
     if result.0 as usize <= 32 {
-        message_box(owner, &format!("Could not open:\n\n{target}"), MB_OK | MB_ICONERROR);
+        Err(Message::error(format!("Could not open:\n\n{target}")))
+    } else {
+        Ok(())
     }
 }
 
@@ -353,8 +414,45 @@ mod tests {
         None
     }
 
+    /// Not opened by a plain click: refused, or a program (Ctrl+click only).
     fn refused(a: &LinkAction) -> bool {
-        matches!(a, LinkAction::Refuse { .. })
+        matches!(a, LinkAction::Refuse { .. } | LinkAction::Program { .. })
+    }
+
+    // 1.0.0: a program link is never run by a plain click; Ctrl+click asks
+    // with a clear warning, Cancel being the safe answer. Data streams and
+    // non-file links are never run, not even with Ctrl+click.
+    #[test]
+    fn test_programs_run_only_after_ctrl_click_and_a_warning() {
+        let program = classify_local_file(Path::new(r"C:\tools\setup.exe"), None);
+        assert_eq!(program, LinkAction::Program { path: PathBuf::from(r"C:\tools\setup.exe"), location: None });
+        let (plain, action) = question(&program, false).unwrap();
+        assert!(action.is_none() && !plain.is_question());
+        assert!(plain.text.contains("Ctrl+click") && plain.text.contains(r"C:\tools\setup.exe"), "{}", plain.text);
+        let (warning, action) = question(&program, true).unwrap();
+        assert!(warning.is_question() && warning.safe == crate::messages::NO);
+        assert!(warning.text.contains("can harm your computer") && warning.buttons[0].label == "Run program", "{warning:?}");
+        assert_eq!(action, Some(Confirmed::RunProgram(PathBuf::from(r"C:\tools\setup.exe"))));
+        let network = classify_local_file(Path::new(r"\\server\share\x.cmd"), Some(r"\\server\share".into()));
+        assert!(question(&network, true).unwrap().0.text.contains(r"connects to \\server\share"));
+        for never in [r"C:\tmp\a.exe:stream", r"C:\tmp\a.txt:evil.exe", r"C:\tmp\a.exe::$DATA"] {
+            let a = classify_local_file(Path::new(never), None);
+            assert!(matches!(a, LinkAction::Refuse { .. }), "{never}");
+            assert!(question(&a, true).unwrap().1.is_none(), "{never}: nothing to run with Ctrl+click");
+        }
+        let scheme = classify_url("ms-msdt:/id x", no_virtual, not_network);
+        assert!(question(&scheme, true).unwrap().1.is_none());
+    }
+
+    #[test]
+    fn test_questions_for_files_and_network_locations() {
+        let file = LinkAction::ConfirmOpenFile(PathBuf::from(r"C:\a.pdf"));
+        let (m, a) = question(&file, false).unwrap();
+        assert!(m.is_question() && m.safe == crate::messages::NO && a == Some(Confirmed::OpenFile(PathBuf::from(r"C:\a.pdf"))));
+        let md = LinkAction::ConfirmOpenNetwork { path: PathBuf::from(r"\\s\h\a.md"), location: r"\\s\h".into() };
+        assert_eq!(question(&md, false).unwrap().1, Some(Confirmed::OpenMarkdown(PathBuf::from(r"\\s\h\a.md"))));
+        assert!(question(&LinkAction::OpenMarkdown(PathBuf::from("a.md")), true).is_none());
+        assert!(question(&LinkAction::OpenExternal("https://x".into()), false).is_none());
     }
 
     #[test]

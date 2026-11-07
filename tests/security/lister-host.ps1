@@ -138,11 +138,12 @@ New-Item -ItemType Directory -Force $IniFolder | Out-Null
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = 'Lister (mdview) - test host'
-$form.Width = 1000
-$form.Height = 800
+$form.Width = 980
+$form.Height = 720
+# Fits a 1024x768 screen (GitHub's runners).
 $form.StartPosition = 'Manual'
-$form.Left = 200
-$form.Top = 150
+$form.Left = 20
+$form.Top = 20
 $closedByPlugin = $false
 # Keys the plugin passes on to TC's Lister window arrive here.
 if ($LogFile) {

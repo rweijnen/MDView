@@ -1,0 +1,85 @@
+name: GUI and security tests
+
+# The end-to-end tests drive real windows with the mouse and keyboard, so
+# they need a desktop of their own: GitHub's Windows runners have one. They
+# run on every push to a branch other than main, on pull requests, and on
+# request (Actions > GUI and security tests > Run workflow).
+on:
+  push:
+    branches-ignore: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build.rs'
+      - '.github/workflows/gui-tests.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  gui-tests:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (debug)
+        run: cargo build
+
+      - name: WebView2 Runtime
+        shell: pwsh
+        run: |
+          # Installed with Edge on most images; install it when missing, so a
+          # missing runtime is never mistaken for an MDView failure.
+          $keys = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+                  'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $version = $keys | ForEach-Object { (Get-ItemProperty $_ -ErrorAction SilentlyContinue).pv } | Where-Object { $_ } | Select-Object -First 1
+          if (-not $version) {
+            Invoke-WebRequest 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile "$env:RUNNER_TEMP\webview2-setup.exe"
+            Start-Process "$env:RUNNER_TEMP\webview2-setup.exe" -ArgumentList '/silent', '/install' -Wait
+            $version = $keys | ForEach-Object { (Get-ItemProperty $_ -ErrorAction SilentlyContinue).pv } | Where-Object { $_ } | Select-Object -First 1
+            if (-not $version) { Write-Error 'The WebView2 Runtime could not be installed.'; exit 1 }
+          }
+          Write-Output "WebView2 Runtime $version"
+          Add-Type -AssemblyName System.Windows.Forms
+          Write-Output "Screen: $([System.Windows.Forms.Screen]::PrimaryScreen.Bounds)"
+
+      - name: Behaviour test (both programs)
+        shell: pwsh
+        run: |
+          .\tests\gui\viewer-behaviour.ps1 -Exe target\debug\mdview.exe -Dll target\debug\mdview_wlx.dll *>&1 | Tee-Object -FilePath behaviour.txt
+          $failed = $LASTEXITCODE
+          $o = Get-Content behaviour.txt
+          Write-Output ("PASS={0} FAIL={1} SKIP={2}" -f @($o | Select-String '^PASS').Count, @($o | Select-String '^FAIL').Count, @($o | Select-String '^SKIP').Count)
+          if ($failed -ne 0) { Write-Error "$failed check(s) failed"; exit 1 }
+
+      - name: Attack suite (both programs)
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          .\tests\security\attack.ps1 -Exe target\debug\mdview.exe -Dll target\debug\mdview_wlx.dll -Label ci *>&1 | Tee-Object -FilePath attack.txt
+          if ($LASTEXITCODE -ne 0) { Write-Error "$LASTEXITCODE case(s) failed"; exit 1 }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            behaviour.txt
+            attack.txt
+            tests/security/results/ci.md
+          if-no-files-found: warn

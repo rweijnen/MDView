@@ -36,6 +36,7 @@ pub fn describe(href: &str, action: &LinkAction) -> String {
         LinkAction::OpenExternal(url) => url.clone(),
         LinkAction::OpenMarkdown(path) | LinkAction::ConfirmOpenFile(path) => path.display().to_string(),
         LinkAction::ConfirmOpenNetwork { path, .. } => path.display().to_string(),
+        LinkAction::Program { path, .. } => format!("{} (program: Ctrl+click to run)", path.display()),
         LinkAction::Refuse { target, .. } => format!("{target} (not opened)"),
     }
 }
@@ -254,8 +255,10 @@ mod tests {
             location: r"\\server\share".to_string(),
         };
         assert_eq!(describe("file://server/share/x.md", &network), r"\\server\share\x.md");
-        let refused = LinkAction::Refuse { target: r"C:\docs\run.exe".to_string(), reason: crate::links::REFUSED_PROGRAM };
-        assert_eq!(describe("run.exe", &refused), r"C:\docs\run.exe (not opened)");
+        let program = LinkAction::Program { path: PathBuf::from(r"C:\docs\run.exe"), location: None };
+        assert_eq!(describe("run.exe", &program), r"C:\docs\run.exe (program: Ctrl+click to run)");
+        let refused = LinkAction::Refuse { target: "ms-msdt:/id x".to_string(), reason: crate::links::REFUSED_LINK_TYPE };
+        assert_eq!(describe("ms-msdt:/id x", &refused), "ms-msdt:/id x (not opened)");
         assert_eq!(describe("#install", &md), "#install");
     }
 

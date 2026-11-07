@@ -200,6 +200,12 @@ $cases = @(
     @{ Id = 'E2'; Safe = 'MDView does not connect to the pipe'; Title = 'double-encoded \\.\pipe\ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E2`n`n![e2]($('../' * 30)%255C%255C.%255Cpipe%255C$(Get-PipeName 'E2'))" }
     @{ Id = 'E3'; Safe = 'MDView does not connect to the pipe'; Title = 'CSS url() with encoded //./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E3`n`n<div style=`"width:10px;height:10px;background:url($('../' * 30)%2F%2F.%2Fpipe%2F$(Get-PipeName 'E3'))`"></div>" }
     @{ Id = 'E4'; Safe = 'MDView does not connect to the pipe'; Title = 'image with an absolute \\.\pipe\ or file://./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E4`n`n![e4a](\\\\.\pipe\$(Get-PipeName 'E4'))`n`n![e4b](file:////./pipe/$(Get-PipeName 'E4'))`n`n![e4c](https://unc.mdview.example/./pipe/$(Get-PipeName 'E4'))" }
+    # Files that aren't Markdown, given directly (#55): never shown as a page,
+    # never run. The standalone viewer shows a notice; the plugin declines them.
+    @{ Id = 'D1'; Ext = 'js'; Safe = 'the file is not run; the viewer says it only opens Markdown, the plugin declines it'; Title = 'a .js file given directly is run'; Canary = $true; Doc = "WScript.CreateObject('WScript.Shell').Run('canary-D1.cmd')" }
+    @{ Id = 'D2'; Ext = 'html'; Safe = 'the page is not shown; nothing runs'; Title = 'an .html file given directly runs its script'; Canary = $true; Doc = "<html><body><p>D2</p><script>document.body.insertAdjacentHTML('beforeend','<p>PWNED-D2</p>'); if (window.chrome && chrome.webview) chrome.webview.postMessage({type:'openLink', url: new URL('canary-D2.cmd', location.href).href})</script></body></html>" }
+    @{ Id = 'D3'; Ext = 'svg'; Safe = 'the image is not shown as a page; nothing runs'; Title = 'an .svg file given directly runs its script'; Doc = "<svg xmlns='http://www.w3.org/2000/svg'><text y='20'>D3</text><script>document.documentElement.insertAdjacentHTML('beforeend','<text y=`"40`">PWNED-D3</text>')</script></svg>" }
+    @{ Id = 'D4'; Ext = 'hta'; Safe = 'the file is not run'; Title = 'an .hta file given directly is run'; Canary = $true; Doc = "<html><head><script language='VBScript'>CreateObject(""WScript.Shell"").Run ""canary-D4.cmd""</script></head><body>PWNED-D4</body></html>" }
     @{ Id = 'E5'; Safe = 'MDView does not connect to the pipe (a real click shows a refusal message)'; Title = 'clicking a link to file://./pipe/ opens the pipe'; Detect = 'pipe'; AllowNetwork = $true; Click = 'e5 pipe link'; Doc = "# E5`n`n[e5 pipe link](<file://./pipe/$(Get-PipeName 'E5')>)" }
 )
 $pages['S5'] = "<html><body>left MDView (S5)</body></html>"
@@ -223,7 +229,7 @@ function Restore-Registry {
 }
 function Set-TestRegistry {
     Restore-Registry
-    foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
+    foreach ($kv in @{ Left = 20; Top = 20; Right = 1000; Bottom = 740; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
 }
@@ -232,10 +238,11 @@ function Set-TestRegistry {
 $results = @()
 function Invoke-Case($case, $hostKind) {
     $id = $case.Id
-    $doc = Join-Path $attack "case-$id.md"
+    $ext = if ($case.Ext) { $case.Ext } else { 'md' }
+    $doc = Join-Path $attack "case-$id.$ext"
     $text = if ($case.DocFn) { & $case.DocFn } else { $case.Doc }
     Set-Content -Path $doc -Value $text -NoNewline
-    foreach ($c in 'B1', 'B4', 'B6', 'F3', 'U1') { if ($id -eq $c) { New-Canary $c | Out-Null } }
+    foreach ($c in 'B1', 'B4', 'B6', 'F3', 'U1', 'D1', 'D2', 'D4') { if ($id -eq $c) { New-Canary $c | Out-Null } }
     Remove-Item (Join-Path $attack "marker-$id.txt") -ErrorAction SilentlyContinue
     $calcBefore = Get-CalcIds
     $hitsBefore = $hits.Count
@@ -280,7 +287,9 @@ function Invoke-Case($case, $hostKind) {
     if ($win) {
         $deadline = (Get-Date).AddSeconds(20)
         while ((Get-Date) -lt $deadline -and -not $proc.HasExited -and -not $pageLoaded) {
-            if (Find-Text $win "^$id$") { $pageLoaded = $true } else { Start-Sleep -Milliseconds 300 }
+            # A file given directly (#55) shows MDView's notice instead of a document.
+            $shownText = if ($case.Ext) { '^Not a Markdown file$' } else { "^$id$" }
+            if (Find-Text $win $shownText) { $pageLoaded = $true } else { Start-Sleep -Milliseconds 300 }
         }
     }
     Start-Sleep -Seconds 2
@@ -331,7 +340,9 @@ function Invoke-Case($case, $hostKind) {
     if ($dialogs.Count) { $observed += "dialog: $($dialogs -join ' | ')" }
     # A case that could not run is an error, never a pass.
     $notRun = $null
-    if ($hostKind -eq 'plugin' -and $status -eq 'load-failed') { $notRun = 'plugin failed to load the document' }
+    if ($hostKind -eq 'plugin' -and $status -eq 'load-failed' -and $case.Ext) { $observed += 'declined by the plugin (TC uses another viewer)' }
+    elseif ($hostKind -eq 'plugin' -and $case.Ext) { $notRun = "the plugin did not decline the file (status: $status)"; $worked = $true; $observed += 'the plugin opened a file that is not Markdown' }
+    elseif ($hostKind -eq 'plugin' -and $status -eq 'load-failed') { $notRun = 'plugin failed to load the document' }
     elseif (-not $win -and -not ($case.Close -and $exitedEarly)) { $notRun = 'viewer window not found' }
     elseif (-not $pageLoaded -and -not $navigatesAway -and -not ($case.Close -and $exitedEarly)) { $notRun = 'document did not load' }
     if (-not $observed.Count) { $observed += 'nothing happened' }

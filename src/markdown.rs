@@ -522,7 +522,7 @@ if (webview) (function() {
     }
 
     window.addEventListener('keydown', function(e) {
-        if (open && e.key === 'Escape') {
+        if (open && !messageOpen && e.key === 'Escape') {
             e.preventDefault();
             e.stopImmediatePropagation();
             close(false);
@@ -548,6 +548,8 @@ if (webview) (function() {
 /// ignores them.
 const PANEL_SCRIPT: &str = r##"
     var panels = 0;
+    // A message (MESSAGE_SCRIPT) is on top: Esc is its own.
+    var messageOpen = false;
     function panelOpened() {
         panels++;
         if (webview) webview.postMessage({type: 'panel', open: 'true'});
@@ -564,6 +566,101 @@ const PANEL_SCRIPT: &str = r##"
         e.preventDefault();
         webview.postMessage({type: 'listerKey', key: e.key.toUpperCase()});
     });
+"##;
+
+/// Messages and questions from MDView (1.0.0, `messages.rs`) in a panel
+/// instead of message boxes: closed shadow root, text with `textContent`.
+/// The page confirms with `messageShown`; a button answers with
+/// `messageChoice`; Esc gives the safe answer. Messages arriving while one is
+/// open wait their turn.
+const MESSAGE_SCRIPT: &str = r##"
+if (webview) (function() {
+    var current = null, queue = [];
+    var CSS = [
+        ':host{all:initial}',
+        '.scrim{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:flex-start;justify-content:center;padding:48px 16px;box-sizing:border-box;background:rgba(27,31,36,.35);font-family:"Segoe UI",-apple-system,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45;color:#24292e}',
+        '.dark.scrim{background:rgba(0,0,0,.55);color:#d4d4d4}',
+        '.box{width:520px;max-width:100%;background:#fff;border:1px solid #d0d7de;border-top:4px solid #57606a;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.28)}',
+        '.dark .box{background:#252526;border-color:#454545}',
+        '.warning .box{border-top-color:#bf8700}.error .box{border-top-color:#cf222e}',
+        '.text{padding:18px 20px;white-space:pre-line;overflow-wrap:anywhere}',
+        '.foot{display:flex;justify-content:flex-end;gap:8px;padding:12px 20px;border-top:1px solid #d0d7de}',
+        '.dark .foot{border-color:#454545}',
+        'button{font:inherit;color:inherit;cursor:pointer;min-height:32px;min-width:88px;padding:4px 14px;border-radius:4px;border:1px solid #d0d7de;background:#fff}',
+        '.dark button{border-color:#454545;background:#252526}',
+        'button.safe{background:#0969da;border-color:#0969da;color:#fff;font-weight:600}',
+        '.dark button.safe{background:#1f6feb;border-color:#1f6feb}',
+        ':focus-visible{outline:2px solid #0969da;outline-offset:2px}.dark :focus-visible{outline-color:#4493f8}'
+    ].join('\n');
+
+    function answer(choice) {
+        if (!current) return;
+        webview.postMessage({type: 'messageChoice', id: current.id, choice: choice});
+        current.host.remove();
+        current = null;
+        messageOpen = false;
+        panelClosed();
+        next();
+    }
+
+    function next() {
+        if (current || !queue.length) return;
+        var m = queue.shift();
+        var host = document.createElement('div');
+        host.setAttribute('data-mdview-message', '');
+        var shadow = host.attachShadow({mode: 'closed'});
+        var style = document.createElement('style');
+        style.textContent = CSS;
+        shadow.appendChild(style);
+        var text = document.createElement('div');
+        text.className = 'text';
+        text.id = 'mdview-message-text';
+        text.textContent = String(m.text);
+        var foot = document.createElement('div');
+        foot.className = 'foot';
+        var safeButton = null;
+        (m.buttons || []).forEach(function(b) {
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = String(b.label);
+            if (b.choice === m.safe) { button.className = 'safe'; safeButton = button; }
+            button.addEventListener('click', function() { answer(String(b.choice)); });
+            foot.appendChild(button);
+        });
+        var box = document.createElement('div');
+        box.className = 'box';
+        box.setAttribute('role', m.buttons && m.buttons.length > 1 ? 'alertdialog' : 'dialog');
+        box.setAttribute('aria-modal', 'true');
+        box.setAttribute('aria-label', 'MDView');
+        box.setAttribute('aria-describedby', 'mdview-message-text');
+        box.appendChild(text);
+        box.appendChild(foot);
+        var scrim = document.createElement('div');
+        scrim.className = 'scrim ' + (m.tone || 'info') + (m.dark ? ' dark' : '');
+        scrim.appendChild(box);
+        shadow.appendChild(scrim);
+        current = {id: String(m.id), safe: String(m.safe), host: host};
+        document.body.appendChild(host);
+        messageOpen = true;
+        panelOpened();
+        webview.postMessage({type: 'messageShown', id: current.id});
+        if (safeButton) safeButton.focus();
+    }
+
+    window.addEventListener('keydown', function(e) {
+        if (!current || e.key !== 'Escape') return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        answer(current.safe);
+    }, true);
+    webview.addEventListener('message', function(e) {
+        var m = e.data;
+        if (m && m.type === 'showMessage' && typeof m.id === 'string' && Array.isArray(m.buttons)) {
+            queue.push(m);
+            next();
+        }
+    });
+})();
 "##;
 
 /// The keyboard help (#59): F1 asks MDView, which sends `showHelp` with this
@@ -660,7 +757,7 @@ if (webview) (function() {
     }
 
     window.addEventListener('keydown', function(e) {
-        if (e.key !== 'F1' && !(open && e.key === 'Escape')) return;
+        if (messageOpen || (e.key !== 'F1' && !(open && e.key === 'Escape'))) return;
         e.preventDefault();
         e.stopImmediatePropagation();
         if (open) close();
@@ -829,6 +926,21 @@ pub fn download_gate_html(path: &str, host_url: Option<&str>) -> String {
 }
 
 /// The page shown when a document cannot be read, instead of an empty window.
+/// A page that says why a file isn't shown (1.0.0): not a Markdown file
+/// (#55), or a location MDView can't show (#53). Text only.
+pub fn notice_html(heading: &str, path: &str, reason: &str) -> String {
+    format!(
+        "<div class=\"mdview-gate\"><p><strong>{}</strong></p><p><code>{}</code></p><p>{}</p></div>",
+        html_text(heading),
+        html_text(path),
+        html_text(reason)
+    )
+}
+
+#[allow(dead_code)] // standalone viewer only; the plugin declines such files
+pub const NOT_MARKDOWN: &str = "MDView only opens Markdown files (.md, .markdown). Nothing from this file was read.";
+pub const NO_ADDRESS: &str = "MDView cannot show files at this location.";
+
 pub fn read_error_html(path: &str, reason: &str) -> String {
     format!(
         "<div class=\"mdview-gate\"><p><strong>Could not read</strong></p><p><code>{}</code></p><p>{}</p></div>",
@@ -1013,6 +1125,7 @@ pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, ba
     let settings_script = SETTINGS_SCRIPT;
     let help_script = HELP_SCRIPT;
     let panel_script = PANEL_SCRIPT;
+    let message_script = MESSAGE_SCRIPT;
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
@@ -1337,6 +1450,7 @@ a {{ cursor: pointer; }}
 {panel_script}
 {settings_script}
 {help_script}
+{message_script}
 }})();
 </script>
 </body>
@@ -1454,6 +1568,14 @@ mod tests {
         assert!(!page.contains("x\"; } body") && page.contains("--mdview-text-size: 14px;"));
     }
 
+    // #53 / #55: the notice page names the file as text only.
+    #[test]
+    fn test_notice_page_shows_the_path_as_text() {
+        let html = notice_html("Not a Markdown file", r"C:\x\<script>a.js", NOT_MARKDOWN);
+        assert!(html.contains("<strong>Not a Markdown file</strong>"));
+        assert!(html.contains(r"C:\x\&lt;script&gt;a.js") && !html.contains("<script>"), "{html}");
+        assert!(html.contains("Nothing from this file was read"));
+    }
     fn nonce_of(page: &str) -> String {
         let start = page.find("'nonce-").expect("CSP has a nonce") + 7;
         page[start..start + 32].to_string()
