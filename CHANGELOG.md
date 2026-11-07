@@ -9,6 +9,7 @@ release workflow refuses to publish a version without a section here.
 - Documents downloaded from the internet (Mark of the Web) are not shown until you choose **Open**, **Open and remove the mark** or **Don't ask again**. (#24)
 - Images and links can use absolute paths, such as `D:\pictures\x.png` or `file://server/share/x.png`. Files from a network location are only loaded after you choose **Load files** or **Always load**; this is separate from remote images. (#56)
 - Hovering over a link shows where it goes in a tooltip: the web address, or the file's path. (#60)
+- Settings (Ctrl+,; in the standalone viewer also **File > Settings…**): font size (a / A / **A**), fonts for text, headings and code, and the answers given in bars (remote images, network files, downloaded documents). Each program keeps its own. (#50)
 
 ### Changes
 - The remote-images bar can be closed with ×; it stays closed while the document is open.

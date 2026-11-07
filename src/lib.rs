@@ -1,10 +1,12 @@
 #![allow(non_snake_case)]
 
 mod files;
+mod fonts;
 mod links;
 mod linkstatus;
 mod markdown;
 mod settings;
+mod settings_page;
 mod viewer;
 mod vpath;
 mod zone;

@@ -7,7 +7,9 @@
 # remote-images bar, paths from documents (#49: no escape to other drives,
 # shares, pipes; absolute paths; the network bar: Load files, Always load,
 # Never; links to a share ask first), the welcome screen, the remembered zoom
-# (#16) and the tooltip that shows where a link goes (#60).
+# (#16), the tooltip that shows where a link goes (#60), and the settings
+# panel (#50: Ctrl+, / File > Settings..., live font preview, Esc, Save,
+# restart, Advanced, Reset, and a store that can't be written).
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -129,14 +131,14 @@ function Start-PipeProbe($name) {
 
 # ---- registry
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles', 'Zoom'
-$regBackup = @{}
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles', 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize'
+$regBackup = @{}; $regKinds = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
-foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
+foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n; $regKinds[$n] = (Get-Item -Path $key).GetValueKind($n) } }
 function Restore-Registry {
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
     foreach ($n in $regNames) {
-        if ($regBackup.ContainsKey($n)) { Set-ItemProperty -Path $key -Name $n -Value $regBackup[$n] -Type DWord }
+        if ($regBackup.ContainsKey($n)) { Set-ItemProperty -Path $key -Name $n -Value $regBackup[$n] -Type $regKinds[$n] }
         else { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
     }
 }
@@ -144,7 +146,7 @@ function Set-TestRegistry($remoteImages) {
     Restore-Registry
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
-    Remove-ItemProperty -Path $key -Name Zoom -ErrorAction SilentlyContinue
+    foreach ($n in 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
     foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
@@ -235,7 +237,18 @@ function Wait-Element($v, $type, $nameRegex, $seconds = 15) {
     }
     $null
 }
-function Invoke-Element($e) { $e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+# Clicks a button through UI Automation. A button with aria-pressed is a toggle
+# button there (Toggle pattern), one with aria-expanded an expander.
+function Invoke-Element($e) {
+    $pattern = $null
+    # A button with aria-expanded (Advanced) opens and closes.
+    if ($e.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pattern)) {
+        if ($pattern.Current.ExpandCollapseState -eq 'Collapsed') { $pattern.Expand() } else { $pattern.Collapse() }
+    }
+    elseif ($e.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) { $pattern.Invoke() }
+    elseif ($e.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) { $pattern.Toggle() }
+    else { throw "'$($e.Current.Name)' can be neither invoked nor toggled" }
+}
 
 Add-Type -Namespace Win32 -Name Behaviour -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -914,11 +927,17 @@ function Press-DialogButton($d, $name) {
         $saved = Get-ZoomSetting $hostKind; $other = Get-ZoomSetting $otherKind
         Check "${hostKind}: Ctrl+Plus zooms to 110% and saves Zoom=110 in its own settings" ($focused -and (Near $plus 1.1) -and $saved -eq 110 -and $null -eq $other) "focused=$focused ratio=$plus Zoom=$saved other=$other"
 
+        # Synthetic input is sometimes lost right after a focus change: a notch
+        # that changed nothing at all is sent once more (and reported); a wrong
+        # change still fails.
+        $retried = @()
         Send-CtrlWheel $v 120
         $up = Wait-Ratio $v 'Main' $base 1.25
+        if (Near $up 1.1) { $retried += 'up'; Send-CtrlWheel $v 120; $up = Wait-Ratio $v 'Main' $base 1.25 }
         Send-CtrlWheel $v -120
         $down = Wait-Ratio $v 'Main' $base 1.1
-        Check "${hostKind}: one Ctrl+wheel notch is one step (110, 125, back to 110)" ((Near $up 1.25) -and (Near $down 1.1)) "up=$up down=$down Zoom=$(Get-ZoomSetting $hostKind)"
+        if (Near $down 1.25) { $retried += 'down'; Send-CtrlWheel $v -120; $down = Wait-Ratio $v 'Main' $base 1.1 }
+        Check "${hostKind}: one Ctrl+wheel notch is one step (110, 125, back to 110)" ((Near $up 1.25) -and (Near $down 1.1)) "up=$up down=$down Zoom=$(Get-ZoomSetting $hostKind) retried=$($retried -join ',')"
 
         $link = Wait-Element $v $CT::Hyperlink 'Go to second' 5
         if ($link) { Invoke-Element $link }
@@ -1045,6 +1064,129 @@ function Press-DialogButton($d, $name) {
         Stop-Viewer $v
     }
 
+    # ---- Settings panel (#50): Ctrl+, opens it over the document; font size
+    # previews live, Esc discards, Save stores in this program's settings only.
+    function Get-Setting($hostKind, $name) {
+        if ($hostKind -eq 'exe') { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).$name } else { Get-IniValue $name }
+    }
+    # Ctrl+, once more if the first keystroke was lost (no panel at all).
+    function Open-Settings($v) {
+        for ($try = 0; $try -lt 2; $try++) {
+            if (-not (Focus-Document $v)) { continue }
+            Send-CtrlKey 0xBC
+            $panel = Wait-Element $v $CT::Window '^Settings$' 4
+            if ($panel) { if ($try) { Write-Host '      (Ctrl+, retried once)' }; return $panel }
+        }
+        $null
+    }
+    function Find-In($parent, $type, $nameRegex) {
+        foreach ($e in $parent.FindAll($TS::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $type)))) {
+            if ($e.Current.Name -match $nameRegex) { return $e }
+        }
+        $null
+    }
+    function Wait-Gone($v, $type, $nameRegex, $seconds = 5) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        do { if (-not (Find-Element $v $type $nameRegex)) { return $true }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline)
+        $false
+    }
+
+    foreach ($hostKind in 'exe', 'plugin') {
+        $otherKind = if ($hostKind -eq 'exe') { 'plugin' } else { 'exe' }
+        $program = if ($hostKind -eq 'exe') { 'Standalone viewer' } else { 'Total Commander plugin' }
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'main.md')
+        [void](Wait-Element $v $CT::Text '^Main$')
+        Start-Sleep -Milliseconds 500
+        $base = Get-HeadingHeight $v 'Main'
+
+        $panel = Open-Settings $v
+        $label = if ($panel) { Find-In $panel $CT::Text "^$program$" } else { $null }
+        $register = if ($panel) { Find-In $panel $CT::CheckBox '^Offer to register' } else { $null }
+        $registerOk = if ($hostKind -eq 'exe') { [bool]$register } else { -not $register }
+        Check "${hostKind}: Ctrl+, opens the settings panel for this program" ([bool]$panel -and [bool]$label -and $registerOk) "panel=$([bool]$panel) label=$([bool]$label) register row=$([bool]$register)"
+
+        $large = if ($panel) { Find-In $panel $CT::Button '^Large text$' } else { $null }
+        if ($large) { Invoke-Element $large }
+        $preview = Wait-Ratio $v 'Main' $base (17 / 14)
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        Send-Escape
+        $closed = Wait-Gone $v $CT::Window '^Settings$'
+        $escRetried = $false
+        if (-not $closed) {
+            # Esc lost (nothing changed): once more, reported.
+            $escRetried = $true
+            [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+            Send-Escape
+            $closed = Wait-Gone $v $CT::Window '^Settings$'
+        }
+        $after = Wait-Ratio $v 'Main' $base 1.0
+        Check "${hostKind}: font size previews live, Esc closes and discards it" ((Near $preview (17 / 14)) -and $closed -and (Near $after 1.0) -and $null -eq (Get-Setting $hostKind 'TextSize')) "preview=$preview closed=$closed after=$after TextSize=$(Get-Setting $hostKind 'TextSize') Esc retried=$escRetried"
+
+        $panel = Open-Settings $v
+        $large = if ($panel) { Find-In $panel $CT::Button '^Large text$' } else { $null }
+        if ($large) { Invoke-Element $large }
+        $remoteGroup = if ($panel) { Find-In $panel $CT::Group '^Remote images$' } else { $null }
+        $always = if ($remoteGroup) { Find-In $remoteGroup $CT::Button '^Always load$' } else { $null }
+        if ($always) { Invoke-Element $always }
+        $save = if ($panel) { Find-In $panel $CT::Button '^Save$' } else { $null }
+        if ($save) { Invoke-Element $save }
+        $closed = Wait-Gone $v $CT::Window '^Settings$' 8
+        [void](Wait-Element $v $CT::Text '^Main$' 10)
+        $saved = Wait-Ratio $v 'Main' $base (17 / 14)
+        $size = Get-Setting $hostKind 'TextSize'; $remote = Get-Setting $hostKind 'RemoteImages'
+        $otherSize = Get-Setting $otherKind 'TextSize'
+        Check "${hostKind}: Save stores the settings in its own store and closes the panel" ($closed -and (Near $saved (17 / 14)) -and $size -eq 17 -and $remote -eq 1 -and $null -eq $otherSize) "closed=$closed ratio=$saved TextSize=$size RemoteImages=$remote other TextSize=$otherSize"
+        Stop-Viewer $v
+
+        $v = Start-Viewer $hostKind (Join-Path $work 'main.md')
+        [void](Wait-Element $v $CT::Text '^Main$')
+        $restored = Wait-Ratio $v 'Main' $base (17 / 14)
+        Check "${hostKind}: the font size is used after a restart" (Near $restored (17 / 14)) "ratio=$restored"
+
+        $panel = Open-Settings $v
+        $advanced = if ($panel) { Find-In $panel $CT::Button '^Advanced' } else { $null }
+        if ($advanced) { Invoke-Element $advanced }
+        $codeFont = if ($panel) { Wait-Element $v $CT::ComboBox '^Code font$' 4 } else { $null }
+        $reset = if ($panel) { Find-In $panel $CT::Button '^Reset fonts to default$' } else { $null }
+        if ($reset) { Invoke-Element $reset }
+        $save = if ($panel) { Find-In $panel $CT::Button '^Save$' } else { $null }
+        if ($save) { Invoke-Element $save }
+        [void](Wait-Gone $v $CT::Window '^Settings$' 8)
+        [void](Wait-Element $v $CT::Text '^Main$' 10)
+        $back = Wait-Ratio $v 'Main' $base 1.0
+        $size = Get-Setting $hostKind 'TextSize'
+        Check "${hostKind}: Advanced shows the font choices; Reset and Save return to the default size" ([bool]$codeFont -and (Near $back 1.0) -and $size -eq 14) "code font list=$([bool]$codeFont) ratio=$back TextSize=$size"
+        Stop-Viewer $v
+    }
+
+    # The standalone viewer's menu item opens the same panel.
+    Set-RemoteImagesSetting 'exe' $null
+    $v = Start-Viewer 'exe' (Join-Path $work 'main.md')
+    [void](Wait-Element $v $CT::Text '^Main$')
+    [void][Win32.Behaviour]::SendMessage([IntPtr]$v.Win.Current.NativeWindowHandle, 0x0111, [IntPtr]1012, [IntPtr]::Zero)
+    $panel = Wait-Element $v $CT::Window '^Settings$' 6
+    Stop-Viewer $v
+    Check 'exe: File > Settings... opens the settings panel' ([bool]$panel) "panel=$([bool]$panel)"
+
+    # Settings that can't be saved: the panel says what failed and stays open.
+    Set-RemoteImagesSetting 'plugin' $null
+    $v = Start-Viewer 'plugin' (Join-Path $work 'main.md') $badIni
+    [void](Wait-Element $v $CT::Text '^Main$')
+    $panel = Open-Settings $v
+    $save = if ($panel) { Find-In $panel $CT::Button '^Save$' } else { $null }
+    if ($save) { Invoke-Element $save }
+    $alert = Wait-Element $v $CT::Text '^Not saved:' 6
+    $stillOpen = [bool](Find-Element $v $CT::Window '^Settings$')
+    $alertText = if ($alert) { $alert.Current.Name } else { '' }
+    Stop-Viewer $v
+    Check "plugin: settings that can't be saved: the panel says what failed and stays open" ([bool]$alert -and $alertText -match 'Text size' -and $alertText -match 'mdview\.ini' -and $alertText -notmatch 'other settings were saved' -and $stillOpen) "alert='$alertText' open=$stillOpen"
+
+}
+catch {
+    # An error in the test itself is a failure, never a silent pass.
+    $failures++
+    Write-Output ("FAIL  test aborted: {0} (line {1})" -f $_, $_.InvocationInfo.ScriptLineNumber)
 }
 finally {
     # Only windows this test started (tracked by process), never others.
