@@ -1601,6 +1601,64 @@ function Press-DialogButton($d, $name) {
     }
 
 
+    # ---- Drag and drop on the standalone viewer (#54). A small window here
+    # starts a real OLE drag with the files while a second thread moves the
+    # mouse onto MDView and releases it; DoDragDrop says whether MDView
+    # accepted the drop (Copy) or refused it (None).
+    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+public static class DragTest {
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+    public static string Drag(string[] files, int fromX, int fromY, int toX, int toY) {
+        string result = "timeout";
+        var t = new Thread(() => {
+            var form = new Form { StartPosition = FormStartPosition.Manual, Left = fromX - 40, Top = fromY - 40, Width = 80, Height = 80, TopMost = true, ShowInTaskbar = false, Text = "drag source" };
+            form.Shown += (s, e) => {
+                SetCursorPos(fromX, fromY);
+                mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
+                var mover = new Thread(() => {
+                    Thread.Sleep(400);
+                    for (int i = 1; i <= 25; i++) { SetCursorPos(fromX + (toX - fromX) * i / 25, fromY + (toY - fromY) * i / 25); mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); }
+                    Thread.Sleep(600);
+                    mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+                });
+                mover.IsBackground = true;
+                mover.Start();
+                var effect = form.DoDragDrop(new DataObject(DataFormats.FileDrop, files), DragDropEffects.Copy);
+                result = effect.ToString();
+                form.Close();
+            };
+            Application.Run(form);
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join(20000);
+        return result;
+    }
+}
+'@
+    Set-Content (Join-Path $work 'dropped.md') '# Dropped document' -NoNewline
+    Set-Content (Join-Path $work 'dropped.txt') 'not markdown' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+    [void](Wait-Element $v $CT::Text '^Second$')
+    $wr = $v.Win.Current.BoundingRectangle
+    $toX = [int]($wr.X + $wr.Width / 2); $toY = [int]($wr.Y + $wr.Height / 2)
+    $fromX = [int]([Math]::Max(60, $wr.X - 60)); $fromY = $toY
+    if ($fromX + 60 -gt $wr.X) { $fromX = [int]($wr.X + 20); $fromY = [int]($wr.Y + 5) }
+    $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY)
+    $two = [DragTest]::Drag(@((Join-Path $work 'dropped.md'), (Join-Path $work 'second.md')), $fromX, $fromY, $toX, $toY)
+    $stillSecond = [bool](Find-Element $v $CT::Text '^Second$')
+    $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY)
+    $opened = Wait-Element $v $CT::Text '^Dropped document$' 10
+    Stop-Viewer $v
+    Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt two files=$two document unchanged=$stillSecond"
+    Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md opened=$([bool]$opened)"
+
     # ---- File > Recent Files shows the path (#44), shortened in the middle,
     # with & shown, and the full path as a tooltip on the highlighted item.
     $deepDir = Join-Path $work 'recent\a-folder-with-a-long-name\another-folder-with-a-long-name\third-folder-name'

@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod dark_menu;
+mod droptarget;
 mod clipboard;
 mod contextmenu;
 mod files;
@@ -479,7 +480,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    DragFinish, DragQueryFileW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog, HDROP,
+    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog,
     IFileOpenDialog, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
     SHChangeNotify, SHCreateMemStream, SIGDN_FILESYSPATH, ShellExecuteW,
 };
@@ -1824,30 +1825,6 @@ fn load_file_into_webview(hwnd: HWND, file_path: &str) {
     add_to_recent_files(file_path);
 }
 
-/// Handle dropped files
-fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
-    unsafe {
-        // Get the first dropped file
-        let mut buffer = [0u16; 260];
-        let len = DragQueryFileW(hdrop, 0, Some(&mut buffer));
-        DragFinish(hdrop);
-
-        if len > 0 {
-            let path = String::from_utf16_lossy(&buffer[..len as usize]);
-            // Check if it's a markdown file
-            let ext = Path::new(&path)
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if ext == "md" || ext == "markdown" {
-                load_file_into_webview(hwnd, &path);
-            } else {
-                tell(hwnd, messages::Message::warning(format!("MDView only opens Markdown files (.md, .markdown):\n\n{path}")), None);
-            }
-        }
-    }
-}
-
 // ============================================================================
 // File Association Registration
 // ============================================================================
@@ -2287,15 +2264,13 @@ fn handle_message_reply(hwnd: HWND, msg: &std::collections::HashMap<String, Stri
 
 fn run_gui(title: &str, html: &str, file_path: Option<&str>) -> windows::core::Result<()> {
     unsafe {
-        // Initialize COM for this thread (required for WebView2)
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        if hr.is_err() {
-            return Err(windows::core::Error::from(hr));
-        }
+        // OLE (COM in a single-threaded apartment, plus drag and drop, #54):
+        // needed by WebView2 and by the drop target.
+        windows::Win32::System::Ole::OleInitialize(None)?;
 
         let result = run_gui_inner(title, html, file_path);
 
-        CoUninitialize();
+        windows::Win32::System::Ole::OleUninitialize();
         result
     }
 }
@@ -2360,7 +2335,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             .collect();
 
         let hwnd = CreateWindowExW(
-            WS_EX_ACCEPTFILES, // Enable drag & drop
+            WINDOW_EX_STYLE::default(), // drops: OLE drop target (droptarget.rs, #54)
             PCWSTR(class_name_wide.as_ptr()),
             PCWSTR(title_wide.as_ptr()),
             // Hidden until it is in place (#58).
@@ -2384,6 +2359,14 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         MAIN_HWND.with(|h| {
             *h.borrow_mut() = Some(hwnd);
         });
+
+        // Dropping a Markdown file on the window (#54).
+        if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
+            message_box(
+                Some(hwnd),
+                &messages::Message::warning(format!("Dropping files on this window will not work:\n\n{e}")),
+            );
+        }
 
         // Store current file path
         if let Some(path) = file_path {
@@ -2487,6 +2470,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
+/// A Markdown file was dropped on the window (#54): open it.
+const WM_MDVIEW_DROP: u32 = WM_APP + 4;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2582,7 +2567,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
-                        // Disable external drop so our WM_DROPFILES handler works
+                        // WebView2 must not take drops itself: MDView's drop target
+                        // (droptarget.rs) decides what can be dropped (#54).
                         if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
                             let _ = controller4.SetAllowExternalDrop(false);
                         }
@@ -2935,6 +2921,12 @@ unsafe extern "system" fn window_proc(
             linkstatus::hide(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        WM_MDVIEW_DROP => {
+            if let Some(path) = droptarget::take_dropped() {
+                load_file_into_webview(hwnd, &path.to_string_lossy());
+            }
+            LRESULT(0)
+        }
         WM_MDVIEW_MENU => {
             show_context_menu(hwnd);
             LRESULT(0)
@@ -3026,11 +3018,6 @@ unsafe extern "system" fn window_proc(
                 }
                 _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
-        }
-        WM_DROPFILES => {
-            let hdrop = HDROP(wparam.0 as _);
-            handle_drop_files(hwnd, hdrop);
-            LRESULT(0)
         }
         WM_DESTROY => {
             // Save window position before closing
