@@ -127,7 +127,7 @@ $form.Show()
 [void][ListerHost]::ShowWindow($form.Handle, 1)
 [System.Windows.Forms.Application]::DoEvents()
 
-$child = [ListerHost]::Load($form.Handle, (Resolve-Path $Doc).Path)
+$child = [ListerHost]::Load($form.Handle, (Resolve-Path $Doc).ProviderPath)
 if ($child -eq [IntPtr]::Zero) { Write-Status 'load-failed'; $form.Dispose(); exit 2 }
 Write-Status 'loaded'
 

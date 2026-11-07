@@ -66,6 +66,8 @@ thread_local! {
 
 /// Posted to a viewer window to handle its queued links (see `queue_link`).
 const WM_MDVIEW_LINK: u32 = WM_APP + 1;
+/// A file from a network location was blocked: tell the page.
+const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 
 pub fn create_viewer(
     parent: HWND,
@@ -150,84 +152,9 @@ fn register_window_class() -> windows::core::Result<()> {
     }
 }
 
-fn absolute_path(path: &Path) -> Option<std::path::PathBuf> {
-    if path.is_absolute() {
-        Some(path.to_path_buf())
-    } else {
-        std::env::current_dir().ok().map(|cwd| cwd.join(path))
-    }
-}
-
-fn get_path_root(path: &Path) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-
-    let absolute = absolute_path(path)?;
-    let mut components = absolute.components();
-
-    match components.next()? {
-        Component::Prefix(prefix) => {
-            if !matches!(components.next(), Some(Component::RootDir)) {
-                return None;
-            }
-
-            let mut root = std::path::PathBuf::from(prefix.as_os_str());
-            root.push(std::path::MAIN_SEPARATOR.to_string());
-            Some(root)
-        }
-        Component::RootDir => Some(std::path::PathBuf::from(
-            std::path::MAIN_SEPARATOR.to_string(),
-        )),
-        _ => None,
-    }
-}
-
-fn path_relative_to_root(path: &Path) -> Option<String> {
-    use std::path::Component;
-
-    let absolute = absolute_path(path)?;
-    let mut saw_root = false;
-    let mut parts = Vec::new();
-
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(_) => {}
-            Component::RootDir => saw_root = true,
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = parts.pop();
-            }
-        }
-    }
-
-    if !saw_root {
-        return None;
-    }
-
-    Some(parts.join("/"))
-}
-
-fn percent_encode_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-
-    encoded
-}
-
+/// The URL a document is shown at (see `vpath`).
 fn virtual_url_for_file(path: &Path) -> Option<String> {
-    let relative = path_relative_to_root(path)?;
-    Some(format!(
-        "https://mdview.example/{}",
-        percent_encode_path(&relative)
-    ))
+    crate::vpath::document_url(path)
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -312,14 +239,20 @@ fn create_virtual_resource_response(
                     let remote_images = remote_images_for(hwnd, file_path);
                     // The plugin never asks to register (#37): TC is the host.
                     let bars = DOCUMENT_CHOICES.with(|c| {
-                        let mut choices = c.borrow_mut();
+                        let mut all = c.borrow_mut();
+                        let choices = all.entry(hwnd.0 as isize).or_default();
+                        choices.page_served(file_path);
+                        let ask_network_files = crate::settings::network_files_setting()
+                            == crate::settings::AskSetting::Ask
+                            && !choices.network_loaded(file_path);
                         crate::markdown::document_bars(&crate::markdown::PageBars {
                             remote_images,
                             ask_to_register: false,
-                            closed: choices.entry(hwnd.0 as isize).or_default().closed_bars(file_path),
+                            ask_network_files,
+                            closed: choices.closed_bars(file_path),
                         })
                     });
-                    (crate::markdown::markdown_to_html(&markdown_content), remote_images, bars)
+                    (crate::markdown::markdown_to_page_html(&markdown_content, file_path), remote_images, bars)
                 }
                 Err(reason) => (
                     crate::markdown::read_error_html(&file_path.display().to_string(), &reason),
@@ -397,11 +330,11 @@ fn remote_request_allowed(hwnd: HWND, uri: &str, context: COREWEBVIEW2_WEB_RESOU
 /// once" if the user chose that for this document in the banner.
 fn remote_images_for(hwnd: HWND, file_path: &Path) -> crate::markdown::RemoteImages {
     use crate::markdown::RemoteImages;
-    use crate::settings::RemoteImagesSetting;
+    use crate::settings::AskSetting;
     match crate::settings::remote_images_setting() {
-        RemoteImagesSetting::Always => RemoteImages::Allowed,
-        RemoteImagesSetting::Never => RemoteImages::Blocked,
-        RemoteImagesSetting::Ask => {
+        AskSetting::Always => RemoteImages::Allowed,
+        AskSetting::Never => RemoteImages::Blocked,
+        AskSetting::Ask => {
             let once = REMOTE_IMAGES_ONCE
                 .with(|o| o.borrow().get(&(hwnd.0 as isize)).is_some_and(|p| p == file_path));
             if once { RemoteImages::Allowed } else { RemoteImages::AskToLoad }
@@ -925,6 +858,10 @@ unsafe extern "system" fn window_proc(
             handle_queued_links(hwnd);
             LRESULT(0)
         }
+        WM_MDVIEW_NETWORK => {
+            post_network_blocked(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => LRESULT(0),
         WM_NCDESTROY => {
             cleanup_viewer_state(hwnd);
@@ -935,70 +872,13 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                decoded.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-
-    String::from_utf8_lossy(&decoded).to_string()
-}
-
-fn percent_decode_repeated(input: &str) -> String {
-    let mut current = input.to_string();
-
-    for _ in 0..3 {
-        let decoded = percent_decode(&current);
-        if decoded == current {
-            break;
-        }
-        current = decoded;
-    }
-
-    current
-}
-
+/// The file a URL from the page stands for while this viewer's file is
+/// shown, or None if it does not name a plain file (see `vpath`).
 fn resolve_virtual_mdview_url(hwnd: HWND, url: &str) -> Option<String> {
-    let relative_path = url
-        .strip_prefix("https://mdview.example/")
-        .or_else(|| url.strip_prefix("http://mdview.example/"))?
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
-
-    if relative_path.is_empty() {
-        return None;
-    }
-
-    let decoded_path = percent_decode_repeated(relative_path);
-
     CURRENT_FILES.with(|f| {
         let files = f.borrow();
-        let current_path = files.get(&(hwnd.0 as isize))?;
-        let root_dir = get_path_root(Path::new(current_path))?;
-        let target = root_dir.join(decoded_path);
-        Some(target.to_string_lossy().to_string())
+        let current = files.get(&(hwnd.0 as isize))?;
+        crate::vpath::resolve(url, Path::new(current)).map(|path| path.to_string_lossy().into_owned())
     })
 }
 
@@ -1007,8 +887,16 @@ fn create_response_for_virtual_url(
     environment: &ICoreWebView2Environment,
     url: &str,
 ) -> Option<ICoreWebView2WebResourceResponse> {
-    let resolved_path = resolve_virtual_mdview_url(hwnd, url)?;
+    // A URL that names no plain file is answered here, never sent anywhere.
+    let Some(resolved_path) = resolve_virtual_mdview_url(hwnd, url) else {
+        return create_not_found_response(environment);
+    };
     let file_path = Path::new(&resolved_path);
+    // Decided before the file is touched: MDView does not connect to a
+    // network location until the user agrees.
+    if !network_file_allowed(hwnd, file_path) {
+        return create_blocked_response(environment);
+    }
     if !file_path.exists() {
         return create_not_found_response(environment);
     }
@@ -1018,8 +906,105 @@ fn create_response_for_virtual_url(
     create_virtual_resource_response(hwnd, environment, file_path, dark_mode)
 }
 
+/// Whether a file this viewer's page asks for may be read. Files on another
+/// share or a network drive wait for the user's answer in the network bar.
+fn network_file_allowed(hwnd: HWND, path: &Path) -> bool {
+    use crate::settings::AskSetting;
+    use crate::vpath::Location;
+    let key = hwnd.0 as isize;
+    let Some(current) = CURRENT_FILES.with(|f| f.borrow().get(&key).cloned()) else { return false };
+    let location = match crate::vpath::location(path, Path::new(&current), crate::vpath::drive_kind) {
+        Some(Location::Network(location)) => location,
+        Some(Location::SameRoot | Location::Local) => return true,
+        None => return false,
+    };
+    match crate::settings::network_files_setting() {
+        AskSetting::Always => true,
+        AskSetting::Never => false,
+        AskSetting::Ask => DOCUMENT_CHOICES.with(|c| {
+            let mut all = c.borrow_mut();
+            let choices = all.entry(key).or_default();
+            let Some(document) = choices.document().map(Path::to_path_buf) else { return false };
+            if choices.network_loaded(&document) {
+                return true;
+            }
+            if choices.note_network_blocked(&document, &location) {
+                log_debug(&format!("blocked a file from network location {location}"));
+                // Told to the page from the window, not from inside this
+                // WebView2 callback.
+                let _ = unsafe { PostMessageW(Some(hwnd), WM_MDVIEW_NETWORK, WPARAM(0), LPARAM(0)) };
+            }
+            false
+        }),
+    }
+}
+
+/// The network location (another share or a network drive) `path` is on,
+/// seen from this viewer's document; None for local files.
+fn network_location(hwnd: HWND, path: &Path) -> Option<String> {
+    let current = CURRENT_FILES.with(|f| f.borrow().get(&(hwnd.0 as isize)).cloned())?;
+    match crate::vpath::location(path, Path::new(&current), crate::vpath::drive_kind)? {
+        crate::vpath::Location::Network(location) => Some(location),
+        crate::vpath::Location::SameRoot | crate::vpath::Location::Local => None,
+    }
+}
+/// Tell this viewer's page which network locations were blocked, for its
+/// network bar. The page ignores locations it already lists.
+fn post_network_blocked(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    let locations = DOCUMENT_CHOICES.with(|c| {
+        let mut all = c.borrow_mut();
+        let choices = all.entry(key).or_default();
+        match choices.document().map(Path::to_path_buf) {
+            Some(document) => choices.network_blocked(&document),
+            None => Vec::new(),
+        }
+    });
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&key) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                for location in locations {
+                    let json: Vec<u16> = crate::markdown::network_blocked_message(&location)
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(json.as_ptr())) };
+                }
+            }
+        }
+    });
+}
+
+/// The user's answer in the network bar.
+fn handle_network_files_choice(hwnd: HWND, choice: &str, document: &Path) {
+    use crate::settings::AskSetting;
+    let save = |setting| match crate::settings::set_network_files_setting(setting) {
+        Ok(()) => true,
+        Err(e) => {
+            show_error(hwnd, &format!("Could not save the network files setting:\n\n{e}"));
+            false
+        }
+    };
+    match choice {
+        "once" => {
+            DOCUMENT_CHOICES.with(|c| c.borrow_mut().entry(hwnd.0 as isize).or_default().load_network(document));
+            reload_page(hwnd);
+        }
+        "always" => {
+            if save(AskSetting::Always) {
+                reload_page(hwnd);
+            }
+        }
+        "never" => {
+            save(AskSetting::Never);
+        }
+        _ => {}
+    }
+}
+
+/// Any of MDView's own URLs: served by the host, never fetched from the web.
 fn is_internal_virtual_url(url: &str) -> bool {
-    url.starts_with("https://mdview.example/") || url.starts_with("http://mdview.example/")
+    crate::vpath::is_virtual_url(url)
 }
 
 /// Only MDView's own pages may be shown: Markdown documents on the virtual
@@ -1027,7 +1012,7 @@ fn is_internal_virtual_url(url: &str) -> bool {
 /// else (script or <meta refresh> navigation, other files, other sites) is
 /// cancelled; a link the user clicked goes through `queue_link`.
 fn navigation_allowed(hwnd: HWND, url: &str) -> bool {
-    if is_internal_virtual_url(url) {
+    if crate::vpath::is_document_origin(url) {
         return resolve_virtual_mdview_url(hwnd, url)
             .is_some_and(|path| crate::links::is_markdown(Path::new(&path)));
     }
@@ -1039,7 +1024,7 @@ fn navigation_allowed(hwnd: HWND, url: &str) -> bool {
 
 /// Whether a message comes from a page MDView itself loaded.
 fn is_trusted_page(hwnd: HWND, source: &str) -> bool {
-    if is_internal_virtual_url(source) {
+    if crate::vpath::is_document_origin(source) {
         return resolve_virtual_mdview_url(hwnd, source)
             .is_some_and(|path| crate::links::is_markdown(Path::new(&path)));
     }
@@ -1066,7 +1051,7 @@ fn handle_queued_links(hwnd: HWND) {
         let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
         let action = crate::links::classify_url(&url, |u| {
             resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from)
-        });
+        }, |p| network_location(hwnd, p));
         crate::links::perform(action, owner, |path| {
             load_file_into_viewer(hwnd, &path.to_string_lossy())
         });
@@ -1082,6 +1067,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
                 queue_link(hwnd, url.clone());
             }
         }
+        Some("networkStatus") => post_network_blocked(hwnd),
         Some("bar") => {
             let (Some(bar), Some(choice)) = (msg.get("bar"), msg.get("choice")) else { return };
             let offered = PAGE_BARS.with(|b| {
@@ -1110,6 +1096,11 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
                 crate::markdown::REMOTE_IMAGES_BAR => {
                     if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
                         handle_remote_images_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
+                crate::markdown::NETWORK_FILES_BAR => {
+                    if let Some(path) = resolve_virtual_mdview_url(hwnd, source) {
+                        handle_network_files_choice(hwnd, choice, Path::new(&path));
                     }
                 }
                 _ => {}
@@ -1165,16 +1156,16 @@ fn reload_page(hwnd: HWND) {
 
 /// The user's answer in the remote-images banner.
 fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
-    use crate::settings::RemoteImagesSetting;
+    use crate::settings::AskSetting;
     let reload = match choice {
         "once" => {
             REMOTE_IMAGES_ONCE
                 .with(|o| o.borrow_mut().insert(hwnd.0 as isize, document.to_path_buf()));
             true
         }
-        "always" => save_remote_images_setting(hwnd, RemoteImagesSetting::Always),
+        "always" => save_remote_images_setting(hwnd, AskSetting::Always),
         "never" => {
-            save_remote_images_setting(hwnd, RemoteImagesSetting::Never);
+            save_remote_images_setting(hwnd, AskSetting::Never);
             false
         }
         _ => false,
@@ -1184,7 +1175,7 @@ fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
     }
 }
 
-fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::RemoteImagesSetting) -> bool {
+fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::AskSetting) -> bool {
     match crate::settings::set_remote_images_setting(setting) {
         Ok(()) => true,
         Err(e) => {
@@ -1238,12 +1229,48 @@ mod tests {
         hwnd
     }
 
-    // Compare as paths: Windows accepts both `\` and `/` as separators, so
-    // `C:\docs/img/a.png` and `C:\docs\img\a.png` name the same file.
+    // Compared as text: the path is shown to the user (link questions, the
+    // window title, recent files), so it must use `\` only (#49).
     fn assert_resolves(hwnd: HWND, url: &str, expected: &str) {
         let resolved = resolve_virtual_mdview_url(hwnd, url)
             .unwrap_or_else(|| panic!("{url} did not resolve to a file"));
-        assert_eq!(Path::new(&resolved), Path::new(expected), "resolved {url} to {resolved}");
+        assert_eq!(resolved, expected, "resolved {url}");
+    }
+
+    fn assert_refused(hwnd: HWND, url: &str) {
+        let resolved = resolve_virtual_mdview_url(hwnd, url);
+        assert_eq!(resolved, None, "{url} must not resolve to a file");
+    }
+
+    // A URL from a document may only name a file below the root it maps to.
+    // Encoded separators, drive letters, `..`, devices, pipes and alternate
+    // data streams must never become a path elsewhere.
+    #[test]
+    fn test_urls_cannot_escape_to_other_paths() {
+        let hwnd = viewer_showing(r"C:\docs\note.md");
+        for url in [
+            "https://mdview.example/%5C%5Cserver%5Cshare%5Cx.png",
+            "https://mdview.example/%2F%2Fserver%2Fshare%2Fx.png",
+            "https://mdview.example/Q%3A%5Cx.png",
+            "https://mdview.example/Q%3A/x.png",
+            "https://mdview.example/docs/..%5C..%5Cx.png",
+            "https://mdview.example/docs/%2E%2E/x.png",
+            "https://mdview.example/%5C%5C.%5Cpipe%5Cp",
+            "https://mdview.example/%5C%5C%3F%5CC%3A%5Cx.png",
+            "https://mdview.example/docs/a.png:secret",
+            "https://mdview.example/docs/a.png%3Asecret",
+            "https://mdview.example/docs/CON",
+            "https://mdview.example/docs/nul.txt",
+            "https://mdview.example/docs/COM1.md",
+            "https://mdview.example/docs/x.png.",
+            "https://mdview.example/docs/x.png%20",
+            "https://mdview.example/docs//x.png",
+        ] {
+            assert_refused(hwnd, url);
+        }
+        // Decoded once only: a double-encoded `\` is a literal name on the
+        // document's own drive, never a separator.
+        assert_resolves(hwnd, "https://mdview.example/%255C%255Cserver%255Cshare%255Cx.png", r"C:\%5C%5Cserver%5Cshare%5Cx.png");
     }
 
     #[test]

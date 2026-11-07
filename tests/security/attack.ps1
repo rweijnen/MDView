@@ -154,6 +154,18 @@ function Invoke-Link($root, $nameRegex) {
     $true
 }
 
+function Get-PipeName($id) { "mdview-attack-$token-$id" }
+# Listens on the case's named pipe until the case is over; 'CONNECTED' if
+# anything opened it.
+function Start-PipeListener($id) {
+    $cancel = [System.Threading.CancellationTokenSource]::new()
+    $job = Start-ThreadJob -ArgumentList (Get-PipeName $id), $cancel -ScriptBlock {
+        param($name, $cancel)
+        $s = [System.IO.Pipes.NamedPipeServerStream]::new($name, 'InOut', 8, 'Byte', 'Asynchronous')
+        try { $s.WaitForConnectionAsync($cancel.Token).Wait(); 'CONNECTED' } catch { 'no connection' } finally { $s.Dispose() }
+    }
+    @{ Job = $job; Cancel = $cancel }
+}
 function Get-CalcIds { @(Get-Process -Name calc, CalculatorApp -ErrorAction SilentlyContinue | ForEach-Object Id) }
 $downloads = Join-Path $env:USERPROFILE 'Downloads'
 
@@ -181,6 +193,14 @@ $cases = @(
     @{ Id = 'P1'; Safe = 'the image is not requested until the user allows it'; Title = 'remote image loads without asking (tracking pixel)'; Doc = "# P1`n`n![pixel]($srv/pixel.png?c=P1)"; Detect = 'hits-pixel' }
     @{ Id = 'U1'; Safe = 'the script is not started (a real click shows a refusal message)'; Title = 'clicking a link to a local .cmd starts it'; Canary = $true; Click = 'run the canary'; Doc = "# U1`n`n[run the canary](canary-U1.cmd)" }
     @{ Id = 'TC1'; Safe = 'the search text is only searched for, never run'; Title = 'TC search text breaks out into script'; PluginOnly = $true; Search = "x`"); $(Mark 'TC1'); (`""; Doc = "# TC1`n`nsearch target x" }
+    # Paths from documents (#49): a URL must never name a path outside the
+    # document's own files. Each case points at a named pipe the test listens
+    # on; network files are allowed, so only the path rules can stop it.
+    @{ Id = 'E1'; Safe = 'MDView does not connect to the pipe'; Title = 'image with encoded \\.\pipe\ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E1`n`n![e1]($('../' * 30)%5C%5C.%5Cpipe%5C$(Get-PipeName 'E1'))" }
+    @{ Id = 'E2'; Safe = 'MDView does not connect to the pipe'; Title = 'double-encoded \\.\pipe\ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E2`n`n![e2]($('../' * 30)%255C%255C.%255Cpipe%255C$(Get-PipeName 'E2'))" }
+    @{ Id = 'E3'; Safe = 'MDView does not connect to the pipe'; Title = 'CSS url() with encoded //./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E3`n`n<div style=`"width:10px;height:10px;background:url($('../' * 30)%2F%2F.%2Fpipe%2F$(Get-PipeName 'E3'))`"></div>" }
+    @{ Id = 'E4'; Safe = 'MDView does not connect to the pipe'; Title = 'image with an absolute \\.\pipe\ or file://./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E4`n`n![e4a](\\\\.\pipe\$(Get-PipeName 'E4'))`n`n![e4b](file:////./pipe/$(Get-PipeName 'E4'))`n`n![e4c](https://unc.mdview.example/./pipe/$(Get-PipeName 'E4'))" }
+    @{ Id = 'E5'; Safe = 'MDView does not connect to the pipe (a real click shows a refusal message)'; Title = 'clicking a link to file://./pipe/ opens the pipe'; Detect = 'pipe'; AllowNetwork = $true; Click = 'e5 pipe link'; Doc = "# E5`n`n[e5 pipe link](<file://./pipe/$(Get-PipeName 'E5')>)" }
 )
 $pages['S5'] = "<html><body>left MDView (S5)</body></html>"
 $pages['N1'] = "<html><body>left MDView (N1)</body></html>"
@@ -190,7 +210,7 @@ Set-Content -Path (Join-Path $attack 'evil-F3.html') -Value "<html><body><p>loca
 
 # ---------------------------------------------------------------- registry safety
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages'
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'NetworkFiles'
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
@@ -221,6 +241,15 @@ function Invoke-Case($case, $hostKind) {
     $hitsBefore = $hits.Count
     $dlBefore = @(Get-ChildItem $downloads -Filter "*$token*" -ErrorAction SilentlyContinue)
     Set-TestRegistry
+    # Network files allowed in both programs' settings (registry; the plugin's
+    # mdview.ini next to its status file), so only the path rules count.
+    $pluginIni = Join-Path $attack 'mdview.ini'
+    Remove-Item $pluginIni -ErrorAction SilentlyContinue
+    if ($case.AllowNetwork) {
+        Set-ItemProperty -Path $key -Name NetworkFiles -Value 1 -Type DWord
+        Set-Content -Path $pluginIni -Value "[MDView]`r`nNetworkFiles=1`r`n" -NoNewline
+    }
+    $pipe = if ($case.Detect -eq 'pipe') { Start-PipeListener $id } else { $null }
 
     $status = $null; $statusFile = Join-Path $attack "status-$id-$hostKind.txt"
     # Own TEMP, so the viewer gets its own WebView2 data folder (%TEMP%\MDView_WebView2)
@@ -269,6 +298,9 @@ function Invoke-Case($case, $hostKind) {
     if ($hostKind -eq 'plugin' -and (Test-Path $statusFile)) { $status = Get-Content $statusFile -Raw }
     if (-not $proc.HasExited) { $proc | Stop-Process -Force; $proc.WaitForExit(5000) | Out-Null }
     Restore-Registry
+    Remove-Item $pluginIni -ErrorAction SilentlyContinue
+    $pipeResult = $null
+    if ($pipe) { $pipe.Cancel.Cancel(); $pipeResult = Receive-Job $pipe.Job -Wait; Remove-Job $pipe.Job -Force }
 
     $newHits = @($hits.ToArray() | Select-Object -Skip $hitsBefore)
     $newCalc = @(Get-CalcIds | Where-Object { $calcBefore -notcontains $_ })
@@ -295,6 +327,7 @@ function Invoke-Case($case, $hostKind) {
     }
     if ($id -in 'S5', 'B6') { if (@($newHits | Where-Object { $_ -match "/page-$id" }).Count) { $observed += "navigated to server page /page-$id"; $worked = $true } }
     if ($id -eq 'U1' -and $dlNew.Count) { $observed += 'canary saved to Downloads (deleted)'; $worked = $true }
+    if ($pipeResult -eq 'CONNECTED') { $observed += "MDView connected to the named pipe $(Get-PipeName $id)"; $worked = $true }
     if ($dialogs.Count) { $observed += "dialog: $($dialogs -join ' | ')" }
     # A case that could not run is an error, never a pass.
     $notRun = $null
