@@ -62,12 +62,18 @@ thread_local! {
     static PAGE_BARS: RefCell<HashMap<isize, Vec<crate::markdown::Bar>>> = RefCell::new(HashMap::new());
     /// Per viewer: what the user chose while the document being shown is open (#24).
     static DOCUMENT_CHOICES: RefCell<HashMap<isize, crate::markdown::DocumentChoices>> = RefCell::new(HashMap::new());
+    /// Viewers with a settings or help panel open: no right-click menu (#59).
+    static PANEL_OPEN: RefCell<std::collections::HashSet<isize>> = RefCell::new(std::collections::HashSet::new());
+    /// Per viewer: the right-click waiting for its menu (see `show_context_menu`).
+    static PENDING_MENU: RefCell<HashMap<isize, crate::contextmenu::Request>> = RefCell::new(HashMap::new());
 }
 
 /// Posted to a viewer window to handle its queued links (see `queue_link`).
 const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 /// A file from a network location was blocked: tell the page.
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
+/// A right-click in the page: show MDView's menu (#59).
+const WM_MDVIEW_MENU: u32 = WM_APP + 3;
 
 pub fn create_viewer(
     parent: HWND,
@@ -414,7 +420,8 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             if let Ok(settings) = webview.Settings() {
                                 let _ = settings.SetIsScriptEnabled(true); // needed for Ctrl+click and ESC handling
                                 let _ = settings.SetIsWebMessageEnabled(true); // needed for link clicks and ESC handling
-                                let _ = settings.SetAreDefaultContextMenusEnabled(false); // disable right-click menu
+                                // Needed for ContextMenuRequested; MDView shows its own menu (#59).
+                                let _ = settings.SetAreDefaultContextMenusEnabled(true);
                                 let _ = settings.SetAreDevToolsEnabled(false); // disable F12 dev tools
                                 let _ = settings.SetIsStatusBarEnabled(false); // disable status bar
                                 let _ = settings.SetAreHostObjectsAllowed(false);
@@ -625,6 +632,25 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             );
                             let mut token: i64 = 0;
                             let _ = webview.add_WebMessageReceived(&handler, &mut token);
+
+                            // MDView's own right-click menu instead of WebView2's (#59).
+                            let menu_host = hwnd;
+                            let key = hwnd.0 as isize;
+                            if let Err(e) = crate::contextmenu::register(
+                                &webview,
+                                menu_host,
+                                move || PANEL_OPEN.with(|p| p.borrow().contains(&key)),
+                                move |request| {
+                                    PENDING_MENU.with(|m| m.borrow_mut().insert(key, request));
+                                    let _ = PostMessageW(Some(menu_host), WM_MDVIEW_MENU, WPARAM(0), LPARAM(0));
+                                },
+                            ) {
+                                // Without it, no menu at all rather than WebView2's (Inspect, Save as).
+                                if let Ok(settings) = webview.Settings() {
+                                    let _ = settings.SetAreDefaultContextMenusEnabled(false);
+                                }
+                                log_debug(&format!("no right-click menu: {e}"));
+                            }
                         }
 
                         // Add accelerator key handler to pass F3, F5, F7 etc. to parent (TC)
@@ -645,10 +671,11 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             || key_event_kind
                                                 == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
                                         {
-                                            // Pass F3, F5, F7, N keys to parent (Total Commander)
+                                            // Pass F3, F5, F7 to Total Commander. N / P / 1-9 come from
+                                            // the page, which knows whether a field has focus (#59).
                                             let pass_to_parent = matches!(
                                                 VIRTUAL_KEY(key as u16),
-                                                VK_F3 | VK_F5 | VK_F7 | VK_N
+                                                VK_F3 | VK_F5 | VK_F7
                                             );
 
                                             if pass_to_parent {
@@ -793,6 +820,8 @@ fn cleanup_viewer_state(hwnd: HWND) {
     PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.borrow_mut().remove(&key));
     PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
     DOCUMENT_CHOICES.with(|c| c.borrow_mut().remove(&key));
+    PANEL_OPEN.with(|p| p.borrow_mut().remove(&key));
+    PENDING_MENU.with(|m| m.borrow_mut().remove(&key));
 }
 
 fn unregister_window_class_if_unused() {
@@ -833,6 +862,58 @@ pub fn execute_script(hwnd: HWND, script: &str) {
     });
 }
 
+/// Run a script and wait for its result (JSON), pumping messages meanwhile as
+/// `init_webview2_sync` does: TC's search needs to know whether text was
+/// found before it returns. `None` if it failed or took longer than `timeout`.
+pub fn execute_script_sync(hwnd: HWND, script: &str, timeout: Duration) -> Option<String> {
+    let webview = CONTROLLERS.with(|c| {
+        c.borrow().get(&(hwnd.0 as isize)).and_then(|controller| unsafe { controller.CoreWebView2() }.ok())
+    })?;
+    let result: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+    let done = result.clone();
+    let handler = webview2_com::ExecuteScriptCompletedHandler::create(Box::new(move |error, json: String| {
+        *done.borrow_mut() = Some(error.ok().map(|_| json));
+        Ok(())
+    }));
+    let script_wide = pwstr_from_str(script);
+    if unsafe { webview.ExecuteScript(PCWSTR(script_wide.as_ptr()), &handler) }.is_err() {
+        return None;
+    }
+    let start = Instant::now();
+    unsafe {
+        while result.borrow().is_none() {
+            if start.elapsed() > timeout {
+                log_debug("execute_script_sync: timed out");
+                return None;
+            }
+            let mut msg = MSG::default();
+            if PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if msg.message == WM_QUIT {
+                    // Leave the quit for TC's own message loop.
+                    PostQuitMessage(msg.wParam.0 as i32);
+                    return None;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    result.borrow_mut().take().flatten()
+}
+
+/// WebView2's print dialog (#59): printer choice and preview.
+pub fn show_print_ui(hwnd: HWND) -> Result<(), String> {
+    let webview = CONTROLLERS
+        .with(|c| c.borrow().get(&(hwnd.0 as isize)).and_then(|controller| unsafe { controller.CoreWebView2() }.ok()))
+        .ok_or_else(|| "the document is not shown".to_string())?;
+    let webview16: ICoreWebView2_16 = webview
+        .cast()
+        .map_err(|_| "this version of the WebView2 Runtime cannot print; please update it".to_string())?;
+    unsafe { webview16.ShowPrintUI(COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER) }.map_err(|e| e.message().to_string())
+}
+
 fn resize_webview(hwnd: HWND) {
     CONTROLLERS.with(|c| {
         if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
@@ -859,6 +940,10 @@ unsafe extern "system" fn window_proc(
         }
         WM_MDVIEW_LINK => {
             handle_queued_links(hwnd);
+            LRESULT(0)
+        }
+        WM_MDVIEW_MENU => {
+            show_context_menu(hwnd);
             LRESULT(0)
         }
         WM_MDVIEW_NETWORK => {
@@ -1001,6 +1086,67 @@ fn open_settings(hwnd: HWND) {
     post_to_page(hwnd, &crate::settings_page::show_message(&page, &notes, &crate::fonts::installed(), true, dark));
 }
 
+/// F1 or the menu (#59): the page shows the plugin's keys.
+fn open_help(hwnd: HWND) {
+    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    post_to_page(hwnd, &crate::shortcuts::help_message(true, dark));
+}
+
+/// A key for Total Commander's Lister (N / P, 1-9, F7), as if pressed there.
+fn post_key_to_lister(hwnd: HWND, vk: u16) {
+    if let Ok(lister) = unsafe { GetParent(hwnd) } {
+        if !lister.is_invalid() {
+            let _ = unsafe { PostMessageW(Some(lister), WM_KEYDOWN, WPARAM(vk as usize), LPARAM(0)) };
+        }
+    }
+}
+
+/// The right-click menu (#59), shown outside the WebView2 event that
+/// reported the click.
+fn show_context_menu(hwnd: HWND) {
+    let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize))) else { return };
+    let items = crate::shortcuts::menu_items(request.link.is_some(), request.has_selection, crate::settings::zoom(), true);
+    if let Some(command) = crate::contextmenu::show(hwnd, request.screen, &items) {
+        run_menu_command(hwnd, command, request.link.as_deref());
+    }
+}
+
+fn run_menu_command(hwnd: HWND, command: crate::shortcuts::MenuCommand, link: Option<&str>) {
+    use crate::shortcuts::MenuCommand::*;
+    match command {
+        OpenLink => {
+            if let Some(url) = link {
+                queue_link(hwnd, url.to_string());
+            }
+        }
+        CopyLink => {
+            let Some(url) = link else { return };
+            let action = crate::links::classify_url(
+                url,
+                |u| resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from),
+                |p| network_location(hwnd, p),
+            );
+            if let Err(e) = crate::clipboard::set_text(hwnd, &crate::linkstatus::describe_url(url, "", &action)) {
+                show_error(hwnd, &format!("Could not copy the link address:\n\n{e}"));
+            }
+        }
+        Copy => execute_script(hwnd, "document.execCommand('copy')"),
+        SelectAll => execute_script(hwnd, "document.execCommand('selectAll')"),
+        // Total Commander's own search, as F7 in Lister.
+        Find => post_key_to_lister(hwnd, windows::Win32::UI::Input::KeyboardAndMouse::VK_F7.0),
+        Print => {
+            if let Err(e) = show_print_ui(hwnd) {
+                show_error(hwnd, &format!("Could not open the print dialog:\n\n{e}"));
+            }
+        }
+        ZoomIn => handle_zoom(hwnd, "in"),
+        ZoomOut => handle_zoom(hwnd, "out"),
+        ZoomReset => handle_zoom(hwnd, "reset"),
+        Settings => open_settings(hwnd),
+        Help => open_help(hwnd),
+    }
+}
+
 /// Save in the settings panel: everything is checked first; then each value is
 /// saved, and the panel says what could not be. The document is reloaded so
 /// its bars follow the new settings.
@@ -1138,6 +1284,16 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
         }
         Some("networkStatus") => post_network_blocked(hwnd),
         Some("openSettings") => open_settings(hwnd),
+        Some("openHelp") => open_help(hwnd),
+        Some("panel") => PANEL_OPEN.with(|p| {
+            let key = hwnd.0 as isize;
+            if msg.get("open").map(String::as_str) == Some("true") { p.borrow_mut().insert(key); } else { p.borrow_mut().remove(&key); }
+        }),
+        Some("listerKey") => {
+            if let Some(vk) = msg.get("key").and_then(|k| crate::shortcuts::lister_key(k)) {
+                post_key_to_lister(hwnd, vk);
+            }
+        }
         Some("saveSettings") => save_settings(hwnd, msg),
         Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
             None => crate::linkstatus::hide(hwnd),
@@ -1273,7 +1429,7 @@ fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::AskSetting) 
 }
 
 /// Something the user asked for failed: say so, owned by TC's Lister window.
-fn show_error(hwnd: HWND, message: &str) {
+pub(crate) fn show_error(hwnd: HWND, message: &str) {
     log_debug(message);
     let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
     let text: Vec<u16> = format!("{message}\0").encode_utf16().collect();

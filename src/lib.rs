@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
 
+mod clipboard;
+mod contextmenu;
 mod files;
 mod fonts;
 mod links;
@@ -7,6 +9,7 @@ mod linkstatus;
 mod markdown;
 mod settings;
 mod settings_page;
+mod shortcuts;
 mod viewer;
 mod vpath;
 mod zone;
@@ -138,25 +141,70 @@ fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
 
 // Additional optional exports for enhanced functionality
 
-// Search parameter flags
-const LP_FORWARDONLY: c_int = 2;
-const LP_WHOLEWORDS: c_int = 4;
-const LP_MATCHCASE: c_int = 8;
+// WLX SDK return values and flags (listplug.h).
+const LISTPLUGIN_OK: c_int = 0;
+const LISTPLUGIN_ERROR: c_int = 1;
+const LCS_FINDFIRST: c_int = 1;
+const LCS_MATCHCASE: c_int = 2;
+const LCS_WHOLEWORDS: c_int = 4;
+const LCS_BACKWARDS: c_int = 8;
+const LC_COPY: c_int = 1;
+const LC_SELECTALL: c_int = 3;
 
-/// Search for text in the document
+/// TC's search options for `ListSearchText` (#59).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchFlags {
+    /// Start at the top (at the bottom when searching backwards), not after
+    /// the current match.
+    find_first: bool,
+    match_case: bool,
+    whole_words: bool,
+    backwards: bool,
+}
+
+fn search_flags(parameter: c_int) -> SearchFlags {
+    SearchFlags {
+        find_first: parameter & LCS_FINDFIRST != 0,
+        match_case: parameter & LCS_MATCHCASE != 0,
+        whole_words: parameter & LCS_WHOLEWORDS != 0,
+        backwards: parameter & LCS_BACKWARDS != 0,
+    }
+}
+
+/// The page script for one search step; it returns whether a match was found
+/// and selected. The text is a JSON string, so it can't end the script.
+fn search_script(text: &str, flags: SearchFlags) -> String {
+    let start = if flags.find_first {
+        format!(
+            "var s = window.getSelection(); s.removeAllRanges(); var r = document.createRange(); \
+             r.selectNodeContents(document.body); r.collapse({}); s.addRange(r);",
+            !flags.backwards
+        )
+    } else {
+        String::new()
+    };
+    // window.find(text, caseSensitive, backwards, wrapAround, wholeWord, searchInFrames, showDialog)
+    format!(
+        "(function() {{ {start} return window.find({}, {}, {}, false, {}, false, false); }})()",
+        markdown::script_string(text),
+        flags.match_case,
+        flags.backwards,
+        flags.whole_words,
+    )
+}
+
+/// Search for text in the document (TC's F7, then F3 / Shift+F3).
 #[unsafe(no_mangle)]
 pub extern "system" fn ListSearchText(
     list_win: HWND,
     search_string: *const c_char,
     search_parameter: c_int,
 ) -> c_int {
-    let search_str = unsafe {
-        match CStr::from_ptr(search_string).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return 1, // LISTPLUGIN_ERROR
-        }
-    };
-    do_search(list_win, &search_str, search_parameter)
+    // TC passes the ANSI version text in the Windows code page.
+    match unsafe { ansi_to_string(search_string) } {
+        Some(text) => do_search(list_win, &text, search_parameter),
+        None => LISTPLUGIN_ERROR,
+    }
 }
 
 /// Search for text (Unicode version)
@@ -166,54 +214,93 @@ pub extern "system" fn ListSearchTextW(
     search_string: *const u16,
     search_parameter: c_int,
 ) -> c_int {
-    let search_str = unsafe {
-        match U16CStr::from_ptr_str(search_string).to_string() {
-            Ok(s) => s,
-            Err(_) => return 1, // LISTPLUGIN_ERROR
-        }
-    };
-    do_search(list_win, &search_str, search_parameter)
+    if search_string.is_null() {
+        return LISTPLUGIN_ERROR;
+    }
+    match unsafe { U16CStr::from_ptr_str(search_string) }.to_string() {
+        Ok(text) => do_search(list_win, &text, search_parameter),
+        Err(_) => LISTPLUGIN_ERROR,
+    }
 }
 
-fn do_search(list_win: HWND, search_string: &str, search_parameter: c_int) -> c_int {
-    let case_sensitive = (search_parameter & LP_MATCHCASE) != 0;
-    let whole_word = (search_parameter & LP_WHOLEWORDS) != 0;
-    let forward_only = (search_parameter & LP_FORWARDONLY) != 0;
-
-    // Escape quotes in search string for JavaScript
-    let escaped = search_string.replace('\\', "\\\\").replace('"', "\\\"");
-
-    // Use window.find() for search
-    // window.find(string, caseSensitive, backwards, wrapAround, wholeWord, searchInFrames, showDialog)
-    let script = format!(
-        "window.find(\"{}\", {}, {}, {}, {}, false, false)",
-        escaped,
-        case_sensitive,
-        false,         // backwards (we search forward)
-        !forward_only, // wrapAround
-        whole_word
-    );
-
-    viewer::execute_script(list_win, &script);
-    0 // LISTPLUGIN_OK
+/// A NUL-terminated string in the Windows code page.
+unsafe fn ansi_to_string(text: *const c_char) -> Option<String> {
+    use windows::Win32::Globalization::{CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS, MultiByteToWideChar};
+    if text.is_null() {
+        return None;
+    }
+    let bytes = unsafe { CStr::from_ptr(text) }.to_bytes();
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let len = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None) };
+    if len <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; len as usize];
+    let written = unsafe { MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut wide)) };
+    (written == len).then(|| String::from_utf16_lossy(&wide))
 }
 
-/// Handle commands (copy, select all, etc.)
+/// One search step. Returns OK when a match was found and selected, else an
+/// error, so TC says it was not found.
+fn do_search(list_win: HWND, text: &str, search_parameter: c_int) -> c_int {
+    if text.is_empty() {
+        return LISTPLUGIN_ERROR;
+    }
+    let script = search_script(text, search_flags(search_parameter));
+    match viewer::execute_script_sync(list_win, &script, std::time::Duration::from_secs(2)) {
+        Some(result) if result == "true" => LISTPLUGIN_OK,
+        _ => LISTPLUGIN_ERROR,
+    }
+}
+
+/// Copy and select all from TC's menu.
 #[unsafe(no_mangle)]
 pub extern "system" fn ListSendCommand(list_win: HWND, command: c_int, _parameter: c_int) -> c_int {
-    const LC_COPY: c_int = 1;
-    const LC_SELECTALL: c_int = 3;
-
     match command {
         LC_COPY => {
             viewer::execute_script(list_win, "document.execCommand('copy')");
-            1 // LISTPLUGIN_OK
+            LISTPLUGIN_OK
         }
         LC_SELECTALL => {
             viewer::execute_script(list_win, "document.execCommand('selectAll')");
-            1
+            LISTPLUGIN_OK
         }
-        _ => 0,
+        _ => LISTPLUGIN_ERROR,
+    }
+}
+
+/// TC's print command: WebView2's print dialog (printer choice, preview).
+#[unsafe(no_mangle)]
+pub extern "system" fn ListPrint(
+    list_win: HWND,
+    _file_to_print: *const c_char,
+    _def_printer: *const c_char,
+    _print_flags: c_int,
+    _margins: *const windows::Win32::Foundation::RECT,
+) -> c_int {
+    print(list_win)
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn ListPrintW(
+    list_win: HWND,
+    _file_to_print: *const u16,
+    _def_printer: *const u16,
+    _print_flags: c_int,
+    _margins: *const windows::Win32::Foundation::RECT,
+) -> c_int {
+    print(list_win)
+}
+
+fn print(list_win: HWND) -> c_int {
+    match viewer::show_print_ui(list_win) {
+        Ok(()) => LISTPLUGIN_OK,
+        Err(e) => {
+            viewer::show_error(list_win, &format!("Could not open the print dialog:\n\n{e}"));
+            LISTPLUGIN_ERROR
+        }
     }
 }
 
@@ -241,5 +328,38 @@ mod tests {
         assert!(ini_folder_from_default_ini_name(&ini_name(b"")).unwrap_err().contains("empty"));
         assert!(ini_folder_from_default_ini_name(&[b'a' as c_char; 260]).unwrap_err().contains("not terminated"));
         assert!(ini_folder_from_default_ini_name(&ini_name(b"lsplugin.ini")).unwrap_err().contains("no folder"));
+    }
+
+    // #59: TC's search flags (listplug.h): before, 2 was read as "forward
+    // only" and 8 as "match case".
+    #[test]
+    fn test_search_flags_follow_the_wlx_sdk() {
+        let none = SearchFlags { find_first: false, match_case: false, whole_words: false, backwards: false };
+        assert_eq!(search_flags(0), none);
+        assert_eq!(search_flags(1), SearchFlags { find_first: true, ..none });
+        assert_eq!(search_flags(2), SearchFlags { match_case: true, ..none });
+        assert_eq!(search_flags(4), SearchFlags { whole_words: true, ..none });
+        assert_eq!(search_flags(8), SearchFlags { backwards: true, ..none });
+        assert_eq!(search_flags(15), SearchFlags { find_first: true, match_case: true, whole_words: true, backwards: true });
+    }
+
+    #[test]
+    fn test_search_script_passes_the_options_and_the_text_safely() {
+        let flags = search_flags(LCS_MATCHCASE | LCS_BACKWARDS);
+        let script = search_script("a\"b</x>\\", flags);
+        let expected = concat!("window.find(\"a\\\"b\\u", "003c/x\\u", "003e\\\\\", true, true, false, false, false, false)");
+        assert!(script.contains(expected), "{script}");
+        assert!(!script.contains("removeAllRanges"), "find next continues after the current match");
+        let first = search_script("x", search_flags(LCS_FINDFIRST));
+        assert!(first.contains("removeAllRanges") && first.contains("r.collapse(true)"), "starts at the top");
+        let first_back = search_script("x", search_flags(LCS_FINDFIRST | LCS_BACKWARDS));
+        assert!(first_back.contains("r.collapse(false)"), "backwards starts at the bottom");
+    }
+
+    #[test]
+    fn test_ansi_search_text_uses_the_windows_code_page() {
+        let text = std::ffi::CString::new("plain text").unwrap();
+        assert_eq!(unsafe { ansi_to_string(text.as_ptr()) }.as_deref(), Some("plain text"));
+        assert_eq!(unsafe { ansi_to_string(std::ptr::null()) }, None);
     }
 }
