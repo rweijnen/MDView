@@ -44,13 +44,18 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: i686-pc-windows-msvc
+          targets: i686-pc-windows-msvc, aarch64-pc-windows-msvc
 
       - name: Build x64
         run: cargo build --release
 
       - name: Build x86
         run: cargo build --release --target i686-pc-windows-msvc
+
+      # The standalone viewer only: Total Commander has no ARM64 version that
+      # could load a plugin; on Windows on ARM it runs the x64 plugin (#51).
+      - name: Build ARM64 (standalone viewer)
+        run: cargo build --release --target aarch64-pc-windows-msvc --bin mdview
 
       - name: Run tests
         run: cargo test --release
@@ -124,6 +129,7 @@ jobs:
             '',
             '## Contents',
             '- `mdview.exe` - Standalone viewer (x64)',
+            '- `mdview-arm64.exe` - Standalone viewer for Windows on ARM (ARM64)',
             '- `mdview.wlx` - Total Commander plugin (x86)',
             '- `mdview.wlx64` - Total Commander plugin (x64)',
             '- `pluginst.inf` - Plugin installer configuration'
@@ -139,6 +145,9 @@ jobs:
 
           # Copy x64 standalone exe
           Copy-Item "target\release\mdview.exe" "release\mdview.exe"
+
+          # Copy ARM64 standalone exe (#51)
+          Copy-Item "target\aarch64-pc-windows-msvc\release\mdview.exe" "release\mdview-arm64.exe"
 
           # Copy x64 plugin (rename dll to wlx64)
           Copy-Item "target\release\mdview_wlx.dll" "release\mdview.wlx64"
@@ -187,3 +196,18 @@ jobs:
           git add Cargo.toml
           git commit -m "Bump version to ${{ steps.version.outputs.new }}"
           git push
+
+  # Unit tests on Windows on ARM itself (#51). The GUI tests need a desktop
+  # and run on x64 (gui-tests.yml).
+  test-arm64:
+    runs-on: windows-11-arm
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests (ARM64)
+        run: cargo test --release
