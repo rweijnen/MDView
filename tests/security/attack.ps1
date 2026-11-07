@@ -314,7 +314,9 @@ function Invoke-Case($case, $hostKind) {
     Start-Sleep -Seconds ([Math]::Max(1, $Seconds - 4))
     if (-not $proc.HasExited) { $dialogs += Close-Dialogs $proc; Start-Sleep -Milliseconds 500 }
 
-    $marker = if ($win -and -not $proc.HasExited) { Find-Text $win "PWNED-$id|LEAK-" } else { $null }
+    # The markers are paragraphs of their own; MDView's messages may quote a link
+    # that contains the text (S6: "MDView does not open this kind of link").
+    $marker = if ($win -and -not $proc.HasExited) { Find-Text $win "^PWNED-$id$|^LEAK-" } else { $null }
     $exitedEarly = $proc.HasExited
     if ($hostKind -eq 'plugin' -and (Test-Path $statusFile)) { $status = Get-Content $statusFile -Raw }
     if (-not $proc.HasExited) { $proc | Stop-Process -Force; $proc.WaitForExit(5000) | Out-Null }
