@@ -12,6 +12,7 @@ release workflow refuses to publish a version without a section here.
 ### Changes
 - The remote-images bar can be closed with ×; it stays closed while the document is open.
 - A link to a network location asks before opening. (#56)
+- The zoom level (Ctrl+mouse wheel, Ctrl+Plus/Minus, Ctrl+0) is remembered, also after following a link or reloading. Each program keeps its own. Thanks to [jumpifequal/mdview-for-Total-Commander](https://github.com/jumpifequal/mdview-for-Total-Commander) for the idea. (#16)
 
 ### Fixes
 - Paths are shown with `\` only. (#49)

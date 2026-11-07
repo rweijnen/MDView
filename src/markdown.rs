@@ -187,6 +187,55 @@ pub struct PageBars<'a> {
     pub closed: &'a [String],
 }
 
+/// Zoom levels in percent for Ctrl+mouse wheel, Ctrl+Plus and Ctrl+Minus
+/// (#16): the same steps as Edge.
+pub const ZOOM_STEPS: [u32; 17] = [25, 33, 50, 67, 75, 80, 90, 100, 110, 125, 150, 175, 200, 250, 300, 400, 500];
+pub const DEFAULT_ZOOM: u32 = 100;
+
+pub fn is_zoom_step(percent: u32) -> bool {
+    ZOOM_STEPS.contains(&percent)
+}
+
+/// The zoom after the user's zoom key or wheel: `"in"`, `"out"` or `"reset"`.
+/// `None` for anything else. At the ends it stays where it is.
+pub fn next_zoom(current: u32, direction: &str) -> Option<u32> {
+    match direction {
+        "in" => Some(ZOOM_STEPS.iter().copied().find(|&s| s > current).unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])),
+        "out" => Some(ZOOM_STEPS.iter().rev().copied().find(|&s| s < current).unwrap_or(ZOOM_STEPS[0])),
+        "reset" => Some(DEFAULT_ZOOM),
+        _ => None,
+    }
+}
+
+/// JSON for `PostWebMessageAsJson`: the page applies this zoom.
+pub fn zoom_message(percent: u32) -> String {
+    format!(r#"{{"type":"zoom","percent":{percent}}}"#)
+}
+
+/// How MDView's pages look, from the user's settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageLook {
+    /// Zoom of the whole page, one of `ZOOM_STEPS` (#16).
+    pub zoom: u32,
+}
+
+impl Default for PageLook {
+    fn default() -> Self {
+        PageLook { zoom: DEFAULT_ZOOM }
+    }
+}
+
+/// CSS `zoom` value for a percentage: 125 gives `1.25`.
+fn css_zoom(percent: u32) -> String {
+    let whole = percent / 100;
+    let fraction = percent % 100;
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{}", format!("{fraction:02}").trim_end_matches('0'))
+    }
+}
+
 /// What the user chose while a document is open (#24): bars they closed, and
 /// whether they opened it although it was downloaded from the internet.
 /// Reloading the same document keeps these; another document starts fresh.
@@ -487,8 +536,9 @@ fn content_security_policy(nonce: &str, remote_images: RemoteImages) -> String {
     )
 }
 
-pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, bars: &[Bar]) -> String {
+pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, bars: &[Bar], look: &PageLook) -> String {
     let nonce = new_nonce();
+    let zoom = css_zoom(look.zoom);
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
@@ -522,6 +572,7 @@ document.addEventListener('securitypolicyviolation', function(e) {{
 }});
 </script>
 <style>
+:root {{ zoom: {zoom}; }}
 #mdview-bars {{
     display: flex;
     flex-direction: column;
@@ -743,6 +794,41 @@ a {{ cursor: pointer; }}
             webview.postMessage({{type: 'close'}});
         }}
     }});
+
+    // Zoom (#16): MDView picks the next step, saves it and tells the page,
+    // so the zoom is part of every page MDView shows and survives links and
+    // reloading. WebView2's own zoom is switched off.
+    if (webview) {{
+        function zoom(direction) {{
+            webview.postMessage({{type: 'zoom', direction: direction}});
+        }}
+        document.addEventListener('keydown', function(e) {{
+            if (!e.ctrlKey || e.altKey || e.metaKey) return;
+            var direction = (e.key === '+' || e.key === '=') ? 'in'
+                : (e.key === '-' || e.key === '_') ? 'out'
+                : e.key === '0' ? 'reset' : null;
+            if (!direction) return;
+            e.preventDefault();
+            zoom(direction);
+        }});
+        // One step per wheel notch; small touchpad deltas add up to a step.
+        var wheel = 0;
+        document.addEventListener('wheel', function(e) {{
+            if (!e.ctrlKey) return;
+            e.preventDefault();
+            wheel += e.deltaY;
+            if (Math.abs(wheel) >= 50) {{
+                zoom(wheel < 0 ? 'in' : 'out');
+                wheel = 0;
+            }}
+        }}, {{passive: false}});
+        webview.addEventListener('message', function(e) {{
+            var m = e.data;
+            if (m && m.type === 'zoom' && typeof m.percent === 'number') {{
+                document.documentElement.style.zoom = String(m.percent / 100);
+            }}
+        }});
+    }}
 }})();
 </script>
 </body>
@@ -797,6 +883,42 @@ pub fn markdown_to_plain_text(markdown: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A page at the default look (zoom 100%).
+    fn wrap(content: &str, dark_mode: bool, remote_images: RemoteImages, bars: &[Bar]) -> String {
+        wrap_html(content, dark_mode, remote_images, bars, &PageLook::default())
+    }
+
+    // #16: the zoom steps MDView moves through, and the ends.
+    #[test]
+    fn test_zoom_steps_up_down_and_reset() {
+        assert_eq!(next_zoom(100, "in"), Some(110));
+        assert_eq!(next_zoom(100, "out"), Some(90));
+        assert_eq!(next_zoom(250, "reset"), Some(100));
+        assert_eq!(next_zoom(500, "in"), Some(500), "stays at the largest step");
+        assert_eq!(next_zoom(25, "out"), Some(25), "stays at the smallest step");
+        assert_eq!(next_zoom(105, "in"), Some(110), "a value between steps goes to the next step");
+        assert_eq!(next_zoom(105, "out"), Some(100));
+        assert_eq!(next_zoom(100, "sideways"), None);
+        let mut z = 25;
+        for _ in 0..ZOOM_STEPS.len() {
+            assert!(is_zoom_step(z));
+            z = next_zoom(z, "in").unwrap();
+        }
+        assert_eq!(z, 500);
+        assert!(!is_zoom_step(0) && !is_zoom_step(105) && !is_zoom_step(1000));
+    }
+
+    // #16: the zoom is part of the page, so navigating or reloading keeps it.
+    #[test]
+    fn test_page_carries_the_zoom() {
+        assert!(wrap("", false, RemoteImages::Blocked, &[]).contains(":root { zoom: 1; }"));
+        for (percent, css) in [(125, "1.25"), (110, "1.1"), (33, "0.33"), (50, "0.5"), (400, "4")] {
+            let page = wrap_html("", false, RemoteImages::Blocked, &[], &PageLook { zoom: percent });
+            assert!(page.contains(&format!(":root {{ zoom: {css}; }}")), "{percent}");
+        }
+        assert_eq!(zoom_message(125), r#"{"type":"zoom","percent":125}"#);
+    }
+
     fn nonce_of(page: &str) -> String {
         let start = page.find("'nonce-").expect("CSP has a nonce") + 7;
         page[start..start + 32].to_string()
@@ -807,7 +929,7 @@ mod tests {
     #[test]
     fn test_page_csp_only_lets_mdview_scripts_run() {
         let body = markdown_to_html("# T\n\n<script>evil()</script>\n\n<img src=x onerror=\"evil()\">");
-        let page = wrap_html(&body, false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
+        let page = wrap(&body, false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
         let nonce = nonce_of(&page);
         assert_eq!(nonce.len(), 32);
         let meta_at = page.find("<meta http-equiv=\"Content-Security-Policy\"").expect("CSP meta");
@@ -843,8 +965,8 @@ mod tests {
 
     #[test]
     fn test_page_nonce_is_new_for_every_page() {
-        let a = nonce_of(&wrap_html("", false, RemoteImages::Blocked, &[]));
-        let b = nonce_of(&wrap_html("", false, RemoteImages::Blocked, &[]));
+        let a = nonce_of(&wrap("", false, RemoteImages::Blocked, &[]));
+        let b = nonce_of(&wrap("", false, RemoteImages::Blocked, &[]));
         assert_ne!(a, b);
     }
 
@@ -864,7 +986,7 @@ mod tests {
         }
         assert!(!bar_choice_offered(&bars, NETWORK_FILES_BAR, "load"));
         assert!(network.buttons.iter().any(|b| b.choice == "never" && b.closes_bar));
-        let page_html = wrap_html("x", false, RemoteImages::AskToLoad, &bars);
+        let page_html = wrap("x", false, RemoteImages::AskToLoad, &bars);
         assert!(page_html.contains(r#""show":"networkFileBlocked""#));
         // A closed network bar stays away while the document is open.
         let closed = vec![NETWORK_FILES_BAR.to_string()];
@@ -935,11 +1057,11 @@ mod tests {
     }
     #[test]
     fn test_remote_images_load_only_when_allowed() {
-        let allowed = wrap_html("", false, RemoteImages::Allowed, &[]);
+        let allowed = wrap("", false, RemoteImages::Allowed, &[]);
         assert!(allowed.contains("img-src https://mdview.example https://*.mdview.example data: https: http:;"));
-        let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
+        let ask = wrap("", false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
         assert!(ask.contains("img-src https://mdview.example https://*.mdview.example data:;"));
-        let blocked = wrap_html("", false, RemoteImages::Blocked, &[]);
+        let blocked = wrap("", false, RemoteImages::Blocked, &[]);
         assert!(blocked.contains("img-src https://mdview.example https://*.mdview.example data:;"));
     }
 
@@ -967,7 +1089,7 @@ mod tests {
             bar("first", "First bar", &[("yes", "Yes", false), ("no", "No", true)], BarShow::Now),
             bar("second", "Second bar", &[("ok", "OK", true)], BarShow::WhenRemoteImageBlocked),
         ];
-        let page = wrap_html("", false, RemoteImages::Blocked, &bars);
+        let page = wrap("", false, RemoteImages::Blocked, &bars);
         let first = page.find(r#""id":"first""#).expect("first bar in the page");
         let second = page.find(r#""id":"second""#).expect("second bar in the page");
         assert!(first < second, "bars keep their order");
@@ -980,7 +1102,7 @@ mod tests {
         ] {
             assert!(page.contains(part), "missing {part}");
         }
-        let none = wrap_html("", false, RemoteImages::Blocked, &[]);
+        let none = wrap("", false, RemoteImages::Blocked, &[]);
         assert!(none.contains("var bars = [];"), "a page without bars gets an empty list");
     }
 
@@ -989,7 +1111,7 @@ mod tests {
     #[test]
     fn test_bar_text_cannot_leave_the_script() {
         let text = "</script><script>x()</script> & <!-- \"q\" \\ \u{2028}\u{2029}\n";
-        let page = wrap_html("", false, RemoteImages::Blocked, &[bar("b", text, &[], BarShow::Now)]);
+        let page = wrap("", false, RemoteImages::Blocked, &[bar("b", text, &[], BarShow::Now)]);
         let nonce = nonce_of(&page);
         assert_eq!(page.matches("<script").count(), 2, "only MDView's own two scripts");
         assert_eq!(page.matches(&format!("<script nonce=\"{nonce}\">")).count(), 2);
@@ -1094,7 +1216,7 @@ mod tests {
         assert!(!html.contains("<script"), "{html}");
         let without = download_gate_html(r"C:\dl\a.md", None);
         assert!(!without.contains("From:"), "{without}");
-        let page_html = wrap_html(&without, false, RemoteImages::Blocked, &[download_gate_bar()]);
+        let page_html = wrap(&without, false, RemoteImages::Blocked, &[download_gate_bar()]);
         assert!(page_html.contains(r#""id":"download-gate""#));
     }
 
@@ -1115,7 +1237,7 @@ mod tests {
         assert_eq!(closable, [(REGISTER_BAR, false), (REMOTE_IMAGES_BAR, true)]);
         assert!(bar_choice_offered(&bars, REMOTE_IMAGES_BAR, CLOSE_CHOICE));
         assert!(!bar_choice_offered(&bars, REGISTER_BAR, CLOSE_CHOICE), "no close button, no close");
-        let page_html = wrap_html("", false, RemoteImages::AskToLoad, &bars);
+        let page_html = wrap("", false, RemoteImages::AskToLoad, &bars);
         assert!(page_html.contains(r#""show":"now","closable":false}"#));
         assert!(page_html.contains(r#""show":"remoteImageBlocked","closable":true}"#));
     }
