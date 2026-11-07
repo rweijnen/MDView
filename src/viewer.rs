@@ -982,9 +982,44 @@ fn post_network_blocked(hwnd: HWND) {
     });
 }
 
+/// Send a message to this viewer's page (`PostWebMessageAsJson`).
+fn post_to_page(hwnd: HWND, json: &str) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) };
+            }
+        }
+    });
+}
+
+/// Ctrl+, (#50): the page shows the settings panel with the plugin's settings.
+fn open_settings(hwnd: HWND) {
+    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    let (page, notes) = crate::settings_page::current(true);
+    post_to_page(hwnd, &crate::settings_page::show_message(&page, &notes, &crate::fonts::installed(), true, dark));
+}
+
+/// Save in the settings panel: everything is checked first; then each value is
+/// saved, and the panel says what could not be. The document is reloaded so
+/// its bars follow the new settings.
+fn save_settings(hwnd: HWND, msg: &HashMap<String, String>) {
+    let saved_fonts = crate::settings::font_settings().0;
+    let result = crate::settings_page::parse_save(msg, true, &crate::fonts::installed(), &saved_fonts)
+        .and_then(|page| crate::settings_page::save(&page));
+    match result {
+        Ok(()) => {
+            post_to_page(hwnd, &crate::settings_page::saved_message());
+            reload_page(hwnd);
+        }
+        Err(text) => post_to_page(hwnd, &crate::settings_page::error_message(&text)),
+    }
+}
+
 /// How MDView's pages look now (#16).
 fn page_look() -> crate::markdown::PageLook {
-    crate::markdown::PageLook { zoom: crate::settings::zoom() }
+    crate::markdown::PageLook { zoom: crate::settings::zoom(), fonts: crate::settings::font_settings().0 }
 }
 
 /// Ctrl+wheel, Ctrl+Plus/Minus/0 on the page (#16): the next zoom step is
@@ -1102,6 +1137,8 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
             }
         }
         Some("networkStatus") => post_network_blocked(hwnd),
+        Some("openSettings") => open_settings(hwnd),
+        Some("saveSettings") => save_settings(hwnd, msg),
         Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
             None => crate::linkstatus::hide(hwnd),
             Some(url) => {

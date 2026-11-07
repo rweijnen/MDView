@@ -2,10 +2,12 @@
 
 mod dark_menu;
 mod files;
+mod fonts;
 mod links;
 mod linkstatus;
 mod markdown;
 mod settings;
+mod settings_page;
 mod terminal;
 mod vpath;
 mod zone;
@@ -464,6 +466,7 @@ const IDM_HELP_ABOUT: u32 = 2001;
 const IDM_EDIT_FIND: u32 = 1201;
 const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
+const IDM_FILE_SETTINGS: u32 = 1012;
 const IDM_FILE_RECENT_BASE: u32 = 1100; // 1100-1109 for recent files
 
 // The product name is defined once, in settings::app_name!().
@@ -609,6 +612,14 @@ fn create_menu() -> windows::core::Result<HMENU> {
             PCWSTR(unregister_text.as_ptr()),
         )?;
         AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
+        let settings_text: Vec<u16> = "&Settings...\tCtrl+,\0".encode_utf16().collect();
+        AppendMenuW(
+            file_menu,
+            MF_STRING,
+            IDM_FILE_SETTINGS as usize,
+            PCWSTR(settings_text.as_ptr()),
+        )?;
+        AppendMenuW(file_menu, MF_SEPARATOR, 0, PCWSTR::null())?;
         let exit_text: Vec<u16> = "E&xit\0".encode_utf16().collect();
         AppendMenuW(
             file_menu,
@@ -679,6 +690,11 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
                 fVirt: FVIRTKEY | FCONTROL,
                 key: 'F' as u16,
                 cmd: IDM_EDIT_FIND as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FCONTROL,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_OEM_COMMA.0,
+                cmd: IDM_FILE_SETTINGS as u16,
             },
         ];
         let haccel = CreateAcceleratorTableW(&accels)?;
@@ -1326,9 +1342,45 @@ fn post_network_blocked() {
     });
 }
 
+/// Send a message to the page (`PostWebMessageAsJson`).
+fn post_to_page(json: &str) {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) };
+            }
+        }
+    });
+}
+
+/// File > Settings... or Ctrl+, (#50): the page shows the settings panel.
+fn open_settings() {
+    let (page, notes) = settings_page::current(false);
+    post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, is_windows_dark_mode()));
+}
+
+/// Save in the settings panel: everything is checked first; then each value is
+/// saved, and the panel says what could not be. A shown document is reloaded
+/// so its bars follow the new settings.
+fn save_settings(msg: &std::collections::HashMap<String, String>) {
+    let saved_fonts = settings::font_settings().0;
+    let result = settings_page::parse_save(msg, false, &fonts::installed(), &saved_fonts)
+        .and_then(|page| settings_page::save(&page));
+    match result {
+        Ok(()) => {
+            post_to_page(&settings_page::saved_message());
+            if CURRENT_FILE.with(|f| f.borrow().is_some()) {
+                reload_page();
+            }
+        }
+        Err(text) => post_to_page(&settings_page::error_message(&text)),
+    }
+}
+
 /// How MDView's pages look now (#16).
 fn page_look() -> markdown::PageLook {
-    markdown::PageLook { zoom: settings::zoom() }
+    markdown::PageLook { zoom: settings::zoom(), fonts: settings::font_settings().0 }
 }
 
 /// Ctrl+wheel, Ctrl+Plus/Minus/0 on the page (#16): the next zoom step is
@@ -1441,6 +1493,8 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
             }
         }
         Some("networkStatus") => post_network_blocked(),
+        Some("openSettings") => open_settings(),
+        Some("saveSettings") => save_settings(msg),
         Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
             None => linkstatus::hide(hwnd),
             Some(url) => {
@@ -1910,8 +1964,6 @@ fn is_file_association_registered() -> bool {
     }
 }
 
-const DONT_ASK_REGISTER: &str = "DontAskRegister";
-
 /// Whether to ask about registering MDView as .md viewer (#37): only while it
 /// is not registered, the user didn't choose "Don't ask again", and didn't
 /// choose "Not now" in this session.
@@ -1922,7 +1974,7 @@ fn should_ask_to_register(registered: bool, dont_ask: bool, dismissed: bool) -> 
 fn ask_to_register() -> bool {
     should_ask_to_register(
         is_file_association_registered(),
-        settings::read_dword(DONT_ASK_REGISTER) == Some(1),
+        settings::dont_ask_register(),
         REGISTER_BAR_DISMISSED.with(|d| d.get()),
     )
 }
@@ -1933,7 +1985,7 @@ fn handle_register_choice(hwnd: HWND, choice: &str) {
         "register" => register_and_open_settings(Some(hwnd)),
         "notNow" => REGISTER_BAR_DISMISSED.with(|d| d.set(true)),
         "never" => {
-            if let Err(e) = settings::write_dword(DONT_ASK_REGISTER, 1) {
+            if let Err(e) = settings::set_dont_ask_register(true) {
                 show_message(
                     Some(hwnd),
                     &format!("Could not save \"Don't ask again\":\n\n{e}"),
@@ -2685,6 +2737,10 @@ unsafe extern "system" fn window_proc(
                 }
                 IDM_FILE_REGISTER => {
                     register_and_open_settings(Some(hwnd));
+                    LRESULT(0)
+                }
+                IDM_FILE_SETTINGS => {
+                    open_settings();
                     LRESULT(0)
                 }
                 IDM_FILE_UNREGISTER => {

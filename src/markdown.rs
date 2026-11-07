@@ -213,16 +213,352 @@ pub fn zoom_message(percent: u32) -> String {
 }
 
 /// How MDView's pages look, from the user's settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageLook {
     /// Zoom of the whole page, one of `ZOOM_STEPS` (#16).
     pub zoom: u32,
+    /// Fonts for the document (#50).
+    pub fonts: crate::settings::FontSettings,
 }
 
 impl Default for PageLook {
     fn default() -> Self {
-        PageLook { zoom: DEFAULT_ZOOM }
+        PageLook { zoom: DEFAULT_ZOOM, fonts: crate::settings::FontSettings::default() }
     }
+}
+
+/// The settings panel (#50), part of the page script (it runs inside the
+/// page's IIFE, where `webview` is set). MDView sends `showSettings` with the
+/// saved settings and the installed fonts; the panel previews font changes
+/// live through the page's CSS variables, and Save sends `saveSettings`.
+/// MDView answers `settingsSaved` or `settingsError` (shown in the panel).
+/// Built in a closed shadow root, so the document's CSS can't restyle or
+/// relabel it; every text from MDView is set with `textContent`.
+const SETTINGS_SCRIPT: &str = r##"
+if (webview) (function() {
+    var DEFAULT_TEXT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif';
+    var DEFAULT_CODE = '"Cascadia Code", "Fira Code", Consolas, monospace';
+    var VARS = ['--mdview-text-font', '--mdview-text-size', '--mdview-heading-font', '--mdview-code-font', '--mdview-code-size'];
+    var PRESETS = [
+        {px: 12, glyph: 'a', name: 'Small text', css: 'font-size:13px'},
+        {px: 14, glyph: 'A', name: 'Normal text', css: 'font-size:16px'},
+        {px: 17, glyph: 'A', name: 'Large text', css: 'font-size:20px;font-weight:700'}
+    ];
+    var TEXT_SIZES = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 22, 24, 28, 32, 40, 48];
+    var CODE_SIZES = [0, 9, 10, 11, 12, 13, 14, 16, 18, 20, 24];
+    var root = document.documentElement.style;
+    var open = null;
+
+    var CSS = [
+        ':host{all:initial}',
+        '.scrim{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px;box-sizing:border-box;background:rgba(27,31,36,.35);overflow:auto;font-family:"Segoe UI",-apple-system,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45;color:#24292e}',
+        '.dark.scrim{background:rgba(0,0,0,.55);color:#d4d4d4}',
+        '.box{width:560px;max-width:100%;background:#fff;border:1px solid #d0d7de;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.28)}',
+        '.dark .box{background:#252526;border-color:#454545}',
+        '.head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid #d0d7de}',
+        '.dark .head,.dark .foot{border-color:#454545}',
+        '.head h2{margin:0;font-size:18px;font-weight:600}',
+        '.muted{font-size:12px;color:#57606a}.dark .muted{color:#a3abb4}',
+        '.body{display:flex;flex-direction:column;gap:22px;padding:20px}',
+        'section{display:flex;flex-direction:column;gap:8px}',
+        'h3{margin:0;font-size:14px;font-weight:600}',
+        '.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+        'button,select,input{font:inherit;color:inherit}',
+        'button{cursor:pointer}',
+        '.seg{min-height:36px;min-width:44px;padding:4px 14px;border-radius:4px;border:1px solid #d0d7de;background:#fff}',
+        '.dark .seg{border-color:#454545;background:#252526}',
+        '.seg[aria-pressed="true"]{border:2px solid #0969da;background:#ddf4ff;color:#0550ae;font-weight:600}',
+        '.dark .seg[aria-pressed="true"]{border-color:#4493f8;background:#13294a;color:#cfe3ff}',
+        '.btn{min-height:32px;min-width:88px;padding:4px 14px;border-radius:4px;border:1px solid #d0d7de;background:#fff}',
+        '.dark .btn{border-color:#454545;background:#252526}',
+        '.primary{background:#0969da;border-color:#0969da;color:#fff;font-weight:600}',
+        '.dark .primary{background:#1f6feb;border-color:#1f6feb;color:#fff}',
+        '.primary:disabled{opacity:.6;cursor:default}',
+        '.close{width:32px;height:32px;border:none;border-radius:4px;background:transparent;display:flex;align-items:center;justify-content:center}',
+        '.adv{align-self:flex-start;display:flex;align-items:center;gap:6px;min-height:32px;padding:4px 0;border:none;background:transparent;font-weight:600}',
+        '.adv svg{transition:transform .15s}.adv[aria-expanded="true"] svg{transform:rotate(90deg)}',
+        '.grid{display:grid;grid-template-columns:96px minmax(0,1fr) 150px;gap:10px 12px;align-items:center;padding:12px;border:1px solid #d0d7de;border-radius:6px;background:#f6f8fa}',
+        '.dark .grid{border-color:#454545;background:#1e1e1e}',
+        'select{min-height:32px;width:100%;box-sizing:border-box;padding:4px 8px;border:1px solid #d0d7de;border-radius:4px;background:#fff;font-size:14px}',
+        '.dark select{border-color:#454545;background:#252526}',
+        '.sep{height:1px;background:#d0d7de}.dark .sep{background:#454545}',
+        '.check{display:flex;align-items:flex-start;gap:10px;cursor:pointer;min-height:32px}',
+        '.check input{width:18px;height:18px;margin:1px 0 0;accent-color:#0969da}',
+        '.dark .check input{accent-color:#4493f8}',
+        '.stack{display:flex;flex-direction:column;gap:2px}',
+        '.strong{font-weight:600}',
+        '.notes{padding:10px 12px;border:1px solid #d4a72c;border-radius:6px;background:#fff8c5;font-size:13px}',
+        '.dark .notes{border-color:#6b5b2a;background:#3b3420}',
+        '.error{margin:0 20px 4px;padding:10px 12px;border:1px solid #ff8182;border-radius:6px;background:#ffebe9;color:#82071e;font-size:13px;white-space:pre-line;overflow-wrap:anywhere}',
+        '.dark .error{border-color:#a4282f;background:#3a1d1f;color:#ffc1bd}',
+        '.foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 20px;border-top:1px solid #d0d7de}',
+        ':focus-visible{outline:2px solid #0969da;outline-offset:2px}.dark :focus-visible{outline-color:#4493f8}',
+        '[hidden]{display:none!important}'
+    ].join('\n');
+
+    function el(tag, props, children) {
+        var e = document.createElement(tag);
+        Object.keys(props || {}).forEach(function(k) {
+            var v = props[k];
+            if (k === 'text') e.textContent = v;
+            else if (k === 'className') e.className = v;
+            else if (k === 'style') e.style.cssText = v;
+            else if (k.indexOf('on') === 0) e.addEventListener(k.slice(2), v);
+            else if (v !== null && v !== undefined && v !== false) e.setAttribute(k, v === true ? '' : String(v));
+        });
+        (children || []).forEach(function(c) { if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
+        return e;
+    }
+    function svg(path, size) {
+        var ns = 'http://www.w3.org/2000/svg';
+        var s = document.createElementNS(ns, 'svg');
+        s.setAttribute('width', size); s.setAttribute('height', size);
+        s.setAttribute('viewBox', '0 0 14 14'); s.setAttribute('fill', 'none');
+        s.setAttribute('stroke', 'currentColor'); s.setAttribute('stroke-width', '1.6');
+        s.setAttribute('stroke-linecap', 'round'); s.setAttribute('stroke-linejoin', 'round');
+        s.setAttribute('aria-hidden', 'true');
+        var p = document.createElementNS(ns, 'path'); p.setAttribute('d', path); s.appendChild(p);
+        return s;
+    }
+    function fontCss(name, stack) { return name ? '"' + name + '", ' + stack : stack; }
+
+    function preview(s) {
+        root.setProperty('--mdview-text-font', fontCss(s.textFont, DEFAULT_TEXT));
+        root.setProperty('--mdview-text-size', s.textSize + 'px');
+        root.setProperty('--mdview-heading-font', s.headingFont ? fontCss(s.headingFont, DEFAULT_TEXT) : 'var(--mdview-text-font)');
+        root.setProperty('--mdview-code-font', fontCss(s.codeFont, DEFAULT_CODE));
+        root.setProperty('--mdview-code-size', s.codeSize ? s.codeSize + 'px' : '85%');
+    }
+    function unpreview() { VARS.forEach(function(v) { root.removeProperty(v); }); }
+
+    function close(keepPreview) {
+        if (!open) return;
+        if (!keepPreview) unpreview();
+        open.host.remove();
+        var back = open.back;
+        open = null;
+        if (back && back.focus) back.focus();
+    }
+
+    function show(m) {
+        if (open) return;
+        var s = {};
+        Object.keys(m.settings).forEach(function(k) { s[k] = m.settings[k]; });
+        var fonts = (m.fonts || []).map(function(f) { return f.name; });
+        var monoFonts = (m.fonts || []).filter(function(f) { return f.mono; }).map(function(f) { return f.name; });
+        var host = el('div', {'data-mdview-settings': ''});
+        var shadow = host.attachShadow({mode: 'closed'});
+        shadow.appendChild(el('style', {text: CSS}));
+
+        function seg(label, pressed, onclick, extra) {
+            return el('button', {type: 'button', className: 'seg', 'aria-pressed': pressed ? 'true' : 'false', 'aria-label': extra && extra.name, style: extra && extra.css, onclick: onclick}, [label]);
+        }
+        function select(label, value, options, onchange, font) {
+            var sel = el('select', {'aria-label': label, onchange: function() { onchange(sel.value); }, style: font ? 'font-family:' + font : null});
+            var found = false;
+            options.forEach(function(o) {
+                var opt = el('option', {value: o.value, style: o.font ? 'font-family:' + o.font : null}, [o.label]);
+                if (o.value === String(value)) { opt.selected = true; found = true; }
+                sel.appendChild(opt);
+            });
+            if (!found) {
+                var keep = el('option', {value: String(value)}, [String(value) + ' (not installed)']);
+                keep.selected = true;
+                sel.appendChild(keep);
+            }
+            return sel;
+        }
+        function fontOptions(list, defaultLabel) {
+            return [{value: '', label: defaultLabel}].concat(list.map(function(n) {
+                return {value: n, label: n, font: fontCss(n, 'sans-serif')};
+            }));
+        }
+
+        var sizeRow = el('div', {className: 'row', role: 'group', 'aria-label': 'Font size'});
+        var custom = el('span', {className: 'muted', text: 'Custom (set under Advanced)'});
+        var advBody = el('div', {});
+        var advButton = el('button', {type: 'button', className: 'adv', 'aria-expanded': 'false'}, [svg('M5 3l4 4-4 4', 12), 'Advanced: fonts per kind of text']);
+        var askRows = el('div', {style: 'display:flex;flex-direction:column;gap:22px'});
+        var error = el('div', {className: 'error', role: 'alert', hidden: true});
+        var save = el('button', {type: 'button', className: 'btn primary', text: 'Save'});
+        var cancel = el('button', {type: 'button', className: 'btn', text: 'Cancel'});
+
+        function renderSizes() {
+            sizeRow.textContent = '';
+            PRESETS.forEach(function(p) {
+                sizeRow.appendChild(seg(p.glyph, s.textSize === p.px, function() { s.textSize = p.px; changed(); }, p));
+            });
+            custom.hidden = PRESETS.some(function(p) { return p.px === s.textSize; });
+            sizeRow.appendChild(custom);
+        }
+        function renderAdvanced() {
+            advBody.textContent = '';
+            if (advButton.getAttribute('aria-expanded') !== 'true') return;
+            var grid = el('div', {className: 'grid'}, [
+                el('span', {}), el('span', {className: 'muted', text: 'Font'}), el('span', {className: 'muted', text: 'Size'}),
+                el('span', {className: 'strong', text: 'Text'}),
+                select('Text font', s.textFont, fontOptions(fonts, 'Segoe UI (default)'), function(v) { s.textFont = v; changed(); }, fontCss(s.textFont, DEFAULT_TEXT)),
+                select('Text size', s.textSize, TEXT_SIZES.map(function(n) { return {value: String(n), label: n + ' px' + (n === 14 ? ' (default)' : '')}; }), function(v) { s.textSize = Number(v); changed(); }),
+                el('span', {className: 'strong', text: 'Headings'}),
+                select('Heading font', s.headingFont, fontOptions(fonts, 'Same as Text'), function(v) { s.headingFont = v; changed(); }, s.headingFont ? fontCss(s.headingFont, DEFAULT_TEXT) : null),
+                el('span', {className: 'muted', text: 'in step with Text'}),
+                el('span', {className: 'strong', text: 'Code'}),
+                select('Code font', s.codeFont, fontOptions(monoFonts.indexOf(s.codeFont) < 0 && s.codeFont ? monoFonts.concat([s.codeFont]) : monoFonts, 'Cascadia Code (default)'), function(v) { s.codeFont = v; changed(); }, fontCss(s.codeFont, DEFAULT_CODE)),
+                select('Code size', s.codeSize, CODE_SIZES.map(function(n) { return {value: String(n), label: n === 0 ? '85% of Text (default)' : n + ' px'}; }), function(v) { s.codeSize = Number(v); changed(); }),
+                el('span', {}),
+                el('span', {className: 'muted', style: 'grid-column:span 2', text: 'Fonts installed on this PC. Changes show in the document behind this panel.'})
+            ]);
+            advBody.appendChild(el('div', {style: 'display:flex;flex-direction:column;gap:10px'}, [
+                grid,
+                el('button', {type: 'button', className: 'btn', style: 'align-self:flex-start', text: 'Reset fonts to default', onclick: function() {
+                    s.textFont = ''; s.textSize = 14; s.headingFont = ''; s.codeFont = ''; s.codeSize = 0; changed();
+                }})
+            ]));
+        }
+        function renderAsk() {
+            askRows.textContent = '';
+            [['remoteImages', 'Remote images', 'Images from the internet in a document.'],
+             ['networkFiles', 'Network files', 'Images and files from another share or a network drive.']].forEach(function(r) {
+                var row = el('div', {className: 'row', role: 'group', 'aria-label': r[1]});
+                [['ask', 'Ask'], ['always', 'Always load'], ['never', 'Never']].forEach(function(o) {
+                    row.appendChild(seg(o[1], s[r[0]] === o[0], function() { s[r[0]] = o[0]; renderAsk(); }));
+                });
+                askRows.appendChild(el('section', {}, [el('div', {className: 'stack'}, [el('h3', {text: r[1]}), el('span', {className: 'muted', text: r[2]})]), row]));
+            });
+        }
+        function check(key, title, help) {
+            var input = el('input', {type: 'checkbox', onchange: function() { s[key] = input.checked; }});
+            input.checked = !!s[key];
+            return el('label', {className: 'check'}, [input, el('span', {className: 'stack'}, [el('span', {className: 'strong', text: title}), el('span', {className: 'muted', text: help})])]);
+        }
+        function changed() {
+            preview(s);
+            renderSizes();
+            var focused = shadow.activeElement && shadow.activeElement.getAttribute('aria-label');
+            renderAdvanced();
+            if (focused) {
+                var again = advBody.querySelector('[aria-label="' + focused + '"]');
+                if (again) again.focus();
+            }
+        }
+        advButton.addEventListener('click', function() {
+            advButton.setAttribute('aria-expanded', advButton.getAttribute('aria-expanded') === 'true' ? 'false' : 'true');
+            renderAdvanced();
+        });
+
+        var notes = (m.notes || []).length ? el('div', {className: 'notes'}, (m.notes || []).map(function(n) { return el('div', {text: n}); })) : null;
+        var box = el('div', {className: 'box', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'mdview-settings-title'}, [
+            el('div', {className: 'head'}, [
+                el('div', {className: 'stack', style: 'flex:1'}, [
+                    el('h2', {id: 'mdview-settings-title', text: 'Settings'}),
+                    el('span', {className: 'muted', text: m.program})
+                ]),
+                el('button', {type: 'button', className: 'close', 'aria-label': 'Close', title: 'Close (Esc)', onclick: function() { close(false); }}, [svg('M3 3l8 8M11 3l-8 8', 14)])
+            ]),
+            el('div', {className: 'body'}, [
+                notes,
+                el('section', {}, [
+                    el('div', {className: 'row', style: 'align-items:baseline'}, [el('h3', {text: 'Font size'}), el('span', {className: 'muted', text: 'all text in the document'})]),
+                    sizeRow
+                ]),
+                el('section', {}, [advButton, advBody]),
+                el('div', {className: 'sep'}),
+                askRows,
+                check('askDownloads', 'Ask before showing a downloaded document', 'Documents with the "Mark of the Web" from a browser or mail program.'),
+                s.askRegister === null ? null : check('askRegister', 'Offer to register MDView as .md viewer', 'The bar at the top of a document. Standalone viewer only.')
+            ]),
+            error,
+            el('div', {className: 'foot'}, [cancel, save])
+        ]);
+        var scrim = el('div', {className: 'scrim' + (m.dark ? ' dark' : '')}, [box]);
+        shadow.appendChild(scrim);
+
+        cancel.addEventListener('click', function() { close(false); });
+        save.addEventListener('click', function() {
+            error.hidden = true;
+            save.disabled = true;
+            save.textContent = 'Saving…';
+            var msg = {
+                type: 'saveSettings',
+                textFont: s.textFont, textSize: String(s.textSize), headingFont: s.headingFont,
+                codeFont: s.codeFont, codeSize: String(s.codeSize),
+                remoteImages: s.remoteImages, networkFiles: s.networkFiles,
+                askDownloads: s.askDownloads ? 'true' : 'false'
+            };
+            // Only the standalone viewer has the register setting.
+            if (s.askRegister !== null) msg.askRegister = s.askRegister ? 'true' : 'false';
+            webview.postMessage(msg);
+        });
+
+        // Keyboard: Esc cancels, Tab stays inside the panel.
+        scrim.addEventListener('keydown', function(e) {
+            if (e.key !== 'Tab') return;
+            var items = Array.prototype.filter.call(box.querySelectorAll('button,select,input'), function(x) { return !x.disabled && x.offsetParent !== null; });
+            if (!items.length) return;
+            var first = items[0], last = items[items.length - 1], at = shadow.activeElement;
+            if (e.shiftKey && at === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && at === last) { e.preventDefault(); first.focus(); }
+        });
+
+        renderSizes();
+        renderAdvanced();
+        renderAsk();
+        open = {
+            host: host, back: document.activeElement,
+            saved: function() { close(true); },
+            failed: function(text) {
+                error.textContent = text;
+                error.hidden = false;
+                save.disabled = false;
+                save.textContent = 'Save';
+            },
+            values: s
+        };
+        document.body.appendChild(host);
+        var start = sizeRow.querySelector('[aria-pressed="true"]') || sizeRow.querySelector('button');
+        if (start) start.focus();
+    }
+
+    window.addEventListener('keydown', function(e) {
+        if (open && e.key === 'Escape') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            close(false);
+        } else if (!open && e.ctrlKey && !e.altKey && e.key === ',') {
+            e.preventDefault();
+            webview.postMessage({type: 'openSettings'});
+        }
+    }, true);
+    webview.addEventListener('message', function(e) {
+        var m = e.data;
+        if (!m || typeof m.type !== 'string') return;
+        if (m.type === 'showSettings' && m.settings) show(m);
+        else if (m.type === 'settingsSaved' && open) open.saved();
+        else if (m.type === 'settingsError' && open && typeof m.message === 'string') open.failed(m.message);
+    });
+})();
+"##;
+
+/// MDView's own fonts, used when no font is chosen and after a chosen one.
+pub const DEFAULT_TEXT_STACK: &str = r#"-apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif"#;
+pub const DEFAULT_CODE_STACK: &str = r#""Cascadia Code", "Fira Code", Consolas, monospace"#;
+
+/// A CSS font-family value: the chosen font first, then MDView's defaults.
+/// Only a valid font name (`settings::is_font_name`) is ever put in the CSS.
+fn font_css(name: &str, stack: &str) -> String {
+    if crate::settings::is_font_name(name) { format!("\"{name}\", {stack}") } else { stack.to_string() }
+}
+
+/// The page's font variables (#50), for its `:root` rule.
+fn font_variables(fonts: &crate::settings::FontSettings) -> String {
+    let text_size = if crate::settings::is_font_size(fonts.text_size) { fonts.text_size } else { crate::settings::DEFAULT_TEXT_SIZE };
+    let heading = if fonts.heading_font.is_empty() { "var(--mdview-text-font)".to_string() } else { font_css(&fonts.heading_font, DEFAULT_TEXT_STACK) };
+    let code_size = if crate::settings::is_font_size(fonts.code_size) { format!("{}px", fonts.code_size) } else { "85%".to_string() };
+    format!(
+        "--mdview-text-font: {}; --mdview-text-size: {text_size}px; --mdview-heading-font: {heading}; --mdview-code-font: {}; --mdview-code-size: {code_size};",
+        font_css(&fonts.text_font, DEFAULT_TEXT_STACK),
+        font_css(&fonts.code_font, DEFAULT_CODE_STACK),
+    )
 }
 
 /// CSS `zoom` value for a percentage: 125 gives `1.25`.
@@ -445,7 +781,7 @@ pub fn bar_choice_offered(bars: &[Bar], bar: &str, choice: &str) -> bool {
 
 /// A JSON string literal that is also safe inside an HTML <script>: `<`, `>`
 /// and `&` are escaped, so the text can never end the script.
-fn script_string(s: &str) -> String {
+pub fn script_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -539,6 +875,8 @@ fn content_security_policy(nonce: &str, remote_images: RemoteImages) -> String {
 pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, bars: &[Bar], look: &PageLook) -> String {
     let nonce = new_nonce();
     let zoom = css_zoom(look.zoom);
+    let font_vars = font_variables(&look.fonts);
+    let settings_script = SETTINGS_SCRIPT;
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
@@ -572,7 +910,8 @@ document.addEventListener('securitypolicyviolation', function(e) {{
 }});
 </script>
 <style>
-:root {{ zoom: {zoom}; }}
+:root {{ zoom: {zoom}; {font_vars} }}
+h1, h2, h3, h4, h5, h6 {{ font-family: var(--mdview-heading-font); }}
 #mdview-bars {{
     display: flex;
     flex-direction: column;
@@ -602,8 +941,8 @@ document.addEventListener('securitypolicyviolation', function(e) {{
     padding: 0 4px;
 }}
 body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-    font-size: 14px;
+    font-family: var(--mdview-text-font);
+    font-size: var(--mdview-text-size);
     line-height: 1.6;
     padding: 20px;
     max-width: 900px;
@@ -617,8 +956,8 @@ code {{
     background-color: {code_bg};
     padding: 0.2em 0.4em;
     border-radius: 3px;
-    font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
-    font-size: 85%;
+    font-family: var(--mdview-code-font);
+    font-size: var(--mdview-code-size);
 }}
 pre {{
     background-color: {code_bg};
@@ -859,6 +1198,7 @@ a {{ cursor: pointer; }}
         window.addEventListener('scroll', hoverEnd, true);
         window.addEventListener('blur', hoverEnd);
     }}
+{settings_script}
 }})();
 </script>
 </body>
@@ -941,12 +1281,39 @@ mod tests {
     // #16: the zoom is part of the page, so navigating or reloading keeps it.
     #[test]
     fn test_page_carries_the_zoom() {
-        assert!(wrap("", false, RemoteImages::Blocked, &[]).contains(":root { zoom: 1; }"));
+        assert!(wrap("", false, RemoteImages::Blocked, &[]).contains(":root { zoom: 1; "));
         for (percent, css) in [(125, "1.25"), (110, "1.1"), (33, "0.33"), (50, "0.5"), (400, "4")] {
-            let page = wrap_html("", false, RemoteImages::Blocked, &[], &PageLook { zoom: percent });
-            assert!(page.contains(&format!(":root {{ zoom: {css}; }}")), "{percent}");
+            let page = wrap_html("", false, RemoteImages::Blocked, &[], &PageLook { zoom: percent, ..PageLook::default() });
+            assert!(page.contains(&format!(":root {{ zoom: {css}; ")), "{percent}");
         }
         assert_eq!(zoom_message(125), r#"{"type":"zoom","percent":125}"#);
+    }
+
+    // #50: the page's fonts come from the settings as CSS variables; only a
+    // valid font name gets into the CSS, never anything that could end it.
+    #[test]
+    fn test_page_fonts_come_from_the_settings() {
+        use crate::settings::FontSettings;
+        let page = wrap("", false, RemoteImages::Blocked, &[]);
+        assert!(page.contains(&format!("--mdview-text-font: {DEFAULT_TEXT_STACK};")), "default text font");
+        assert!(page.contains("--mdview-text-size: 14px;"));
+        assert!(page.contains("--mdview-heading-font: var(--mdview-text-font);"));
+        assert!(page.contains(&format!("--mdview-code-font: {DEFAULT_CODE_STACK};")));
+        assert!(page.contains("--mdview-code-size: 85%;"));
+        assert!(page.contains("font-family: var(--mdview-text-font);") && page.contains("font-family: var(--mdview-code-font);"));
+        let fonts = FontSettings {
+            text_font: "Georgia".into(), text_size: 17, heading_font: "Cambria".into(),
+            code_font: "Consolas".into(), code_size: 13,
+        };
+        let page = wrap_html("", false, RemoteImages::Blocked, &[], &PageLook { fonts, ..PageLook::default() });
+        assert!(page.contains(&format!("--mdview-text-font: \"Georgia\", {DEFAULT_TEXT_STACK};")));
+        assert!(page.contains("--mdview-text-size: 17px;"));
+        assert!(page.contains(&format!("--mdview-heading-font: \"Cambria\", {DEFAULT_TEXT_STACK};")));
+        assert!(page.contains(&format!("--mdview-code-font: \"Consolas\", {DEFAULT_CODE_STACK};")));
+        assert!(page.contains("--mdview-code-size: 13px;"));
+        let evil = FontSettings { text_font: "x\"; } body { display:none".into(), text_size: 400, ..FontSettings::default() };
+        let page = wrap_html("", false, RemoteImages::Blocked, &[], &PageLook { fonts: evil, ..PageLook::default() });
+        assert!(!page.contains("x\"; } body") && page.contains("--mdview-text-size: 14px;"));
     }
 
     fn nonce_of(page: &str) -> String {
