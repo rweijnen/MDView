@@ -7,9 +7,14 @@ release workflow refuses to publish a version without a section here.
 
 ### New
 - Documents downloaded from the internet (Mark of the Web) are not shown until you choose **Open**, **Open and remove the mark** or **Don't ask again**. (#24)
+- Images and links can use absolute paths, such as `D:\pictures\x.png` or `file://server/share/x.png`. Files from a network location are only loaded after you choose **Load files** or **Always load**; this is separate from remote images. (#56)
 
 ### Changes
 - The remote-images bar can be closed with ×; it stays closed while the document is open.
+- A link to a network location asks before opening. (#56)
+
+### Fixes
+- Paths are shown with `\` only. (#49)
 
 ## v0.2.7
 

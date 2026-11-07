@@ -4,7 +4,9 @@
 # (Load images / Always / Never), the registration bar (#37: no dialog, Not now,
 # Don't ask again, Esc), the gate before documents downloaded from the internet
 # (#24: Open, remove the mark, Don't ask again, Close), Close on the
-# remote-images bar, and the welcome screen.
+# remote-images bar, paths from documents (#49: no escape to other drives,
+# shares, pipes; absolute paths; the network bar: Load files, Always load,
+# Never; links to a share ask first), and the welcome screen.
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -86,9 +88,47 @@ Set-Content (Join-Path $work 'zoneremote.md') -NoNewline -Value (
 Set-Zone 'zoneremote.md' "[ZoneTransfer]`r`nZoneId=3`r`n"
 Set-Content (Join-Path $work 'zoneaway.md') -Value "# Zone away`n`n[Go back](zoneremote.md)" -NoNewline
 
+# Paths from documents (#49). "Another local drive" is a temporary subst
+# letter, the share is \\localhost\C$, a network drive is a temporary net use.
+# Only drive letters this test defined are removed again.
+$freeLetters = @('Q', 'R', 'W', 'Y', 'X', 'V', 'U', 'T', 'S', 'P', 'O', 'N') | Where-Object { -not (Test-Path "$($_):\") }
+$substLetter = $freeLetters[0]; $netLetter = $freeLetters[1]
+$otherDir = Join-Path $work 'other'
+New-Item -ItemType Directory $otherDir | Out-Null
+Copy-Item (Join-Path $work 'local.jpg') (Join-Path $otherDir 'big.jpg')
+Copy-Item (Join-Path $work 'local.jpg') (Join-Path $work 'big.jpg')
+subst "$($substLetter):" $otherDir
+$substDefined = Test-Path "$($substLetter):\big.jpg"
+if ($work -notmatch '^[Cc]:\\') { throw "the share checks need the test folder on C: ($work)" }
+$shareWork = '\\localhost\C$\' + $work.Substring(3)
+$shareUrl = 'file://localhost/C$/' + ($work.Substring(3) -replace '\\', '/')
+$shareReachable = Test-Path (Join-Path $shareWork 'big.jpg')
+$netOutput = net use "$($netLetter):" '\\localhost\C$' /persistent:no 2>&1
+$netDefined = ($LASTEXITCODE -eq 0) -and (Test-Path "$($netLetter):\")
+$up = '../' * 30
+$pipeName = "mdview-behaviour-$PID"
+$encodedShare = (($shareWork + '\big.jpg') -replace '\\', '%5C') -replace '\$', '%24'
+Set-Content (Join-Path $work 'escape.md') -NoNewline -Value ("# Escape`n`n" +
+    "![escape drive](${up}$($substLetter)%3A%5Cbig.jpg)`n`n" +
+    "![escape share](${up}$encodedShare)`n`n" +
+    "![escape pipe](${up}%5C%5C.%5Cpipe%5C$pipeName)")
+Set-Content (Join-Path $work 'absolute.md') -NoNewline -Value ("# Absolute`n`n" +
+    "![abs drive]($($substLetter):\big.jpg)`n`n![abs share](<$shareUrl/big.jpg>)")
+Set-Content (Join-Path $work 'onshare.md') -Value "# On share`n`n![same share](big.jpg)" -NoNewline
+Set-Content (Join-Path $work 'sharelink.md') -Value "# Share link`n`n[to the share](<$shareUrl/second.md>)" -NoNewline
+Set-Content (Join-Path $work 'mapped.md') -NoNewline -Value (
+    "# Mapped`n`n![abs mapped](<$($netLetter):\$($work.Substring(3))\big.jpg>)")
+function Start-PipeProbe($name) {
+    Start-ThreadJob -ArgumentList $name -ScriptBlock {
+        param($n)
+        $s = [System.IO.Pipes.NamedPipeServerStream]::new($n, 'InOut', 4, 'Byte', 'Asynchronous')
+        try { if ($s.WaitForConnectionAsync().Wait(12000)) { 'CONNECTED' } else { 'no connection' } } finally { $s.Dispose() }
+    }
+}
+
 # ---- registry
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking'
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles'
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
@@ -102,6 +142,7 @@ function Restore-Registry {
 function Set-TestRegistry($remoteImages) {
     Restore-Registry
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
     foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
@@ -136,6 +177,18 @@ function Set-RemoteImagesSetting($hostKind, $value) {
     Set-IniRemoteImages $null
     if ($hostKind -eq 'exe') { if ($null -ne $value) { Set-ItemProperty -Path $key -Name RemoteImages -Value $value -Type DWord } }
     else { Set-IniRemoteImages $value }
+}
+
+# Where each host keeps its network-files choice (registry or mdview.ini).
+function Get-NetworkFilesSetting($hostKind) {
+    if ($hostKind -eq 'exe') { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).NetworkFiles } else { Get-IniValue 'NetworkFiles' }
+}
+function Get-OtherNetworkFilesSetting($hostKind) { Get-NetworkFilesSetting $(if ($hostKind -eq 'exe') { 'plugin' } else { 'exe' }) }
+function Set-NetworkFilesSetting($hostKind, $value) {
+    Set-RemoteImagesSetting $hostKind $null
+    if ($null -eq $value) { return }
+    if ($hostKind -eq 'exe') { Set-ItemProperty -Path $key -Name NetworkFiles -Value $value -Type DWord }
+    else { Set-Content -Path $pluginIni -Value "[MDView]`r`nNetworkFiles=$value`r`n" -NoNewline }
 }
 
 # ---- viewer control
@@ -191,6 +244,7 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 '@
 # Windows only lets a process take the foreground under some conditions; a
 # synthetic F24 tap satisfies them and means nothing to MDView (see focus.ps1).
@@ -241,6 +295,41 @@ function Check($name, $ok, $detail) {
     $status = if ($ok) { 'PASS' } else { 'FAIL' }
     if (-not $ok) { $script:failures++ }
     Write-Output ("{0}  {1}  ({2})" -f $status, $name, $detail)
+}
+# A check that cannot run here is reported, never counted as passed.
+function Skip($name, $reason) { Write-Output ("SKIP  {0}  ({1})" -f $name, $reason) }
+function Get-ImageHeight($v, $name) {
+    $e = Find-Element $v $CT::Image $name
+    if ($e) { $e.Current.BoundingRectangle.Height } else { 0 }
+}
+function Wait-ImageHeight($v, $name, $seconds = 10) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do { $h = Get-ImageHeight $v $name; if ($h -gt 50) { return $h }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $deadline)
+    $h
+}
+function Wait-Dialog($v, $seconds = 8) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do { $d = Get-Dialog $v; if ($d) { return $d }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $deadline)
+    $null
+}
+function Get-DialogText($d) { ($d.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' }
+# A message box's buttons have no UIA Invoke pattern (they show as panes of
+# class Button), and BM_CLICK only works while the box is in front: bring it
+# to the front, click, and report whether the box closed.
+function Press-DialogButton($d, $name) {
+    $b = $d.FindFirst($TS::Descendants, (New-Object System.Windows.Automation.AndCondition(
+        (New-Object System.Windows.Automation.PropertyCondition($AE::ClassNameProperty, 'Button')),
+        (New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $name)))))
+    if (-not $b) { return $false }
+    $h = [IntPtr]$d.Current.NativeWindowHandle
+    for ($try = 0; $try -lt 4; $try++) {
+        if (Set-Foreground $h) {
+            [void][Win32.Behaviour]::SendMessage([IntPtr]$b.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+            Start-Sleep -Milliseconds 800
+            try { if ($d.Current.IsOffscreen -or -not [Win32.Behaviour]::IsWindowVisible($h)) { return $true } } catch { return $true }
+        }
+    }
+    $false
 }
 
     foreach ($hostKind in 'exe', 'plugin') {
@@ -594,6 +683,112 @@ function Check($name, $ok, $detail) {
         Stop-Viewer $v
         Check "${hostKind}: after 'Don't ask again' downloaded documents open directly" ([bool]$docShown -and -not $gate -and (Test-Marked 'zone4.md')) "document=$([bool]$docShown) gate=$([bool]$gate)"
         Set-Content (Join-Path $work 'zoneaway.md') -Value "# Zone away`n`n[Go back](zoneremote.md)" -NoNewline
+
+        # ---- Paths from documents (#49)
+        $netText = '^This document loads files from a network location:'
+        $shareName = '^\\\\localhost\\C\$$'
+        # Encoded separators, drive letters and pipes never reach anything,
+        # even with network files allowed.
+        Set-NetworkFilesSetting $hostKind 1
+        $probe = Start-PipeProbe $pipeName
+        $v = Start-Viewer $hostKind (Join-Path $work 'escape.md')
+        $shown = Wait-Element $v $CT::Text '^Escape$' 15
+        Start-Sleep -Seconds 3
+        $hDrive = Get-ImageHeight $v 'escape drive'; $hShare = Get-ImageHeight $v 'escape share'
+        $pipe = Receive-Job $probe -Wait; Remove-Job $probe
+        Stop-Viewer $v
+        Check "${hostKind}: encoded paths reach no other drive, share or pipe" ([bool]$shown -and $substDefined -and $shareReachable -and $hDrive -lt 50 -and $hShare -lt 50 -and $pipe -ne 'CONNECTED') "document=$([bool]$shown) drive=$hDrive share=$hShare pipe=$pipe (subst=$substDefined share reachable=$shareReachable)"
+
+        # Absolute paths: another local drive is shown; a share waits for the bar.
+        Set-NetworkFilesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'absolute.md')
+        [void](Wait-Element $v $CT::Text '^Absolute$' 15)
+        $bar = Wait-Element $v $CT::Text $netText 10
+        $location = Find-Element $v $CT::Text $shareName
+        $hDrive = Wait-ImageHeight $v 'abs drive' 5
+        $hShare = Get-ImageHeight $v 'abs share'
+        Check "${hostKind}: an image with an absolute path on another local drive is shown" ($hDrive -gt 50) "height=$hDrive"
+        Check "${hostKind}: an image on a share is blocked and the bar names the share" ($hShare -lt 50 -and [bool]$bar -and [bool]$location) "height=$hShare bar=$([bool]$bar) location shown=$([bool]$location)"
+        $load = Find-Element $v $CT::Button '^Load files$'
+        if ($load) { Invoke-Element $load }
+        $hShare = Wait-ImageHeight $v 'abs share' 10
+        $barAfter = Find-Element $v $CT::Text $netText
+        Stop-Viewer $v
+        $saved = Get-NetworkFilesSetting $hostKind
+        Check "${hostKind}: 'Load files' shows the image from the share, bar gone, nothing saved" ([bool]$load -and $hShare -gt 50 -and -not $barAfter -and $null -eq $saved) "clicked=$([bool]$load) height=$hShare bar=$([bool]$barAfter) saved=$saved"
+        $v = Start-Viewer $hostKind (Join-Path $work 'absolute.md')
+        [void](Wait-Element $v $CT::Text '^Absolute$' 15)
+        $bar = Wait-Element $v $CT::Text $netText 10
+        $hShare = Get-ImageHeight $v 'abs share'
+        Check "${hostKind}: opened again, the network bar asks again" ([bool]$bar -and $hShare -lt 50) "bar=$([bool]$bar) height=$hShare"
+        $always = Find-Element $v $CT::Button '^Always load$'
+        if ($always) { Invoke-Element $always }
+        $hShare = Wait-ImageHeight $v 'abs share' 10
+        $saved = Get-NetworkFilesSetting $hostKind; $other = Get-OtherNetworkFilesSetting $hostKind
+        Stop-Viewer $v
+        Check "${hostKind}: 'Always load' shows it and saves NetworkFiles=1 in its own settings only" ([bool]$always -and $hShare -gt 50 -and $saved -eq 1 -and $null -eq $other) "clicked=$([bool]$always) height=$hShare saved=$saved other=$other"
+        $v = Start-Viewer $hostKind (Join-Path $work 'absolute.md')
+        [void](Wait-Element $v $CT::Text '^Absolute$' 15)
+        $hShare = Wait-ImageHeight $v 'abs share' 10
+        $bar = Find-Element $v $CT::Text $netText
+        Stop-Viewer $v
+        Check "${hostKind}: after 'Always load' files from shares are shown without a bar" ($hShare -gt 50 -and -not $bar) "height=$hShare bar=$([bool]$bar)"
+        Set-NetworkFilesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'absolute.md')
+        [void](Wait-Element $v $CT::Text $netText 15)
+        $never = Find-Element $v $CT::Button '^Never$'
+        if ($never) { Invoke-Element $never; Start-Sleep -Seconds 1 }
+        $bar = Find-Element $v $CT::Text $netText
+        $hShare = Get-ImageHeight $v 'abs share'
+        $saved = Get-NetworkFilesSetting $hostKind
+        Stop-Viewer $v
+        Check "${hostKind}: 'Never' closes the bar, saves NetworkFiles=2, the image stays blocked" ([bool]$never -and -not $bar -and $saved -eq 2 -and $hShare -lt 50) "clicked=$([bool]$never) bar=$([bool]$bar) saved=$saved height=$hShare"
+
+        # "Always load" for remote images does not cover network files.
+        Set-RemoteImagesSetting $hostKind 1
+        $v = Start-Viewer $hostKind (Join-Path $work 'absolute.md')
+        [void](Wait-Element $v $CT::Text '^Absolute$' 15)
+        $bar = Wait-Element $v $CT::Text $netText 10
+        $hShare = Get-ImageHeight $v 'abs share'
+        Stop-Viewer $v
+        Check "${hostKind}: remote images 'Always' still asks for network files" ([bool]$bar -and $hShare -lt 50) "bar=$([bool]$bar) height=$hShare"
+
+        # A document on a share shows its own images without asking.
+        Set-NetworkFilesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $shareWork 'onshare.md')
+        $shown = Wait-Element $v $CT::Text '^On share$' 15
+        $h = Wait-ImageHeight $v 'same share' 10
+        $bar = Find-Element $v $CT::Text $netText
+        Stop-Viewer $v
+        Check "${hostKind}: a document on a share shows images from that share without a bar" ([bool]$shown -and $h -gt 50 -and -not $bar) "document=$([bool]$shown) height=$h bar=$([bool]$bar)"
+
+        # A link to a share asks first.
+        $v = Start-Viewer $hostKind (Join-Path $work 'sharelink.md')
+        $link = Wait-Element $v $CT::Hyperlink 'to the share' 15
+        if ($link) { Invoke-Element $link }
+        $d = Wait-Dialog $v
+        $text = if ($d) { Get-DialogText $d } else { '' }
+        $no = if ($d) { Press-DialogButton $d 'No' } else { $false }
+        $stayed = Find-Element $v $CT::Text '^Share link$'
+        if ($link) { Invoke-Element $link }
+        $d = Wait-Dialog $v
+        $yes = if ($d) { Press-DialogButton $d 'Yes' } else { $false }
+        $second = Wait-Element $v $CT::Text '^Second$' 10
+        Stop-Viewer $v
+        Check "${hostKind}: a link to a share asks first; No stays, Yes opens it" ($text -match 'network location' -and $text -match 'localhost' -and $no -and [bool]$stayed -and $yes -and [bool]$second) "dialog='$text' no=$no stayed=$([bool]$stayed) yes=$yes opened=$([bool]$second)"
+
+        # A network drive counts as a network location.
+        if ($netDefined) {
+            $v = Start-Viewer $hostKind (Join-Path $work 'mapped.md')
+            [void](Wait-Element $v $CT::Text '^Mapped$' 15)
+            $bar = Wait-Element $v $CT::Text $netText 10
+            $location = Find-Element $v $CT::Text "^$($netLetter):$"
+            $h = Get-ImageHeight $v 'abs mapped'
+            Stop-Viewer $v
+            Check "${hostKind}: an image on a network drive waits for the bar, which names the drive" ([bool]$bar -and [bool]$location -and $h -lt 50) "bar=$([bool]$bar) location=$([bool]$location) height=$h"
+        } else {
+            Skip "${hostKind}: an image on a network drive waits for the bar" "net use $($netLetter): \\localhost\C$ failed: $netOutput"
+        }
     }
 
     # Nothing is read before the gate (#24): a downloaded document that another
@@ -657,6 +852,8 @@ finally {
     # Only windows this test started (tracked by process), never others.
     foreach ($p in $started) { if (-not $p.HasExited) { $p | Stop-Process -Force } }
     if (Get-Command Restore-Registry -ErrorAction SilentlyContinue) { Restore-Registry }
+    if ($substDefined) { subst "$($substLetter):" /d }
+    if ($netDefined) { net use "$($netLetter):" /delete /y | Out-Null }
     if ($tcp) { $tcp.Stop() }
     if ($job) { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 2

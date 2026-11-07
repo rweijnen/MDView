@@ -5,6 +5,7 @@ mod links;
 mod markdown;
 mod settings;
 mod viewer;
+mod vpath;
 mod zone;
 
 use std::ffi::{CStr, c_char, c_int};

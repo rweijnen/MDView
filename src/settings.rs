@@ -212,18 +212,19 @@ fn registry_write_dword(name: &str, value: u32) -> Result<(), String> {
     }
 }
 
-/// Whether remote (http/https) images in a document are loaded.
+/// Whether something a document asks for is loaded: remote (http/https)
+/// images, or files from a network location. Stored as 0/1/2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteImagesSetting {
-    /// Default: blocked, with a banner offering to load them.
+pub enum AskSetting {
+    /// Default: blocked, with a bar offering to load it.
     Ask,
-    /// Always load remote images.
+    /// Always load it.
     Always,
-    /// Never load them and don't ask.
+    /// Never load it and don't ask.
     Never,
 }
 
-impl RemoteImagesSetting {
+impl AskSetting {
     fn from_dword(v: u32) -> Self {
         match v {
             1 => Self::Always,
@@ -241,14 +242,26 @@ impl RemoteImagesSetting {
     }
 }
 
-pub fn remote_images_setting() -> RemoteImagesSetting {
+pub fn remote_images_setting() -> AskSetting {
     read_dword(REMOTE_IMAGES)
-        .map(RemoteImagesSetting::from_dword)
-        .unwrap_or(RemoteImagesSetting::Ask)
+        .map(AskSetting::from_dword)
+        .unwrap_or(AskSetting::Ask)
 }
 
-pub fn set_remote_images_setting(setting: RemoteImagesSetting) -> Result<(), String> {
+pub fn set_remote_images_setting(setting: AskSetting) -> Result<(), String> {
     write_dword(REMOTE_IMAGES, setting.to_dword())
+}
+
+/// Files from another share or a network drive, named in a document. Separate
+/// from remote images: a share can also receive the user's Windows login.
+const NETWORK_FILES: &str = "NetworkFiles";
+
+pub fn network_files_setting() -> AskSetting {
+    read_dword(NETWORK_FILES).map(AskSetting::from_dword).unwrap_or(AskSetting::Ask)
+}
+
+pub fn set_network_files_setting(setting: AskSetting) -> Result<(), String> {
+    write_dword(NETWORK_FILES, setting.to_dword())
 }
 
 /// "Don't ask again" on the page shown instead of a downloaded document (#24).
@@ -423,9 +436,24 @@ mod tests {
 
     #[test]
     fn test_remote_images_setting_round_trips_and_defaults_to_ask() {
-        for s in [RemoteImagesSetting::Ask, RemoteImagesSetting::Always, RemoteImagesSetting::Never] {
-            assert_eq!(RemoteImagesSetting::from_dword(s.to_dword()), s);
+        for s in [AskSetting::Ask, AskSetting::Always, AskSetting::Never] {
+            assert_eq!(AskSetting::from_dword(s.to_dword()), s);
         }
-        assert_eq!(RemoteImagesSetting::from_dword(99), RemoteImagesSetting::Ask);
+        assert_eq!(AskSetting::from_dword(99), AskSetting::Ask);
+    }
+
+    // Network files have their own value: "Always load" for remote images
+    // must not also send requests to a share.
+    #[test]
+    fn test_network_files_are_stored_apart_from_remote_images() {
+        assert_ne!(NETWORK_FILES, REMOTE_IMAGES);
+        let dir = TempFolder::new("network");
+        let store = ini_store_for(&dir.0);
+        write_dword_in(&store, REMOTE_IMAGES, AskSetting::Always.to_dword()).unwrap();
+        assert_eq!(read_dword_in(&store, NETWORK_FILES), None, "remote images do not set network files");
+        write_dword_in(&store, NETWORK_FILES, AskSetting::Never.to_dword()).unwrap();
+        assert_eq!(read_dword_in(&store, REMOTE_IMAGES), Some(1));
+        let text = std::fs::read_to_string(dir.0.join("mdview.ini")).unwrap();
+        assert!(text.contains("NetworkFiles=2") && text.contains("RemoteImages=1"), "{text:?}");
     }
 }

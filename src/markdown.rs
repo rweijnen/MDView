@@ -1,7 +1,35 @@
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
 use std::collections::HashMap;
 
+/// HTML for the viewer's page showing `document`: absolute paths in images
+/// and links (`D:\x.png`, `file:///D:/x.png`, `\\server\share\x.png`) become
+/// MDView URLs, so the host decides whether they may be loaded (see `vpath`).
+pub fn markdown_to_page_html(markdown: &str, document: &std::path::Path) -> String {
+    render(markdown, Some(document))
+}
+
+/// HTML without any rewriting (console output: `--html`, `--body`).
+#[allow(dead_code)] // standalone viewer only; markdown.rs is compiled into both binaries
 pub fn markdown_to_html(markdown: &str) -> String {
+    render(markdown, None)
+}
+
+/// Absolute targets of images and links, as MDView URLs. Raw HTML is left
+/// alone; its absolute paths stay blocked by the page's rules.
+fn rewrite_absolute_targets(events: &mut [Event], document: &std::path::Path) {
+    let Some(root) = crate::vpath::Root::of(document) else { return };
+    for event in events.iter_mut() {
+        if let Event::Start(Tag::Image { dest_url, .. } | Tag::Link { dest_url, .. }) = event {
+            if let Some(url) = crate::vpath::absolute_link_target(dest_url)
+                .and_then(|path| crate::vpath::url_for(&path, &root))
+            {
+                *dest_url = url.into();
+            }
+        }
+    }
+}
+
+fn render(markdown: &str, document: Option<&std::path::Path>) -> String {
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_FOOTNOTES);
@@ -12,6 +40,9 @@ pub fn markdown_to_html(markdown: &str) -> String {
 
     let mut events: Vec<Event> = Parser::new_ext(markdown, options).collect();
     assign_heading_ids(&mut events);
+    if let Some(document) = document {
+        rewrite_absolute_targets(&mut events, document);
+    }
 
     let mut html_output = String::new();
     html::push_html(&mut html_output, events.into_iter());
@@ -127,9 +158,15 @@ pub enum BarShow {
     Now,
     /// Only once a remote image was actually blocked.
     WhenRemoteImageBlocked,
+    /// Only once the host blocked a file from a network location.
+    WhenNetworkFileBlocked,
 }
 
 pub const REMOTE_IMAGES_BAR: &str = "remote-images";
+
+/// Files from another share or a network drive: asked separately from remote
+/// images, because a share can also receive the user's Windows login.
+pub const NETWORK_FILES_BAR: &str = "network-files";
 
 /// Standalone viewer only: asks to register MDView as .md viewer (#37).
 pub const REGISTER_BAR: &str = "register";
@@ -144,6 +181,8 @@ pub struct PageBars<'a> {
     pub remote_images: RemoteImages,
     /// Only ever true in the standalone viewer.
     pub ask_to_register: bool,
+    /// Files from network locations are blocked until the user agrees.
+    pub ask_network_files: bool,
     /// Bars the user closed while this document is open.
     pub closed: &'a [String],
 }
@@ -156,6 +195,9 @@ pub struct DocumentChoices {
     document: Option<std::path::PathBuf>,
     closed_bars: Vec<String>,
     opened_download: bool,
+    network_loaded: bool,
+    /// Network locations blocked on the page now shown, in the order met.
+    network_blocked: Vec<String>,
 }
 
 impl DocumentChoices {
@@ -165,7 +207,51 @@ impl DocumentChoices {
             self.document = Some(document.to_path_buf());
             self.closed_bars.clear();
             self.opened_download = false;
+            self.network_loaded = false;
+            self.network_blocked.clear();
         }
+    }
+
+    /// The document whose page is shown now (the last one served).
+    pub fn document(&self) -> Option<&std::path::Path> {
+        self.document.as_deref()
+    }
+
+    /// `document` is served as a page (again): what was blocked on the
+    /// previous page no longer counts.
+    pub fn page_served(&mut self, document: &std::path::Path) {
+        self.switch_to(document);
+        self.network_blocked.clear();
+    }
+
+    /// Whether the user chose Load files for `document` while it is open.
+    pub fn network_loaded(&mut self, document: &std::path::Path) -> bool {
+        self.switch_to(document);
+        self.network_loaded
+    }
+
+    /// The user chose Load files for `document`.
+    pub fn load_network(&mut self, document: &std::path::Path) {
+        self.switch_to(document);
+        self.network_loaded = true;
+        self.network_blocked.clear();
+    }
+
+    /// A file from `location` was blocked on `document`'s page. True the
+    /// first time for that location, so the page is told only once.
+    pub fn note_network_blocked(&mut self, document: &std::path::Path, location: &str) -> bool {
+        self.switch_to(document);
+        if self.network_blocked.iter().any(|l| l.eq_ignore_ascii_case(location)) {
+            return false;
+        }
+        self.network_blocked.push(location.to_string());
+        true
+    }
+
+    /// The network locations blocked on `document`'s page so far.
+    pub fn network_blocked(&mut self, document: &std::path::Path) -> Vec<String> {
+        self.switch_to(document);
+        self.network_blocked.clone()
     }
 
     /// The closed bars for `document`, which is about to be shown.
@@ -282,6 +368,19 @@ pub fn document_bars(page: &PageBars) -> Vec<Bar> {
             closable: true,
         });
     }
+    if page.ask_network_files {
+        bars.push(Bar {
+            id: NETWORK_FILES_BAR,
+            text: "This document loads files from a network location:".to_string(),
+            buttons: vec![
+                BarButton { choice: "once", label: "Load files", closes_bar: false },
+                BarButton { choice: "always", label: "Always load", closes_bar: false },
+                BarButton { choice: "never", label: "Never", closes_bar: true },
+            ],
+            show: BarShow::WhenNetworkFileBlocked,
+            closable: true,
+        });
+    }
     bars.retain(|bar| !page.closed.iter().any(|closed| closed == bar.id));
     bars
 }
@@ -316,6 +415,11 @@ fn script_string(s: &str) -> String {
     out
 }
 
+/// The host's message to the page that a network location was blocked, as
+/// JSON for `PostWebMessageAsJson`. The location is shown as text only.
+pub fn network_blocked_message(location: &str) -> String {
+    format!(r#"{{"type":"networkBlocked","location":{}}}"#, script_string(location))
+}
 fn bars_json(bars: &[Bar]) -> String {
     let items: Vec<String> = bars
         .iter()
@@ -335,6 +439,7 @@ fn bars_json(bars: &[Bar]) -> String {
             let show = match bar.show {
                 BarShow::Now => "now",
                 BarShow::WhenRemoteImageBlocked => "remoteImageBlocked",
+                BarShow::WhenNetworkFileBlocked => "networkFileBlocked",
             };
             format!(
                 r#"{{"id":{},"text":{},"buttons":[{}],"show":"{show}","closable":{}}}"#,
@@ -371,12 +476,12 @@ fn new_nonce() -> String {
 /// the document's own files, unless remote images are allowed.
 fn content_security_policy(nonce: &str, remote_images: RemoteImages) -> String {
     let img_src = match remote_images {
-        RemoteImages::Allowed => "https://mdview.example data: https: http:",
-        RemoteImages::AskToLoad | RemoteImages::Blocked => "https://mdview.example data:",
+        RemoteImages::Allowed => "https://mdview.example https://*.mdview.example data: https: http:",
+        RemoteImages::AskToLoad | RemoteImages::Blocked => "https://mdview.example https://*.mdview.example data:",
     };
     format!(
         "default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; \
-         img-src {img_src}; media-src https://mdview.example; font-src 'none'; \
+         img-src {img_src}; media-src https://mdview.example https://*.mdview.example; font-src 'none'; \
          connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; \
          form-action 'none'"
     )
@@ -436,7 +541,7 @@ document.addEventListener('securitypolicyviolation', function(e) {{
 }}
 .mdview-bar span {{ flex: 1; }}
 .mdview-bar button {{ font: inherit; cursor: pointer; }}
-.mdview-gate code {{ word-break: break-all; }}
+.mdview-gate code, .mdview-bar-location {{ word-break: break-all; }}
 .mdview-bar button.mdview-bar-close {{
     border: none;
     background: transparent;
@@ -564,6 +669,32 @@ a {{ cursor: pointer; }}
         bars.forEach(function(def) {{ if (def.show === 'remoteImageBlocked') showBar(def); }});
     }};
     if (window.__mdviewRemoteImageBlocked) window.__mdviewOnRemoteImageBlocked();
+
+    // MDView tells the page which network locations it blocked; they are
+    // listed in the bar as text. Locations blocked before this script ran
+    // are asked for once (networkStatus).
+    var networkLocations = {{}};
+    function networkFileBlocked(location) {{
+        bars.forEach(function(def) {{
+            if (def.show !== 'networkFileBlocked') return;
+            showBar(def);
+            var bar = document.querySelector('#mdview-bars > [data-bar="' + def.id + '"]');
+            if (!bar || networkLocations[location.toLowerCase()]) return;
+            networkLocations[location.toLowerCase()] = true;
+            var item = document.createElement('code');
+            item.className = 'mdview-bar-location';
+            item.textContent = location;
+            bar.firstChild.appendChild(document.createTextNode(' '));
+            bar.firstChild.appendChild(item);
+        }});
+    }}
+    if (webview && bars.some(function(def) {{ return def.show === 'networkFileBlocked'; }})) {{
+        webview.addEventListener('message', function(e) {{
+            var m = e.data;
+            if (m && m.type === 'networkBlocked' && typeof m.location === 'string') networkFileBlocked(m.location);
+        }});
+        webview.postMessage({{type: 'networkStatus'}});
+    }}
 
     // Heading ids are generated server-side (markdown::assign_heading_ids).
     function scrollToHash(hash) {{
@@ -717,18 +848,103 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    // Absolute paths in Markdown images and links become MDView URLs, so the
+    // host decides about them; raw HTML and console output are not rewritten.
+    #[test]
+    fn test_network_bar_is_offered_only_when_asked() {
+        assert!(document_bars(&page(RemoteImages::Blocked, false)).is_empty());
+        let bars = document_bars(&PageBars { ask_network_files: true, ..page(RemoteImages::AskToLoad, false) });
+        let ids: Vec<&str> = bars.iter().map(|b| b.id).collect();
+        assert_eq!(ids, [REMOTE_IMAGES_BAR, NETWORK_FILES_BAR], "network bar comes after remote images");
+        let network = &bars[1];
+        assert_eq!(network.show, BarShow::WhenNetworkFileBlocked);
+        assert!(network.closable);
+        for choice in ["once", "always", "never", CLOSE_CHOICE] {
+            assert!(bar_choice_offered(&bars, NETWORK_FILES_BAR, choice), "{choice}");
+        }
+        assert!(!bar_choice_offered(&bars, NETWORK_FILES_BAR, "load"));
+        assert!(network.buttons.iter().any(|b| b.choice == "never" && b.closes_bar));
+        let page_html = wrap_html("x", false, RemoteImages::AskToLoad, &bars);
+        assert!(page_html.contains(r#""show":"networkFileBlocked""#));
+        // A closed network bar stays away while the document is open.
+        let closed = vec![NETWORK_FILES_BAR.to_string()];
+        let bars = document_bars(&PageBars { ask_network_files: true, closed: &closed, ..page(RemoteImages::Blocked, false) });
+        assert!(bars.is_empty());
+    }
+
+    #[test]
+    fn test_network_blocked_message_is_json_with_the_location_as_text() {
+        assert_eq!(
+            network_blocked_message(r"\\server\share"),
+            r#"{"type":"networkBlocked","location":"\\\\server\\share"}"#
+        );
+        let evil = network_blocked_message(r#"\\x\"</script><b>"#);
+        assert!(!evil.contains('<') && !evil.contains('>'), "{evil}");
+    }
+
+    #[test]
+    fn test_network_choices_last_while_the_document_is_open() {
+        let a = std::path::Path::new(r"C:\docs\a.md");
+        let b = std::path::Path::new(r"C:\docs\b.md");
+        let mut choices = DocumentChoices::default();
+        choices.page_served(a);
+        assert!(!choices.network_loaded(a));
+        assert!(choices.note_network_blocked(a, r"\\server\share"));
+        assert!(!choices.note_network_blocked(a, r"\\SERVER\share"), "told once per location");
+        assert!(choices.note_network_blocked(a, "Z:"));
+        assert_eq!(choices.network_blocked(a), [r"\\server\share", "Z:"]);
+        choices.page_served(a);
+        assert!(choices.network_blocked(a).is_empty(), "a new page starts without blocked locations");
+        choices.load_network(a);
+        assert!(choices.network_loaded(a));
+        choices.page_served(a);
+        assert!(choices.network_loaded(a), "a reload keeps Load files");
+        choices.page_served(b);
+        assert!(!choices.network_loaded(b), "another document asks again");
+        assert!(!choices.network_loaded(a), "and so does the first one when it is opened again");
+    }
+    #[test]
+    fn test_absolute_paths_become_mdview_urls() {
+        let doc = std::path::Path::new(r"C:\docs\note.md");
+        let md = concat!(
+            "![a](D:\\pics\\a.png) ![b](<file:///D:/my%20pics/b.png>) ![c](\\\\\\\\server\\share\\c.png) ![c2](file://server/share/c2.png)\n\n",
+            // In Markdown `\\` is an escaped backslash: this is `\server\share`, not a share.
+            "![x](\\\\server\\share\\x.png)\n\n",
+            "![d](C:\\docs\\img\\d.png) ![e](img/e.png) [f](D:\\notes\\f.md) [g](https://example.com/g)\n\n",
+            "![p](\\\\.\\pipe\\p)\n\n",
+            "<img src=\"D:\\raw.png\">\n"
+        );
+        let html = markdown_to_page_html(md, doc);
+        for expected in [
+            r#"src="https://drive-d.mdview.example/pics/a.png""#,
+            r#"src="https://drive-d.mdview.example/my%20pics/b.png""#,
+            r#"src="https://unc.mdview.example/server/share/c.png""#,
+            r#"src="https://unc.mdview.example/server/share/c2.png""#,
+            r#"src="%5Cserver%5Cshare%5Cx.png""#,
+            r#"src="https://mdview.example/docs/img/d.png""#,
+            r#"src="img/e.png""#,
+            r#"href="https://drive-d.mdview.example/notes/f.md""#,
+            r#"href="https://example.com/g""#,
+            r#"<img src="D:\raw.png">"#,
+        ] {
+            assert!(html.contains(expected), "missing {expected} in {html}");
+        }
+        assert!(!html.contains("pipe.mdview") && !html.contains("mdview.example/./"), "a pipe never gets an MDView URL: {html}");
+        let console = markdown_to_html(md);
+        assert!(console.contains(r#"src="D:%5Cpics%5Ca.png""#) && !console.contains("mdview.example"), "console output is not rewritten: {console}");
+    }
     #[test]
     fn test_remote_images_load_only_when_allowed() {
         let allowed = wrap_html("", false, RemoteImages::Allowed, &[]);
-        assert!(allowed.contains("img-src https://mdview.example data: https: http:;"));
+        assert!(allowed.contains("img-src https://mdview.example https://*.mdview.example data: https: http:;"));
         let ask = wrap_html("", false, RemoteImages::AskToLoad, &document_bars(&page(RemoteImages::AskToLoad, false)));
-        assert!(ask.contains("img-src https://mdview.example data:;"));
+        assert!(ask.contains("img-src https://mdview.example https://*.mdview.example data:;"));
         let blocked = wrap_html("", false, RemoteImages::Blocked, &[]);
-        assert!(blocked.contains("img-src https://mdview.example data:;"));
+        assert!(blocked.contains("img-src https://mdview.example https://*.mdview.example data:;"));
     }
 
     fn page(remote_images: RemoteImages, ask_to_register: bool) -> PageBars<'static> {
-        PageBars { remote_images, ask_to_register, closed: &[] }
+        PageBars { remote_images, ask_to_register, ask_network_files: false, closed: &[] }
     }
 
     // #40: one bar component; MDView decides which bars a page gets.

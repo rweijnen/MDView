@@ -18,6 +18,10 @@ pub enum LinkAction {
     OpenMarkdown(PathBuf),
     /// Another local file: open with its default app, but only after the user confirms.
     ConfirmOpenFile(PathBuf),
+    /// A Markdown or other file on another share or network drive: opened
+    /// (Markdown in MDView, other files with their default app) only after
+    /// the user confirms, because opening it connects to that location.
+    ConfirmOpenNetwork { path: PathBuf, location: String },
     /// Never opened; tell the user why.
     Refuse { target: String, reason: &'static str },
 }
@@ -78,8 +82,9 @@ fn names_data_stream(path: &Path) -> bool {
         .is_some_and(|n| n.to_string_lossy().contains(':'))
 }
 
-/// Decide what to do with a local file a link points to.
-pub fn classify_local_file(path: &Path) -> LinkAction {
+/// Decide what to do with a file a link points to. `network` names the
+/// network location it is on (another share or a network drive), if any.
+pub fn classify_local_file(path: &Path, network: Option<String>) -> LinkAction {
     if names_data_stream(path) {
         LinkAction::Refuse {
             target: path.display().to_string(),
@@ -90,6 +95,8 @@ pub fn classify_local_file(path: &Path) -> LinkAction {
             target: path.display().to_string(),
             reason: REFUSED_PROGRAM,
         }
+    } else if let Some(location) = network {
+        LinkAction::ConfirmOpenNetwork { path: path.to_path_buf(), location }
     } else if is_markdown(path) {
         LinkAction::OpenMarkdown(path.to_path_buf())
     } else {
@@ -100,56 +107,33 @@ pub fn classify_local_file(path: &Path) -> LinkAction {
 /// Decide what to do with a link URL from the page. `resolve_virtual` maps
 /// MDView's own `https://mdview.example/...` URLs to the local file they stand
 /// for (`None` for any other URL).
-pub fn classify_url(url: &str, resolve_virtual: impl Fn(&str) -> Option<PathBuf>) -> LinkAction {
-    if let Some(path) = resolve_virtual(url) {
-        return classify_local_file(&path);
+pub fn classify_url(
+    url: &str,
+    resolve_virtual: impl Fn(&str) -> Option<PathBuf>,
+    network_location: impl Fn(&Path) -> Option<String>,
+) -> LinkAction {
+    let refuse = || LinkAction::Refuse {
+        target: url.to_string(),
+        reason: REFUSED_LINK_TYPE,
+    };
+    // One of MDView's own URLs that names no plain file is refused, never
+    // handed to the browser as a web link.
+    if crate::vpath::is_virtual_url(url) {
+        return match resolve_virtual(url) {
+            Some(path) => classify_local_file(&path, network_location(&path)),
+            None => refuse(),
+        };
     }
     let lower = url.trim_start().to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
         return LinkAction::OpenExternal(url.trim().to_string());
     }
     if lower.starts_with("file:") {
-        if let Some(path) = file_url_to_path(url) {
-            return classify_local_file(&path);
+        if let Some(path) = crate::vpath::file_url_to_path(url) {
+            return classify_local_file(&path, network_location(&path));
         }
     }
-    LinkAction::Refuse {
-        target: url.to_string(),
-        reason: REFUSED_LINK_TYPE,
-    }
-}
-
-/// `file:///C:/dir/a%20b.txt` or `file://server/share/x` to a Windows path.
-fn file_url_to_path(url: &str) -> Option<PathBuf> {
-    let rest = url.get(5..)?; // after "file:"
-    let rest = rest.split(['?', '#']).next().unwrap_or_default();
-    let decoded = percent_decode(rest);
-    let path = if let Some(local) = decoded.strip_prefix("///") {
-        local.replace('/', "\\")
-    } else if let Some(unc) = decoded.strip_prefix("//") {
-        format!("\\\\{}", unc.replace('/', "\\"))
-    } else {
-        return None;
-    };
-    (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
-                out.push(h << 4 | l);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    refuse()
 }
 
 fn hex(b: u8) -> Option<u8> {
@@ -160,7 +144,6 @@ fn hex(b: u8) -> Option<u8> {
         _ => None,
     }
 }
-
 /// Carry out a link decision. `owner` is the window dialogs belong to;
 /// `open_markdown` shows a Markdown file in the viewer. Every outcome other
 /// than success is reported to the user.
@@ -182,6 +165,26 @@ pub fn perform(
             );
             if message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
                 shell_open(owner, &path.to_string_lossy());
+            }
+        }
+        LinkAction::ConfirmOpenNetwork { path, location } => {
+            let text = if is_markdown(&path) {
+                format!(
+                    "This link opens a document from a network location:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document. Open it?",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "This link opens a file from a network location with its default program:\n\n{}\n\nOpening it connects to {location}. Only open it if you trust this document. Open it?",
+                    path.display()
+                )
+            };
+            if message_box(owner, &text, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
+                if is_markdown(&path) {
+                    open_markdown(&path);
+                } else {
+                    shell_open(owner, &path.to_string_lossy());
+                }
             }
         }
         LinkAction::Refuse { target, reason } => {
@@ -346,6 +349,10 @@ mod tests {
         None
     }
 
+    fn not_network(_: &Path) -> Option<String> {
+        None
+    }
+
     fn refused(a: &LinkAction) -> bool {
         matches!(a, LinkAction::Refuse { .. })
     }
@@ -353,7 +360,7 @@ mod tests {
     #[test]
     fn test_web_and_mail_links_open_externally() {
         for url in ["https://example.com/a", "http://example.com", "mailto:a@b.c", "HTTPS://X.Y"] {
-            assert!(matches!(classify_url(url, no_virtual), LinkAction::OpenExternal(_)), "{url}");
+            assert!(matches!(classify_url(url, no_virtual, not_network), LinkAction::OpenExternal(_)), "{url}");
         }
     }
 
@@ -370,20 +377,20 @@ mod tests {
             "shell:startup",
             "",
         ] {
-            assert!(refused(&classify_url(url, no_virtual)), "{url:?} must be refused");
+            assert!(refused(&classify_url(url, no_virtual, not_network)), "{url:?} must be refused");
         }
     }
 
     #[test]
     fn test_file_urls_follow_the_local_file_rules() {
-        assert!(refused(&classify_url("file:///C:/tmp/canary.cmd", no_virtual)));
-        assert!(refused(&classify_url("file://server/share/x.exe", no_virtual)));
+        assert!(refused(&classify_url("file:///C:/tmp/canary.cmd", no_virtual, not_network)));
+        assert!(refused(&classify_url("file://server/share/x.exe", no_virtual, not_network)));
         assert_eq!(
-            classify_url("file:///C:/tmp/a%20b.pdf", no_virtual),
+            classify_url("file:///C:/tmp/a%20b.pdf", no_virtual, not_network),
             LinkAction::ConfirmOpenFile(PathBuf::from("C:\\tmp\\a b.pdf"))
         );
         assert_eq!(
-            classify_url("file:///C:/tmp/notes.md", no_virtual),
+            classify_url("file:///C:/tmp/notes.md", no_virtual, not_network),
             LinkAction::OpenMarkdown(PathBuf::from("C:\\tmp\\notes.md"))
         );
     }
@@ -391,15 +398,48 @@ mod tests {
     #[test]
     fn test_virtual_urls_use_the_resolved_file() {
         let resolve = |u: &str| u.strip_prefix("https://mdview.example/").map(|p| PathBuf::from(format!("C:\\{p}")));
-        assert!(refused(&classify_url("https://mdview.example/tmp/canary.cmd", resolve)));
+        assert!(refused(&classify_url("https://mdview.example/tmp/canary.cmd", resolve, not_network)));
         assert_eq!(
-            classify_url("https://mdview.example/tmp/next.md", resolve),
+            classify_url("https://mdview.example/tmp/next.md", resolve, not_network),
             LinkAction::OpenMarkdown(PathBuf::from("C:\\tmp/next.md"))
         );
         assert!(matches!(
-            classify_url("https://mdview.example/tmp/report.pdf", resolve),
+            classify_url("https://mdview.example/tmp/report.pdf", resolve, not_network),
             LinkAction::ConfirmOpenFile(_)
         ));
+    }
+
+    // A refused MDView URL is never handed to the browser as a web link.
+    #[test]
+    fn test_unresolvable_virtual_urls_are_refused() {
+        for url in [
+            "https://mdview.example/%5C%5Cserver%5Cshare%5Cx.md",
+            "https://drive-d.mdview.example/CON",
+            "https://unc.mdview.example/server",
+        ] {
+            assert!(refused(&classify_url(url, no_virtual, not_network)), "{url}");
+        }
+    }
+
+    // Opening anything on another share or network drive connects to it, so
+    // the user is asked first; programs stay refused.
+    #[test]
+    fn test_network_locations_need_confirmation() {
+        let share = |p: &Path| p.to_string_lossy().starts_with(r"\\").then(|| r"\\server\share".to_string());
+        for url in ["file://server/share/notes.md", "file://server/share/report.pdf"] {
+            assert!(matches!(
+                classify_url(url, no_virtual, share),
+                LinkAction::ConfirmOpenNetwork { ref location, .. } if location == r"\\server\share"
+            ), "{url}");
+        }
+        assert!(refused(&classify_url("file://server/share/x.exe", no_virtual, share)));
+        assert!(refused(&classify_url("file://server/share/a.md:x", no_virtual, share)));
+        assert_eq!(
+            classify_url("file:///C:/tmp/notes.md", no_virtual, share),
+            LinkAction::OpenMarkdown(PathBuf::from(r"C:\tmp\notes.md"))
+        );
+        // Special paths are not links to a file at all.
+        assert!(refused(&classify_url("file:////./pipe/p", no_virtual, share)));
     }
 
     #[test]
@@ -412,7 +452,7 @@ mod tests {
             "a.exe.", "a.exe ", "a.exe. . ", "a.exe:stream", "a.exe::$DATA", "a.txt:evil.exe",
         ] {
             let path = PathBuf::from(format!("C:\\tmp\\{name}"));
-            assert!(refused(&classify_local_file(&path)), "{name:?} must be refused");
+            assert!(refused(&classify_local_file(&path, None)), "{name:?} must be refused");
         }
     }
 
@@ -420,11 +460,11 @@ mod tests {
     fn test_documents_need_confirmation_and_markdown_opens() {
         for name in ["a.pdf", "a.png", "a.txt", "a.csv", "a.html", "noextension", "a.MD.txt"] {
             let path = PathBuf::from(format!("C:\\tmp\\{name}"));
-            assert!(matches!(classify_local_file(&path), LinkAction::ConfirmOpenFile(_)), "{name}");
+            assert!(matches!(classify_local_file(&path, None), LinkAction::ConfirmOpenFile(_)), "{name}");
         }
         for name in ["a.md", "a.MD", "a.markdown"] {
             let path = PathBuf::from(format!("C:\\tmp\\{name}"));
-            assert!(matches!(classify_local_file(&path), LinkAction::OpenMarkdown(_)), "{name}");
+            assert!(matches!(classify_local_file(&path, None), LinkAction::OpenMarkdown(_)), "{name}");
         }
     }
 

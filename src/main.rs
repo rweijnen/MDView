@@ -6,6 +6,7 @@ mod links;
 mod markdown;
 mod settings;
 mod terminal;
+mod vpath;
 mod zone;
 
 use std::cell::RefCell;
@@ -358,6 +359,7 @@ fn main() {
             let welcome_bars = markdown::document_bars(&markdown::PageBars {
                 remote_images: markdown::RemoteImages::Blocked,
                 ask_to_register: ask_to_register(),
+                ask_network_files: false,
                 closed: &[],
             });
             let welcome_html = markdown::wrap_html(
@@ -1049,84 +1051,9 @@ fn restore_window_position(hwnd: HWND) -> bool {
     }
 }
 
-fn absolute_path(path: &Path) -> Option<std::path::PathBuf> {
-    if path.is_absolute() {
-        Some(path.to_path_buf())
-    } else {
-        std::env::current_dir().ok().map(|cwd| cwd.join(path))
-    }
-}
-
-fn get_path_root(path: &Path) -> Option<std::path::PathBuf> {
-    use std::path::Component;
-
-    let absolute = absolute_path(path)?;
-    let mut components = absolute.components();
-
-    match components.next()? {
-        Component::Prefix(prefix) => {
-            if !matches!(components.next(), Some(Component::RootDir)) {
-                return None;
-            }
-
-            let mut root = std::path::PathBuf::from(prefix.as_os_str());
-            root.push(std::path::MAIN_SEPARATOR.to_string());
-            Some(root)
-        }
-        Component::RootDir => Some(std::path::PathBuf::from(
-            std::path::MAIN_SEPARATOR.to_string(),
-        )),
-        _ => None,
-    }
-}
-
-fn path_relative_to_root(path: &Path) -> Option<String> {
-    use std::path::Component;
-
-    let absolute = absolute_path(path)?;
-    let mut saw_root = false;
-    let mut parts = Vec::new();
-
-    for component in absolute.components() {
-        match component {
-            Component::Prefix(_) => {}
-            Component::RootDir => saw_root = true,
-            Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = parts.pop();
-            }
-        }
-    }
-
-    if !saw_root {
-        return None;
-    }
-
-    Some(parts.join("/"))
-}
-
-fn percent_encode_path(path: &str) -> String {
-    let mut encoded = String::with_capacity(path.len());
-
-    for byte in path.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-
-    encoded
-}
-
+/// The URL a document is shown at (see `vpath`).
 fn virtual_url_for_file(path: &Path) -> Option<String> {
-    let relative = path_relative_to_root(path)?;
-    Some(format!(
-        "https://mdview.example/{}",
-        percent_encode_path(&relative)
-    ))
+    vpath::document_url(path)
 }
 
 fn content_type_for_path(path: &Path) -> &'static str {
@@ -1196,13 +1123,18 @@ fn create_virtual_resource_response(
                 Ok(markdown_content) => {
                     let remote_images = remote_images_for(file_path);
                     let bars = DOCUMENT_CHOICES.with(|c| {
+                        let mut choices = c.borrow_mut();
+                        choices.page_served(file_path);
+                        let ask_network_files = settings::network_files_setting() == settings::AskSetting::Ask
+                            && !choices.network_loaded(file_path);
                         markdown::document_bars(&markdown::PageBars {
                             remote_images,
                             ask_to_register: ask_to_register(),
-                            closed: c.borrow_mut().closed_bars(file_path),
+                            ask_network_files,
+                            closed: choices.closed_bars(file_path),
                         })
                     });
-                    (markdown::markdown_to_html(&markdown_content), remote_images, bars)
+                    (markdown::markdown_to_page_html(&markdown_content, file_path), remote_images, bars)
                 }
                 Err(reason) => (
                     markdown::read_error_html(&file_path.display().to_string(), &reason),
@@ -1286,9 +1218,9 @@ fn download_gate(file_path: &Path) -> Option<zone::Mark> {
 /// chose that for this document in the banner.
 fn remote_images_for(file_path: &Path) -> markdown::RemoteImages {
     match settings::remote_images_setting() {
-        settings::RemoteImagesSetting::Always => markdown::RemoteImages::Allowed,
-        settings::RemoteImagesSetting::Never => markdown::RemoteImages::Blocked,
-        settings::RemoteImagesSetting::Ask => {
+        settings::AskSetting::Always => markdown::RemoteImages::Allowed,
+        settings::AskSetting::Never => markdown::RemoteImages::Blocked,
+        settings::AskSetting::Ask => {
             let once = REMOTE_IMAGES_ONCE.with(|o| o.borrow().as_deref() == Some(file_path));
             if once {
                 markdown::RemoteImages::Allowed
@@ -1299,70 +1231,12 @@ fn remote_images_for(file_path: &Path) -> markdown::RemoteImages {
     }
 }
 
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
-                decoded.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-
-        decoded.push(bytes[i]);
-        i += 1;
-    }
-
-    String::from_utf8_lossy(&decoded).to_string()
-}
-
-fn percent_decode_repeated(input: &str) -> String {
-    let mut current = input.to_string();
-
-    for _ in 0..3 {
-        let decoded = percent_decode(&current);
-        if decoded == current {
-            break;
-        }
-        current = decoded;
-    }
-
-    current
-}
-
+/// The file a URL from the page stands for while the current file is shown,
+/// or None if it does not name a plain file (see `vpath`).
 fn resolve_virtual_mdview_url(url: &str) -> Option<String> {
-    let relative_path = url
-        .strip_prefix("https://mdview.example/")
-        .or_else(|| url.strip_prefix("http://mdview.example/"))?
-        .split(['?', '#'])
-        .next()
-        .unwrap_or_default();
-
-    if relative_path.is_empty() {
-        return None;
-    }
-
-    let relative_path = percent_decode_repeated(relative_path);
-
     CURRENT_FILE.with(|f| {
         let current = f.borrow();
-        let current_path = current.as_ref()?;
-        let root_dir = get_path_root(Path::new(current_path))?;
-        let target = root_dir.join(relative_path);
-        Some(target.to_string_lossy().to_string())
+        vpath::resolve(url, Path::new(current.as_ref()?)).map(|path| path.to_string_lossy().into_owned())
     })
 }
 
@@ -1370,16 +1244,115 @@ fn create_response_for_virtual_url(
     environment: &ICoreWebView2Environment,
     url: &str,
 ) -> Option<ICoreWebView2WebResourceResponse> {
-    let resolved_path = resolve_virtual_mdview_url(url)?;
+    // A URL that names no plain file is answered here, never sent anywhere.
+    let Some(resolved_path) = resolve_virtual_mdview_url(url) else {
+        return create_not_found_response(environment);
+    };
     let file_path = Path::new(&resolved_path);
+    // Decided before the file is touched: MDView does not connect to a
+    // network location until the user agrees.
+    if !network_file_allowed(file_path) {
+        return create_blocked_response(environment);
+    }
     if !file_path.exists() {
         return create_not_found_response(environment);
     }
     create_virtual_resource_response(environment, file_path, is_windows_dark_mode())
 }
 
+/// Whether a file the page asks for may be read. Files on another share or a
+/// network drive wait for the user's answer in the network bar.
+fn network_file_allowed(path: &Path) -> bool {
+    let Some(current) = CURRENT_FILE.with(|f| f.borrow().clone()) else { return false };
+    let location = match vpath::location(path, Path::new(&current), vpath::drive_kind) {
+        Some(vpath::Location::Network(location)) => location,
+        Some(vpath::Location::SameRoot | vpath::Location::Local) => return true,
+        None => return false,
+    };
+    match settings::network_files_setting() {
+        settings::AskSetting::Always => true,
+        settings::AskSetting::Never => false,
+        settings::AskSetting::Ask => DOCUMENT_CHOICES.with(|c| {
+            let mut choices = c.borrow_mut();
+            let Some(document) = choices.document().map(Path::to_path_buf) else { return false };
+            if choices.network_loaded(&document) {
+                return true;
+            }
+            if choices.note_network_blocked(&document, &location) {
+                if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+                    // Told to the page from the window, not from inside this
+                    // WebView2 callback.
+                    let _ = unsafe { PostMessageW(Some(hwnd), WM_MDVIEW_NETWORK, WPARAM(0), LPARAM(0)) };
+                }
+            }
+            false
+        }),
+    }
+}
+
+/// The network location (another share or a network drive) `path` is on,
+/// seen from the current document; None for local files.
+fn network_location(path: &Path) -> Option<String> {
+    let current = CURRENT_FILE.with(|f| f.borrow().clone())?;
+    match vpath::location(path, Path::new(&current), vpath::drive_kind)? {
+        vpath::Location::Network(location) => Some(location),
+        vpath::Location::SameRoot | vpath::Location::Local => None,
+    }
+}
+/// Tell the page which network locations were blocked, for its network bar.
+/// The page ignores locations it already lists.
+fn post_network_blocked() {
+    let locations = DOCUMENT_CHOICES.with(|c| {
+        let mut choices = c.borrow_mut();
+        match choices.document().map(Path::to_path_buf) {
+            Some(document) => choices.network_blocked(&document),
+            None => Vec::new(),
+        }
+    });
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                for location in locations {
+                    let json: Vec<u16> = markdown::network_blocked_message(&location)
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+                    let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(json.as_ptr())) };
+                }
+            }
+        }
+    });
+}
+
+/// The user's answer in the network bar.
+fn handle_network_files_choice(hwnd: HWND, choice: &str, document: &Path) {
+    let save = |setting| match settings::set_network_files_setting(setting) {
+        Ok(()) => true,
+        Err(e) => {
+            show_message(Some(hwnd), &format!("Could not save the network files setting:\n\n{e}"), MB_OK | MB_ICONERROR);
+            false
+        }
+    };
+    match choice {
+        "once" => {
+            DOCUMENT_CHOICES.with(|c| c.borrow_mut().load_network(document));
+            reload_page();
+        }
+        "always" => {
+            if save(settings::AskSetting::Always) {
+                reload_page();
+            }
+        }
+        "never" => {
+            save(settings::AskSetting::Never);
+        }
+        _ => {}
+    }
+}
+
+/// Any of MDView's own URLs: served by the host, never fetched from the web.
 fn is_internal_virtual_url(url: &str) -> bool {
-    url.starts_with("https://mdview.example/") || url.starts_with("http://mdview.example/")
+    crate::vpath::is_virtual_url(url)
 }
 
 /// Only MDView's own pages may be shown: Markdown documents on the virtual
@@ -1387,7 +1360,7 @@ fn is_internal_virtual_url(url: &str) -> bool {
 /// Everything else (script or <meta refresh> navigation, other files, other
 /// sites) is cancelled; a link the user clicked goes through `queue_link`.
 fn navigation_allowed(url: &str) -> bool {
-    if is_internal_virtual_url(url) {
+    if crate::vpath::is_document_origin(url) {
         return resolve_virtual_mdview_url(url)
             .is_some_and(|path| links::is_markdown(Path::new(&path)));
     }
@@ -1399,7 +1372,7 @@ fn navigation_allowed(url: &str) -> bool {
 
 /// Whether a message comes from a page MDView itself loaded.
 fn is_trusted_page(source: &str) -> bool {
-    if is_internal_virtual_url(source) {
+    if crate::vpath::is_document_origin(source) {
         return resolve_virtual_mdview_url(source)
             .is_some_and(|path| links::is_markdown(Path::new(&path)));
     }
@@ -1419,7 +1392,7 @@ fn handle_queued_links(hwnd: HWND) {
     while let Some(url) = PENDING_LINKS.with(|q| q.borrow_mut().pop_front()) {
         let action = links::classify_url(&url, |u| {
             resolve_virtual_mdview_url(u).map(std::path::PathBuf::from)
-        });
+        }, network_location);
         links::perform(action, hwnd, |path| {
             load_file_into_webview(hwnd, &path.to_string_lossy())
         });
@@ -1437,6 +1410,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
                 queue_link(url.clone());
             }
         }
+        Some("networkStatus") => post_network_blocked(),
         Some("bar") => {
             let (Some(bar), Some(choice)) = (msg.get("bar"), msg.get("choice")) else { return };
             if !PAGE_BARS.with(|b| markdown::bar_choice_offered(&b.borrow(), bar, choice)) {
@@ -1457,6 +1431,11 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
                 markdown::REMOTE_IMAGES_BAR => {
                     if let Some(path) = resolve_virtual_mdview_url(source) {
                         handle_remote_images_choice(hwnd, choice, Path::new(&path));
+                    }
+                }
+                markdown::NETWORK_FILES_BAR => {
+                    if let Some(path) = resolve_virtual_mdview_url(source) {
+                        handle_network_files_choice(hwnd, choice, Path::new(&path));
                     }
                 }
                 markdown::REGISTER_BAR => handle_register_choice(hwnd, choice),
@@ -1507,9 +1486,9 @@ fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
             REMOTE_IMAGES_ONCE.with(|o| *o.borrow_mut() = Some(document.to_path_buf()));
             true
         }
-        "always" => save_remote_images_setting(hwnd, settings::RemoteImagesSetting::Always),
+        "always" => save_remote_images_setting(hwnd, settings::AskSetting::Always),
         "never" => {
-            save_remote_images_setting(hwnd, settings::RemoteImagesSetting::Never);
+            save_remote_images_setting(hwnd, settings::AskSetting::Never);
             false
         }
         _ => false,
@@ -1519,7 +1498,7 @@ fn handle_remote_images_choice(hwnd: HWND, choice: &str, document: &Path) {
     }
 }
 
-fn save_remote_images_setting(hwnd: HWND, setting: settings::RemoteImagesSetting) -> bool {
+fn save_remote_images_setting(hwnd: HWND, setting: settings::AskSetting) -> bool {
     match settings::set_remote_images_setting(setting) {
         Ok(()) => true,
         Err(e) => {
@@ -2183,6 +2162,8 @@ thread_local! {
 
 /// Posted to the main window to handle queued links (see `queue_link`).
 const WM_MDVIEW_LINK: u32 = WM_APP + 1;
+/// A file from a network location was blocked: tell the page.
+const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2598,6 +2579,10 @@ unsafe extern "system" fn window_proc(
             handle_queued_links(hwnd);
             LRESULT(0)
         }
+        WM_MDVIEW_NETWORK => {
+            post_network_blocked();
+            LRESULT(0)
+        }
         // Windows gives focus to this window when it is activated; pass it on
         // to the document.
         WM_SETFOCUS => {
@@ -2699,6 +2684,64 @@ unsafe extern "system" fn window_proc(
 mod tests {
     use super::*;
 
+    fn showing(file: &str) {
+        CURRENT_FILE.with(|f| *f.borrow_mut() = Some(file.to_string()));
+    }
+
+    // Compared as text: the path is shown to the user (link questions, the
+    // window title, recent files), so it must use `\` only (#49).
+    fn assert_resolves(url: &str, expected: &str) {
+        let resolved = resolve_virtual_mdview_url(url)
+            .unwrap_or_else(|| panic!("{url} did not resolve to a file"));
+        assert_eq!(resolved, expected, "resolved {url}");
+    }
+
+    #[test]
+    fn test_document_url_maps_back_with_backslashes_only() {
+        showing(r"C:\docs\note.md");
+        assert_eq!(
+            virtual_url_for_file(Path::new(r"C:\docs\note.md")).as_deref(),
+            Some("https://mdview.example/docs/note.md")
+        );
+        assert_resolves("https://mdview.example/docs/img/a.png?v=2#x", r"C:\docs\img\a.png");
+        assert_resolves(
+            "https://mdview.example/Dokumenty/pozn%C3%A1mky/sn%C3%ADmek%20obrazovky.png",
+            r"C:\Dokumenty\poznámky\snímek obrazovky.png",
+        );
+        showing(r"\\server\share\docs\note.md");
+        assert_resolves("https://mdview.example/docs/img/a.png", r"\\server\share\docs\img\a.png");
+    }
+
+    // A URL from a document may only name a file below the root it maps to.
+    // Encoded separators, drive letters, `..`, devices, pipes and alternate
+    // data streams must never become a path elsewhere.
+    #[test]
+    fn test_urls_cannot_escape_to_other_paths() {
+        showing(r"C:\docs\note.md");
+        for url in [
+            "https://mdview.example/%5C%5Cserver%5Cshare%5Cx.png",
+            "https://mdview.example/%2F%2Fserver%2Fshare%2Fx.png",
+            "https://mdview.example/Q%3A%5Cx.png",
+            "https://mdview.example/Q%3A/x.png",
+            "https://mdview.example/docs/..%5C..%5Cx.png",
+            "https://mdview.example/docs/%2E%2E/x.png",
+            "https://mdview.example/%5C%5C.%5Cpipe%5Cp",
+            "https://mdview.example/%5C%5C%3F%5CC%3A%5Cx.png",
+            "https://mdview.example/docs/a.png:secret",
+            "https://mdview.example/docs/a.png%3Asecret",
+            "https://mdview.example/docs/CON",
+            "https://mdview.example/docs/nul.txt",
+            "https://mdview.example/docs/COM1.md",
+            "https://mdview.example/docs/x.png.",
+            "https://mdview.example/docs/x.png%20",
+            "https://mdview.example/docs//x.png",
+        ] {
+            assert_eq!(resolve_virtual_mdview_url(url), None, "{url} must not resolve to a file");
+        }
+        // Decoded once only: a double-encoded `\` is a literal name on the
+        // document's own drive, never a separator.
+        assert_resolves("https://mdview.example/%255C%255Cserver%255Cshare%255Cx.png", r"C:\%5C%5Cserver%5Cshare%5Cx.png");
+    }
     fn placement(show_cmd: SHOW_WINDOW_CMD, flags: WINDOWPLACEMENT_FLAGS) -> WINDOWPLACEMENT {
         WINDOWPLACEMENT {
             length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
