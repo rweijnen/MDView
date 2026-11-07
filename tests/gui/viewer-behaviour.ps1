@@ -1722,7 +1722,47 @@ function Press-DialogButton($d, $name) {
         Check "${hostKind}: Back to a document on another drive shows it again" ([bool]$onMain -and $crossAgain) "on main=$([bool]$onMain) back on cross=$crossAgain"
     }
 
-    # ---- Drag and drop on the standalone viewer (#54). A small window here
+    # ---- File > Recent Files shows the path (#44), shortened in the middle,
+    # with & shown, and the full path as a tooltip on the highlighted item.
+    $deepDir = Join-Path $work 'recent\a-folder-with-a-long-name\another-folder-with-a-long-name\third-folder-name'
+    New-Item -ItemType Directory -Force $deepDir | Out-Null
+    $deepFile = Join-Path $deepDir 'notes.md'
+    Set-Content $deepFile '# Deep' -NoNewline
+    New-Item -ItemType Directory -Force (Join-Path $work 'R&D') | Out-Null
+    $ampFile = Join-Path $work 'R&D\a&b.md'
+    Set-Content -LiteralPath $ampFile '# Amp' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
+    Set-ItemProperty -Path $recentKey -Name File0 -Value $deepFile -Type String
+    Set-ItemProperty -Path $recentKey -Name File1 -Value $ampFile -Type String
+    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+    [void](Wait-Element $v $CT::Text '^Second$')
+    $menuTexts = @(); $tips = @()
+    for ($try = 0; $try -lt 2 -and -not $menuTexts.Count; $try++) {
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        [Win32.Behaviour]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); Send-Key 0x46; [Win32.Behaviour]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # Alt+F
+        $deadline = (Get-Date).AddSeconds(3)
+        do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+        if ($m -ne [IntPtr]::Zero) { $menuTexts = @(Get-MenuTexts $m) }
+    }
+    if ($menuTexts.Count) {
+        # Down through the items; collect the tooltips shown on the way.
+        for ($i = 0; $i -lt 6; $i++) {
+            Send-Key 0x28; Start-Sleep -Milliseconds 1200
+            $tip = Get-Tooltip $v
+            if ($tip) { $tips += $tip }
+        }
+        Send-Escape; Start-Sleep -Milliseconds 200; Send-Escape
+    }
+    Stop-Viewer $v
+    $deepItem = $menuTexts | Where-Object { $_ -like '*notes.md' } | Select-Object -First 1
+    $ampItem = $menuTexts | Where-Object { $_ -like '*a&&b.md' } | Select-Object -First 1
+    Check 'exe: Recent Files show the path, shortened in the middle, with & shown' ($deepItem -match '\\\.\.\.\\' -and $deepItem -like '*\third-folder-name\notes.md' -and $ampItem -like '*R&&D\a&&b.md') "items=$($menuTexts -join ' / ')"
+    Check 'exe: the highlighted recent file shows its full path as a tooltip' ($tips -contains $deepFile) "tooltips=$($tips -join ' / ')"
+
+    # ---- Drag and drop on the standalone viewer (#54). Last, so a drag that
+    # doesn't end can't affect another check. A small window here
     # starts a real OLE drag with the files while a second thread moves the
     # mouse onto MDView and releases it; DoDragDrop says whether MDView
     # accepted the drop (Copy) or refused it (None).
@@ -1805,52 +1845,24 @@ public static class DragTest {
     $fromX = [int]([Math]::Max(60, $wr.X - 60)); $fromY = $toY
     if ($fromX + 60 -gt $wr.X) { $fromX = [int]($wr.X + 20); $fromY = [int]($wr.Y + 5) }
     $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY); $txtFx = [DragTest]::LastEffects
-    $two = [DragTest]::Drag(@((Join-Path $work 'dropped.md'), (Join-Path $work 'second.md')), $fromX, $fromY, $toX, $toY)
-    $stillSecond = [bool](Find-Element $v $CT::Text '^Second$')
-    $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY); $mdFx = [DragTest]::LastEffects
-    $opened = Wait-Element $v $CT::Text '^Dropped document$' 10
-    Stop-Viewer $v
-    Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt (effects $txtFx) two files=$two document unchanged=$stillSecond"
-    Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md (effects $mdFx) opened=$([bool]$opened)"
-
-    # ---- File > Recent Files shows the path (#44), shortened in the middle,
-    # with & shown, and the full path as a tooltip on the highlighted item.
-    $deepDir = Join-Path $work 'recent\a-folder-with-a-long-name\another-folder-with-a-long-name\third-folder-name'
-    New-Item -ItemType Directory -Force $deepDir | Out-Null
-    $deepFile = Join-Path $deepDir 'notes.md'
-    Set-Content $deepFile '# Deep' -NoNewline
-    New-Item -ItemType Directory -Force (Join-Path $work 'R&D') | Out-Null
-    $ampFile = Join-Path $work 'R&D\a&b.md'
-    Set-Content -LiteralPath $ampFile '# Amp' -NoNewline
-    Set-RemoteImagesSetting 'exe' $null
-    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
-    foreach ($i in 0..9) { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
-    Set-ItemProperty -Path $recentKey -Name File0 -Value $deepFile -Type String
-    Set-ItemProperty -Path $recentKey -Name File1 -Value $ampFile -Type String
-    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
-    [void](Wait-Element $v $CT::Text '^Second$')
-    $menuTexts = @(); $tips = @()
-    for ($try = 0; $try -lt 2 -and -not $menuTexts.Count; $try++) {
-        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
-        [Win32.Behaviour]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); Send-Key 0x46; [Win32.Behaviour]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # Alt+F
-        $deadline = (Get-Date).AddSeconds(3)
-        do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
-        if ($m -ne [IntPtr]::Zero) { $menuTexts = @(Get-MenuTexts $m) }
+    # A drag that never got any feedback (not even from the drag source's own
+    # window) never moved: the machine doesn't deliver the injected mouse input
+    # to the drag loop (seen on the GitHub runner). That says nothing about
+    # MDView, so the drop checks are skipped, with the reason.
+    if ($txt -like 'timeout*' -and -not $txtFx) {
+        Stop-Viewer $v
+        $why = "the test's drag never moved on this machine: $txt"
+        Skip 'exe: other files and several files cannot be dropped' $why
+        Skip 'exe: a dropped Markdown file is accepted and opened' $why
+    } else {
+        $two = [DragTest]::Drag(@((Join-Path $work 'dropped.md'), (Join-Path $work 'second.md')), $fromX, $fromY, $toX, $toY)
+        $stillSecond = [bool](Find-Element $v $CT::Text '^Second$')
+        $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY); $mdFx = [DragTest]::LastEffects
+        $opened = Wait-Element $v $CT::Text '^Dropped document$' 10
+        Stop-Viewer $v
+        Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt (effects $txtFx) two files=$two document unchanged=$stillSecond"
+        Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md (effects $mdFx) opened=$([bool]$opened)"
     }
-    if ($menuTexts.Count) {
-        # Down through the items; collect the tooltips shown on the way.
-        for ($i = 0; $i -lt 6; $i++) {
-            Send-Key 0x28; Start-Sleep -Milliseconds 1200
-            $tip = Get-Tooltip $v
-            if ($tip) { $tips += $tip }
-        }
-        Send-Escape; Start-Sleep -Milliseconds 200; Send-Escape
-    }
-    Stop-Viewer $v
-    $deepItem = $menuTexts | Where-Object { $_ -like '*notes.md' } | Select-Object -First 1
-    $ampItem = $menuTexts | Where-Object { $_ -like '*a&&b.md' } | Select-Object -First 1
-    Check 'exe: Recent Files show the path, shortened in the middle, with & shown' ($deepItem -match '\\\.\.\.\\' -and $deepItem -like '*\third-folder-name\notes.md' -and $ampItem -like '*R&&D\a&&b.md') "items=$($menuTexts -join ' / ')"
-    Check 'exe: the highlighted recent file shows its full path as a tooltip' ($tips -contains $deepFile) "tooltips=$($tips -join ' / ')"
 }
 catch {
     # An error in the test itself is a failure, never a silent pass.

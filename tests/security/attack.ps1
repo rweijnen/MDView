@@ -366,7 +366,7 @@ function Invoke-Case($case, $hostKind) {
     }
     if ($worked -and $hostKind -eq 'plugin' -and (Test-Path $pluginLog)) {
         Write-Host "  plugin log (navigation):"
-        Get-Content $pluginLog | Select-String 'navigat|history|Navigate' | Select-Object -Last 30 | ForEach-Object { Write-Host "    $($_.Line)" }
+        Get-Content $pluginLog | Select-String 'navigat|history|Navigate|request' | Select-Object -Last 40 | ForEach-Object { Write-Host "    $($_.Line)" }
     }
     [pscustomobject]@{ Case = $id; Host = $hostKind; Attack = $case.Title; Safe = $case.Safe; Result = $result; Observed = ($observed -join '; ') }
 }

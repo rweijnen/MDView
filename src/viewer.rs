@@ -480,6 +480,11 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                     windows::Win32::System::Com::CoTaskMemFree(
                                                         Some(uri_ptr.0 as *const _),
                                                     );
+                                                    if !is_internal_virtual_url(&uri) {
+                                                        let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
+                                                        let _ = args.ResourceContext(&mut context);
+                                                        log_debug(&format!("resource request: {uri} (context {})", context.0));
+                                                    }
                                                     let response = if is_internal_virtual_url(&uri) {
                                                         create_response_for_virtual_url(
                                                             hwnd,
@@ -546,6 +551,32 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             );
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
+
+                            // Debug log: where each navigation ended up (to trace a
+                            // cancelled navigation that still loaded, attack case S5).
+                            let completed_handler = webview2_com::NavigationCompletedEventHandler::create(Box::new(
+                                move |webview, args| {
+                                    let mut success = windows::core::BOOL(0);
+                                    let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+                                    if let Some(args) = args {
+                                        let _ = args.IsSuccess(&mut success);
+                                        let _ = args.WebErrorStatus(&mut status);
+                                    }
+                                    let mut source = windows::core::PWSTR::null();
+                                    let source = match webview {
+                                        Some(w) if w.Source(&mut source).is_ok() && !source.is_null() => {
+                                            let s = source.to_string().unwrap_or_default();
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(source.0 as *const _));
+                                            s
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    log_debug(&format!("navigation completed: success={} status={} source={source}", success.as_bool(), status.0));
+                                    Ok(())
+                                },
+                            ));
+                            let mut completed_token: i64 = 0;
+                            let _ = webview.add_NavigationCompleted(&completed_handler, &mut completed_token);
 
                             // Back is possible or not any more: tell the page (#46).
                             let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
