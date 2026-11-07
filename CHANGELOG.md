@@ -10,6 +10,7 @@ release workflow refuses to publish a version without a section here.
 - Images and links can use absolute paths, such as `D:\pictures\x.png` or `file://server/share/x.png`. Files from a network location are only loaded after you choose **Load files** or **Always load**; this is separate from remote images. (#56)
 - Hovering over a link shows where it goes in a tooltip: the web address, or the file's path. (#60)
 - Settings (Ctrl+,; in the standalone viewer also **File > Settings…**): font size (a / A / **A**), fonts for text, headings and code, and the answers given in bars (remote images, network files, downloaded documents). Each program keeps its own. (#50)
+- F1 shows the keyboard shortcuts. Right-click opens MDView's own menu: open or copy a link, copy, select all, find, print, zoom, settings. Thanks to [jumpifequal/mdview-for-Total-Commander](https://github.com/jumpifequal/mdview-for-Total-Commander) for the idea. (#59)
 
 ### Changes
 - The remote-images bar can be closed with ×; it stays closed while the document is open.
@@ -18,6 +19,7 @@ release workflow refuses to publish a version without a section here.
 
 ### Fixes
 - Paths are shown with `\` only. (#49)
+- Total Commander plugin: N / P (next / previous file) and 1–9 (view modes) work in the document; F3 / Shift+F3 find forward and backward, match case and whole words work, and "not found" is reported; Copy, Select all and Print from Total Commander's menu work. (#59)
 
 ## v0.2.7
 

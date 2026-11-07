@@ -335,13 +335,14 @@ if (webview) (function() {
         if (!open) return;
         if (!keepPreview) unpreview();
         open.host.remove();
+        panelClosed();
         var back = open.back;
         open = null;
         if (back && back.focus) back.focus();
     }
 
     function show(m) {
-        if (open) return;
+        if (open || panels) return;
         var s = {};
         Object.keys(m.settings).forEach(function(k) { s[k] = m.settings[k]; });
         var fonts = (m.fonts || []).map(function(f) { return f.name; });
@@ -515,6 +516,7 @@ if (webview) (function() {
             values: s
         };
         document.body.appendChild(host);
+        panelOpened();
         var start = sizeRow.querySelector('[aria-pressed="true"]') || sizeRow.querySelector('button');
         if (start) start.focus();
     }
@@ -524,7 +526,7 @@ if (webview) (function() {
             e.preventDefault();
             e.stopImmediatePropagation();
             close(false);
-        } else if (!open && e.ctrlKey && !e.altKey && e.key === ',') {
+        } else if (!panels && e.ctrlKey && !e.altKey && e.key === ',') {
             e.preventDefault();
             webview.postMessage({type: 'openSettings'});
         }
@@ -535,6 +537,138 @@ if (webview) (function() {
         if (m.type === 'showSettings' && m.settings) show(m);
         else if (m.type === 'settingsSaved' && open) open.saved();
         else if (m.type === 'settingsError' && open && typeof m.message === 'string') open.failed(m.message);
+    });
+})();
+"##;
+
+/// Shared by the panels (settings, help; #50, #59): only one is open at a
+/// time, and MDView is told whether one is open (no right-click menu then).
+/// Also passes N / P / 1-9 to Total Commander's Lister when the focus is in
+/// the document itself (not in a panel or a field); the standalone viewer
+/// ignores them.
+const PANEL_SCRIPT: &str = r##"
+    var panels = 0;
+    function panelOpened() {
+        panels++;
+        if (webview) webview.postMessage({type: 'panel', open: 'true'});
+    }
+    function panelClosed() {
+        panels = Math.max(0, panels - 1);
+        if (webview) webview.postMessage({type: 'panel', open: panels ? 'true' : 'false'});
+    }
+    if (webview) document.addEventListener('keydown', function(e) {
+        if (panels || e.ctrlKey || e.altKey || e.metaKey || e.key.length !== 1) return;
+        if (!/^[NnPp1-9]$/.test(e.key)) return;
+        var t = e.target;
+        if (t && (t.isContentEditable || /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName))) return;
+        e.preventDefault();
+        webview.postMessage({type: 'listerKey', key: e.key.toUpperCase()});
+    });
+"##;
+
+/// The keyboard help (#59): F1 asks MDView, which sends `showHelp` with this
+/// program's keys. A panel like the settings panel (closed shadow root, text
+/// with `textContent`); Esc, F1 or Close closes it.
+const HELP_SCRIPT: &str = r##"
+if (webview) (function() {
+    var open = null;
+    var CSS = [
+        ':host{all:initial}',
+        '.scrim{position:fixed;inset:0;z-index:2147483647;display:flex;align-items:flex-start;justify-content:center;padding:32px 16px;box-sizing:border-box;background:rgba(27,31,36,.35);overflow:auto;font-family:"Segoe UI",-apple-system,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.45;color:#24292e}',
+        '.dark.scrim{background:rgba(0,0,0,.55);color:#d4d4d4}',
+        '.box{width:560px;max-width:100%;background:#fff;border:1px solid #d0d7de;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,.28)}',
+        '.dark .box{background:#252526;border-color:#454545}',
+        '.head{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid #d0d7de}',
+        '.dark .head{border-color:#454545}',
+        '.head h2{margin:0;font-size:18px;font-weight:600}',
+        '.muted{font-size:12px;color:#57606a}.dark .muted{color:#a3abb4}',
+        '.stack{display:flex;flex-direction:column;gap:2px}',
+        '.body{display:flex;flex-direction:column;gap:18px;padding:16px 20px 20px}',
+        'h3{margin:0 0 6px;font-size:14px;font-weight:600}',
+        'table{border-collapse:collapse;width:100%}',
+        'td{padding:5px 0;border-top:1px solid #eaeef2;vertical-align:top}',
+        '.dark td{border-color:#3a3a3a}',
+        'td.key{width:46%;padding-right:12px}',
+        'kbd{display:inline-block;padding:1px 6px;border:1px solid #d0d7de;border-bottom-width:2px;border-radius:4px;background:#f6f8fa;font-family:"Segoe UI",sans-serif;font-size:12px}',
+        '.dark kbd{border-color:#555;background:#1e1e1e}',
+        'button{font:inherit;color:inherit;cursor:pointer}',
+        '.close{width:32px;height:32px;border:none;border-radius:4px;background:transparent;display:flex;align-items:center;justify-content:center}',
+        ':focus-visible{outline:2px solid #0969da;outline-offset:2px}.dark :focus-visible{outline-color:#4493f8}'
+    ].join('\n');
+
+    function el(tag, props, children) {
+        var e = document.createElement(tag);
+        Object.keys(props || {}).forEach(function(k) {
+            if (k === 'text') e.textContent = props[k];
+            else if (k === 'className') e.className = props[k];
+            else if (k.indexOf('on') === 0) e.addEventListener(k.slice(2), props[k]);
+            else e.setAttribute(k, props[k]);
+        });
+        (children || []).forEach(function(c) { if (c) e.appendChild(c); });
+        return e;
+    }
+
+    function close() {
+        if (!open) return;
+        open.host.remove();
+        var back = open.back;
+        open = null;
+        panelClosed();
+        if (back && back.focus) back.focus();
+    }
+
+    function show(m) {
+        if (open || panels) return;
+        var host = el('div', {'data-mdview-help': ''});
+        var shadow = host.attachShadow({mode: 'closed'});
+        shadow.appendChild(el('style', {text: CSS}));
+        var ns = 'http://www.w3.org/2000/svg';
+        var x = document.createElementNS(ns, 'svg');
+        x.setAttribute('width', '14'); x.setAttribute('height', '14'); x.setAttribute('viewBox', '0 0 14 14');
+        x.setAttribute('fill', 'none'); x.setAttribute('stroke', 'currentColor'); x.setAttribute('stroke-width', '1.6');
+        x.setAttribute('stroke-linecap', 'round'); x.setAttribute('aria-hidden', 'true');
+        var p = document.createElementNS(ns, 'path'); p.setAttribute('d', 'M3 3l8 8M11 3l-8 8'); x.appendChild(p);
+        var closeButton = el('button', {type: 'button', className: 'close', 'aria-label': 'Close', title: 'Close (Esc)', onclick: close}, [x]);
+        var body = el('div', {className: 'body'});
+        (m.groups || []).forEach(function(g) {
+            var table = el('table', {});
+            (g.keys || []).forEach(function(k) {
+                table.appendChild(el('tr', {}, [
+                    el('td', {className: 'key'}, [el('kbd', {text: String(k[0])})]),
+                    el('td', {text: String(k[1])})
+                ]));
+            });
+            body.appendChild(el('section', {}, [el('h3', {text: String(g.title)}), table]));
+        });
+        var box = el('div', {className: 'box', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'mdview-help-title'}, [
+            el('div', {className: 'head'}, [
+                el('div', {className: 'stack', style: 'flex:1'}, [
+                    el('h2', {id: 'mdview-help-title', text: 'Keyboard shortcuts'}),
+                    el('span', {className: 'muted', text: String(m.program)})
+                ]),
+                closeButton
+            ]),
+            body
+        ]);
+        var scrim = el('div', {className: 'scrim' + (m.dark ? ' dark' : '')}, [box]);
+        scrim.addEventListener('mousedown', function(e) { if (e.target === scrim) close(); });
+        shadow.appendChild(scrim);
+        open = {host: host, back: document.activeElement};
+        document.body.appendChild(host);
+        panelOpened();
+        closeButton.focus();
+    }
+
+    window.addEventListener('keydown', function(e) {
+        if (e.key !== 'F1' && !(open && e.key === 'Escape')) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (open) close();
+        else if (!panels) webview.postMessage({type: 'openHelp'});
+    }, true);
+    webview.addEventListener('message', function(e) {
+        var m = e.data;
+        if (m && m.type === 'showHelp' && Array.isArray(m.groups)) show(m);
     });
 })();
 "##;
@@ -877,6 +1011,8 @@ pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, ba
     let zoom = css_zoom(look.zoom);
     let font_vars = font_variables(&look.fonts);
     let settings_script = SETTINGS_SCRIPT;
+    let help_script = HELP_SCRIPT;
+    let panel_script = PANEL_SCRIPT;
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
@@ -1198,7 +1334,9 @@ a {{ cursor: pointer; }}
         window.addEventListener('scroll', hoverEnd, true);
         window.addEventListener('blur', hoverEnd);
     }}
+{panel_script}
 {settings_script}
+{help_script}
 }})();
 </script>
 </body>

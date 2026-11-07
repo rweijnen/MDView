@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
 mod dark_menu;
+mod clipboard;
+mod contextmenu;
 mod files;
 mod fonts;
 mod links;
@@ -8,6 +10,7 @@ mod linkstatus;
 mod markdown;
 mod settings;
 mod settings_page;
+mod shortcuts;
 mod terminal;
 mod vpath;
 mod zone;
@@ -463,6 +466,7 @@ const DARK_CLIENT: u32 = 0x00202020;
 const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
+const IDM_HELP_KEYS: u32 = 2002;
 const IDM_EDIT_FIND: u32 = 1201;
 const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
@@ -638,6 +642,13 @@ fn create_menu() -> windows::core::Result<HMENU> {
         )?;
 
         // Help menu items (native Windows menus)
+        let keys_text: Vec<u16> = "&Keyboard shortcuts\tF1\0".encode_utf16().collect();
+        AppendMenuW(
+            help_menu,
+            MF_STRING,
+            IDM_HELP_KEYS as usize,
+            PCWSTR(keys_text.as_ptr()),
+        )?;
         let about_text: Vec<u16> = concat!("&About ", app_name!(), "\0").encode_utf16().collect();
         AppendMenuW(
             help_menu,
@@ -690,6 +701,11 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
                 fVirt: FVIRTKEY | FCONTROL,
                 key: 'F' as u16,
                 cmd: IDM_EDIT_FIND as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F1.0,
+                cmd: IDM_HELP_KEYS as u16,
             },
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL,
@@ -1360,6 +1376,75 @@ fn open_settings() {
     post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, is_windows_dark_mode()));
 }
 
+/// F1, Help > Keyboard shortcuts or the menu (#59): the page shows the keys.
+fn open_help() {
+    post_to_page(&shortcuts::help_message(false, is_windows_dark_mode()));
+}
+
+/// Run a script on the page (the result is not needed).
+fn run_script(script: &str) {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let wide = pwstr_from_str(script);
+                let _ = unsafe { webview.ExecuteScript(PCWSTR(wide.as_ptr()), None) };
+            }
+        }
+    });
+}
+
+/// WebView2's print dialog (printer choice, preview).
+fn print_page(hwnd: HWND) {
+    let result = CONTROLLER.with(|c| -> Result<(), String> {
+        let controller = c.borrow().clone().ok_or_else(|| "no document is shown".to_string())?;
+        let webview = unsafe { controller.CoreWebView2() }.map_err(|e| e.message().to_string())?;
+        let webview16: ICoreWebView2_16 = webview
+            .cast()
+            .map_err(|_| "this version of the WebView2 Runtime cannot print; please update it".to_string())?;
+        unsafe { webview16.ShowPrintUI(COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER) }.map_err(|e| e.message().to_string())
+    });
+    if let Err(e) = result {
+        show_message(Some(hwnd), &format!("Could not open the print dialog:\n\n{e}"), MB_OK | MB_ICONERROR);
+    }
+}
+
+/// The right-click menu (#59), shown outside the WebView2 event that
+/// reported the click.
+fn show_context_menu(hwnd: HWND) {
+    let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().take()) else { return };
+    let items = shortcuts::menu_items(request.link.is_some(), request.has_selection, settings::zoom(), false);
+    if let Some(command) = contextmenu::show(hwnd, request.screen, &items) {
+        run_menu_command(hwnd, command, request.link.as_deref());
+    }
+}
+
+fn run_menu_command(hwnd: HWND, command: shortcuts::MenuCommand, link: Option<&str>) {
+    use shortcuts::MenuCommand::*;
+    match command {
+        OpenLink => {
+            if let Some(url) = link {
+                queue_link(url.to_string());
+            }
+        }
+        CopyLink => {
+            let Some(url) = link else { return };
+            let action = links::classify_url(url, |u| resolve_virtual_mdview_url(u).map(std::path::PathBuf::from), network_location);
+            if let Err(e) = clipboard::set_text(hwnd, &linkstatus::describe_url(url, "", &action)) {
+                show_message(Some(hwnd), &format!("Could not copy the link address:\n\n{e}"), MB_OK | MB_ICONERROR);
+            }
+        }
+        Copy => run_script("document.execCommand('copy')"),
+        SelectAll => run_script("document.execCommand('selectAll')"),
+        Find => open_find(hwnd),
+        Print => print_page(hwnd),
+        ZoomIn => handle_zoom(hwnd, "in"),
+        ZoomOut => handle_zoom(hwnd, "out"),
+        ZoomReset => handle_zoom(hwnd, "reset"),
+        Settings => open_settings(),
+        Help => open_help(),
+    }
+}
+
 /// Save in the settings panel: everything is checked first; then each value is
 /// saved, and the panel says what could not be. A shown document is reloaded
 /// so its bars follow the new settings.
@@ -1494,6 +1579,10 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
         }
         Some("networkStatus") => post_network_blocked(),
         Some("openSettings") => open_settings(),
+        Some("openHelp") => open_help(),
+        Some("panel") => PANEL_OPEN.with(|p| p.set(msg.get("open").map(String::as_str) == Some("true"))),
+        // N / P / 1-9 are for Total Commander's Lister; nothing to do here.
+        Some("listerKey") => {}
         Some("saveSettings") => save_settings(msg),
         Some("hoverLink") => match msg.get("url").filter(|u| !u.is_empty()) {
             None => linkstatus::hide(hwnd),
@@ -2255,12 +2344,18 @@ thread_local! {
     static REGISTER_BAR_DISMISSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// What the user chose while the document being shown is open (#24).
     static DOCUMENT_CHOICES: RefCell<markdown::DocumentChoices> = RefCell::new(markdown::DocumentChoices::default());
+    /// A settings or help panel is open on the page: no right-click menu (#59).
+    static PANEL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The right-click waiting for its menu (see `show_context_menu`).
+    static PENDING_MENU: RefCell<Option<contextmenu::Request>> = const { RefCell::new(None) };
 }
 
 /// Posted to the main window to handle queued links (see `queue_link`).
 const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 /// A file from a network location was blocked: tell the page.
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
+/// A right-click in the page: show MDView's menu (#59).
+const WM_MDVIEW_MENU: u32 = WM_APP + 3;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2580,6 +2675,24 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             );
                             let mut token: i64 = 0;
                             let _ = webview.add_WebMessageReceived(&handler, &mut token);
+
+                            // MDView's own right-click menu instead of WebView2's (#59).
+                            let menu_host = hwnd;
+                            if let Err(e) = contextmenu::register(
+                                &webview,
+                                menu_host,
+                                || PANEL_OPEN.with(|p| p.get()),
+                                move |request| {
+                                    PENDING_MENU.with(|m| *m.borrow_mut() = Some(request));
+                                    let _ = PostMessageW(Some(menu_host), WM_MDVIEW_MENU, WPARAM(0), LPARAM(0));
+                                },
+                            ) {
+                                // Without it, no menu at all rather than WebView2's (Inspect, Save as).
+                                if let Ok(settings) = webview.Settings() {
+                                    let _ = settings.SetAreDefaultContextMenusEnabled(false);
+                                }
+                                eprintln!("MDView: no right-click menu: {e}");
+                            }
                         }
 
                         CONTROLLER.with(|c| {
@@ -2686,6 +2799,10 @@ unsafe extern "system" fn window_proc(
             handle_queued_links(hwnd);
             LRESULT(0)
         }
+        WM_MDVIEW_MENU => {
+            show_context_menu(hwnd);
+            LRESULT(0)
+        }
         WM_MDVIEW_NETWORK => {
             post_network_blocked();
             LRESULT(0)
@@ -2745,6 +2862,10 @@ unsafe extern "system" fn window_proc(
                 }
                 IDM_FILE_UNREGISTER => {
                     let _ = unregister_file_association();
+                    LRESULT(0)
+                }
+                IDM_HELP_KEYS => {
+                    open_help();
                     LRESULT(0)
                 }
                 IDM_HELP_ABOUT => {

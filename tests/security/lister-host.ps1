@@ -10,7 +10,15 @@
 # that file next to wincmd.ini.
 #
 # Usage:
-#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text] [-IniFolder dir]
+#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text] [-IniFolder dir] [-CommandFile c.txt -LogFile l.txt]
+#
+# With -CommandFile and -LogFile it acts like TC on request (#59): each new line of
+# the command file is run once, and the result appended to the log:
+#   search <flags> <text>  ListSearchTextW (lcs_* flags)   -> result <n> <return value>
+#   send <command>         ListSendCommand (lc_* command) -> result <n> <return value>
+#   print                  ListPrintW                     -> result <n> <return value | missing>
+# Keys the plugin passes on to this window (as to TC's Lister) are logged as
+#   key <virtual key code>
 param(
     [Parameter(Mandatory)] [string]$Dll,
     [Parameter(Mandatory)] [string]$Doc,
@@ -20,7 +28,9 @@ param(
     # Use this folder as TEMP (an elevated host does not inherit the caller's environment)
     [string]$Temp,
     # Folder TC would report as its ini folder (where wincmd.ini is); default: next to the status file
-    [string]$IniFolder
+    [string]$IniFolder,
+    [string]$CommandFile,
+    [string]$LogFile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,6 +56,10 @@ public static class ListerHost
     delegate void ListCloseWindowFn(IntPtr window);
     [UnmanagedFunctionPointer(CallingConvention.Winapi)]
     delegate int ListSearchTextWFn(IntPtr window, [MarshalAs(UnmanagedType.LPWStr)] string text, int flags);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    delegate int ListSendCommandFn(IntPtr window, int command, int parameter);
+    [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+    delegate int ListPrintWFn(IntPtr window, [MarshalAs(UnmanagedType.LPWStr)] string file, [MarshalAs(UnmanagedType.LPWStr)] string printer, int flags, IntPtr margins);
 
     // WLX SDK: ListDefaultParamStruct (DefaultIniName is ANSI, MAX_PATH)
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
@@ -64,6 +78,8 @@ public static class ListerHost
     static ListCloseWindowFn close;
     static ListSearchTextWFn search;
     static ListSetDefaultParamsFn setDefaultParams;
+    static ListSendCommandFn sendCommand;
+    static ListPrintWFn print;
 
     public static void Init(string dll)
     {
@@ -77,6 +93,10 @@ public static class ListerHost
         IntPtr p = GetProcAddress(module, "ListSetDefaultParams");
         if (p != IntPtr.Zero)
             setDefaultParams = Marshal.GetDelegateForFunctionPointer(p, typeof(ListSetDefaultParamsFn)) as ListSetDefaultParamsFn;
+        p = GetProcAddress(module, "ListSendCommand");
+        if (p != IntPtr.Zero) sendCommand = Marshal.GetDelegateForFunctionPointer(p, typeof(ListSendCommandFn)) as ListSendCommandFn;
+        p = GetProcAddress(module, "ListPrintW");
+        if (p != IntPtr.Zero) print = Marshal.GetDelegateForFunctionPointer(p, typeof(ListPrintWFn)) as ListPrintWFn;
     }
 
     static T Get<T>(IntPtr module, string name) where T : class
@@ -102,6 +122,10 @@ public static class ListerHost
     public static IntPtr Load(IntPtr parent, string file) { return load(parent, file, 0); }
     public static void Close(IntPtr window) { close(window); }
     public static int Search(IntPtr window, string text) { return search(window, text, 0); }
+    public static int SearchWith(IntPtr window, string text, int flags) { return search(window, text, flags); }
+    /// null when the plugin does not export it.
+    public static int? Send(IntPtr window, int command) { if (sendCommand == null) return null; return sendCommand(window, command, 0); }
+    public static int? Print(IntPtr window, string file) { if (print == null) return null; return print(window, file, null, 0, IntPtr.Zero); }
 }
 '@
 
@@ -120,6 +144,11 @@ $form.StartPosition = 'Manual'
 $form.Left = 200
 $form.Top = 150
 $closedByPlugin = $false
+# Keys the plugin passes on to TC's Lister window arrive here.
+if ($LogFile) {
+    $form.KeyPreview = $true
+    $form.Add_KeyDown({ param($sender, $e) Add-Content -Path $LogFile -Value ("key {0}" -f [int]$e.KeyCode) })
+}
 $form.Add_FormClosing({ $script:closedByPlugin = $true })
 $form.Show()
 # When started with -WindowStyle Hidden, Windows applies "hidden" to the first
@@ -134,12 +163,26 @@ Write-Status 'loaded'
 $loadedAt = Get-Date
 $deadline = $loadedAt.AddSeconds($Seconds)
 $searched = $false
+$commandsDone = 0
 while ((Get-Date) -lt $deadline -and -not $closedByPlugin) {
     [System.Windows.Forms.Application]::DoEvents()
     # Search once the document has had time to load, as a user pressing F7 would.
     if ($Search -and -not $searched -and (Get-Date) -gt $loadedAt.AddSeconds(6)) {
         [void][ListerHost]::Search($child, $Search)
         $searched = $true
+    }
+    if ($CommandFile -and $LogFile -and (Test-Path $CommandFile)) {
+        $lines = @(Get-Content -Path $CommandFile)
+        while ($commandsDone -lt $lines.Count) {
+            $line = $lines[$commandsDone]; $commandsDone++
+            $result = switch -Regex ($line) {
+                '^search (\d+) (.+)$' { [ListerHost]::SearchWith($child, $Matches[2], [int]$Matches[1]) }
+                '^send (\d+)$' { $r = [ListerHost]::Send($child, [int]$Matches[1]); if ($null -eq $r) { 'missing' } else { $r } }
+                '^print$' { $r = [ListerHost]::Print($child, (Resolve-Path $Doc).ProviderPath); if ($null -eq $r) { 'missing' } else { $r } }
+                default { 'unknown' }
+            }
+            Add-Content -Path $LogFile -Value ("result {0} {1}" -f $commandsDone, $result)
+        }
     }
     Start-Sleep -Milliseconds 30
 }

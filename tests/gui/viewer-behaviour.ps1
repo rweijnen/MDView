@@ -9,7 +9,10 @@
 # Never; links to a share ask first), the welcome screen, the remembered zoom
 # (#16), the tooltip that shows where a link goes (#60), and the settings
 # panel (#50: Ctrl+, / File > Settings..., live font preview, Esc, Save,
-# restart, Advanced, Reset, and a store that can't be written).
+# restart, Advanced, Reset, and a store that can't be written), and keys and the
+# right-click menu (#59: F1 help, menu items and actions, Ctrl+P, Ctrl+Home/End;
+# plugin: N/P/1-9 to TC, TC's search flags, Copy/Select all/Print from TC).
+# Uses the clipboard and puts its text back afterwards.
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -37,6 +40,9 @@ New-Item -ItemType Directory $work | Out-Null
 $wv2Temp = Join-Path $work 'wv2-temp'
 New-Item -ItemType Directory $wv2Temp | Out-Null
 
+# The user's clipboard text, put back at the end (the #59 checks use the clipboard).
+$clipboardBefore = Get-Clipboard -Raw -ErrorAction SilentlyContinue
+$clipboardSaved = $true
 $tcp = $null; $job = $null
 $started = New-Object System.Collections.ArrayList
 try {
@@ -144,6 +150,9 @@ function Restore-Registry {
 }
 function Set-TestRegistry($remoteImages) {
     Restore-Registry
+    # The user's own answers (also saved by the settings panel, #50) must not
+    # affect the checks; they are put back afterwards by Restore-Registry.
+    Remove-ItemProperty -Path $key -Name RemoteImages -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
     foreach ($n in 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
@@ -196,7 +205,12 @@ function Set-NetworkFilesSetting($hostKind, $value) {
 }
 
 # ---- viewer control
+# The plugin's test host acts like TC on request: commands in $hostCommands,
+# results and the keys it receives in $hostLog (see lister-host.ps1).
+$hostCommands = Join-Path $work 'host-commands.txt'
+$hostLog = Join-Path $work 'host-log.txt'
 function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni) {
+    Remove-Item $hostCommands, $hostLog -ErrorAction SilentlyContinue
     $savedTemp = $env:TEMP; $savedTmp = $env:TMP; $env:TEMP = $wv2Temp; $env:TMP = $wv2Temp
     try {
         $docArgs = if ($doc) { @('--gui', "`"$doc`"") } else { @('--gui') }
@@ -204,7 +218,8 @@ function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni) {
         else {
             $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hostScript`"", '-Dll', "`"$Dll`"", '-Doc', "`"$doc`"",
-                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$iniFolder`"")
+                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$iniFolder`"",
+                '-CommandFile', "`"$hostCommands`"", '-LogFile', "`"$hostLog`"")
         }
     } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     [void]$started.Add($p)
@@ -261,6 +276,9 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr m);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr m, uint item, System.Text.StringBuilder s, int n, uint flags);
+[DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr m, uint item, uint flags);
 [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
 '@
 # Windows only lets a process take the foreground under some conditions; a
@@ -1182,6 +1200,248 @@ function Press-DialogButton($d, $name) {
     Stop-Viewer $v
     Check "plugin: settings that can't be saved: the panel says what failed and stays open" ([bool]$alert -and $alertText -match 'Text size' -and $alertText -match 'mdview\.ini' -and $alertText -notmatch 'other settings were saved' -and $stillOpen) "alert='$alertText' open=$stillOpen"
 
+    # ---- Keys and right-click menu (#59).
+    Set-Content (Join-Path $work 'keys.md') -NoNewline -Value ((@(
+        '# Keys', '', 'Unique probe sentence 4711.', '', '[second link](second.md)', '',
+        'needle alpha', '', 'needle beta', '', 'Needle gamma', '',
+        (('filler line' + "`n`n") * 60), '## Last heading', '', 'end') -join "`n"))
+    # An open Windows popup menu (#32768) of the viewer process, if any.
+    function Find-Menu($v) {
+        $script:menuFound = [IntPtr]::Zero
+        $targetPid = $v.Proc.Id
+        $cb = [Win32.Behaviour+EnumProc]{
+            param($h, $l)
+            $procId = 0
+            [void][Win32.Behaviour]::GetWindowThreadProcessId($h, [ref]$procId)
+            if ($procId -eq $targetPid -and [Win32.Behaviour]::IsWindowVisible($h)) {
+                $c = New-Object System.Text.StringBuilder 64
+                [void][Win32.Behaviour]::GetClassName($h, $c, 64)
+                if ($c.ToString() -eq '#32768') { $script:menuFound = $h; return $false }
+            }
+            $true
+        }
+        [void][Win32.Behaviour]::EnumWindows($cb, [IntPtr]::Zero)
+        $script:menuFound
+    }
+    # The texts of an open menu (tab shown as ' | '; greyed items marked).
+    function Get-MenuTexts($menuWindow) {
+        $hmenu = [Win32.Behaviour]::SendMessage($menuWindow, 0x01E1, [IntPtr]::Zero, [IntPtr]::Zero)   # MN_GETHMENU
+        $n = [Win32.Behaviour]::GetMenuItemCount($hmenu)
+        for ($i = 0; $i -lt $n; $i++) {
+            $s = New-Object System.Text.StringBuilder 256
+            [void][Win32.Behaviour]::GetMenuStringW($hmenu, $i, $s, 256, 0x400)
+            $greyed = ([Win32.Behaviour]::GetMenuState($hmenu, $i, 0x400) -band 1) -ne 0
+            if ($s.Length) { $s.ToString().Replace("`t", ' | ') + $(if ($greyed) { ' (greyed)' } else { '' }) }
+        }
+    }
+    # Right-click on an element; once more if the click was lost. Returns the menu window or zero.
+    function Open-ContextMenu($v, $element) {
+        $r = $element.Current.BoundingRectangle
+        $x = [int]($r.X + [Math]::Min(20, $r.Width / 2)); $y = [int]($r.Y + $r.Height / 2)
+        for ($try = 0; $try -lt 2; $try++) {
+            [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+            [void][Win32.Behaviour]::SetCursorPos($x + 3, $y); Start-Sleep -Milliseconds 100
+            [void][Win32.Behaviour]::SetCursorPos($x, $y); Start-Sleep -Milliseconds 200
+            [Win32.Behaviour]::mouse_event(0x0008, 0, 0, 0, [UIntPtr]::Zero)
+            [Win32.Behaviour]::mouse_event(0x0010, 0, 0, 0, [UIntPtr]::Zero)
+            $deadline = (Get-Date).AddSeconds(3)
+            do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+            if ($m -ne [IntPtr]::Zero) { return $m }
+        }
+        [IntPtr]::Zero
+    }
+    function Send-Key($vk) {
+        [Win32.Behaviour]::keybd_event($vk, 0, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 2, [UIntPtr]::Zero)
+    }
+    # Plugin: ask the test host (acting as TC) to call the plugin; returns the result.
+    function Invoke-Host($command) {
+        Add-Content -Path $hostCommands -Value $command
+        $n = @(Get-Content $hostCommands).Count
+        $deadline = (Get-Date).AddSeconds(10)
+        do {
+            Start-Sleep -Milliseconds 200
+            $line = Get-Content $hostLog -ErrorAction SilentlyContinue | Where-Object { $_ -match "^result $n " } | Select-Object -First 1
+        } while (-not $line -and (Get-Date) -lt $deadline)
+        if ($line) { ($line -split ' ', 3)[2] } else { 'no answer' }
+    }
+    function Get-HostKeys { @(Get-Content $hostLog -ErrorAction SilentlyContinue | Where-Object { $_ -match '^key ' } | ForEach-Object { [int]($_ -split ' ')[1] }) }
+    # The document's selection: its text and its top on the screen.
+    function Get-Selection($v) {
+        $doc = Find-Element $v $CT::Document '.*'
+        $pattern = $null
+        if (-not $doc -or -not $doc.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) { return $null }
+        $range = @($pattern.GetSelection())[0]
+        if (-not $range) { return $null }
+        $rects = $range.GetBoundingRectangles()
+        @{ Text = $range.GetText(-1); Y = $(if ($rects.Count) { [int]$rects[0].Y } else { -1 }) }
+    }
+
+    foreach ($hostKind in 'exe', 'plugin') {
+        $program = if ($hostKind -eq 'exe') { 'Standalone viewer' } else { 'Total Commander plugin' }
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'keys.md')
+        [void](Wait-Element $v $CT::Text '^Keys$')
+        Start-Sleep -Milliseconds 500
+
+        # F1 help
+        $help = $null
+        for ($try = 0; $try -lt 2 -and -not $help; $try++) {
+            if (Focus-Document $v) { Send-Key 0x70 }
+            $help = Wait-Element $v $CT::Window '^Keyboard shortcuts$' 4
+        }
+        $ownKey = if ($hostKind -eq 'exe') { '^Ctrl\+O$' } else { '^N / P$' }
+        $label = if ($help) { Find-In $help $CT::Text "^$program$" } else { $null }
+        # The keys are table cells (DataItem to UI Automation), so any type.
+        $ownKeyShown = if ($help) { $help.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | Where-Object { $_.Current.Name -match $ownKey } | Select-Object -First 1 } else { $null }
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        Send-Escape
+        $closed = Wait-Gone $v $CT::Window '^Keyboard shortcuts$'
+        $stillOpen = -not $v.Proc.HasExited
+        Check "${hostKind}: F1 shows this program's keys; Esc closes only the help" ([bool]$help -and [bool]$label -and [bool]$ownKeyShown -and $closed -and $stillOpen) "help=$([bool]$help) program=$([bool]$label) own key=$([bool]$ownKeyShown) closed=$closed window open=$stillOpen"
+
+        # Right-click menu
+        $sentence = Find-Element $v $CT::Text '^Unique probe sentence 4711\.$'
+        $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+        $texts = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) } else { @() }
+        $findText = if ($hostKind -eq 'exe') { '&Find... | Ctrl+F' } else { '&Find... | F7' }
+        $expected = '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
+        $missing = @($expected | Where-Object { $texts -notcontains $_ })
+        $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Back|Refresh|Save as' })
+        Check "${hostKind}: right-click shows MDView's menu with the keys, not WebView2's" ($menu -ne [IntPtr]::Zero -and -not $missing -and -not $webview2Items) "menu=$($menu -ne [IntPtr]::Zero) missing=$($missing -join ',') webview2=$($webview2Items -join ',') items=$($texts -join ' / ')"
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x41 }   # A: Select all
+        Start-Sleep -Milliseconds 600
+        $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+        $copyItem = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) | Where-Object { $_ -like '&Copy*' } } else { '' }
+        Set-Clipboard -Value 'before'
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x43 }   # C: Copy
+        Start-Sleep -Milliseconds 1000
+        $clip = Get-Clipboard -Raw
+        Check "${hostKind}: Select all and Copy from the menu copy the document" ($copyItem -eq '&Copy | Ctrl+C' -and $clip -match 'Unique probe sentence 4711') "copy item='$copyItem' clipboard has text=$($clip -match 'Unique probe sentence 4711')"
+
+        $link = Find-Element $v $CT::Hyperlink '^second link$'
+        $menu = if ($link) { Open-ContextMenu $v $link } else { [IntPtr]::Zero }
+        $linkTexts = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) } else { @() }
+        Set-Clipboard -Value 'before'
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x4C }   # L: Copy link address
+        Start-Sleep -Milliseconds 1000
+        $clip = Get-Clipboard -Raw
+        $want = Join-Path $work 'second.md'
+        Check "${hostKind}: on a link the menu copies where it goes" ($linkTexts -contains '&Open link' -and $clip -eq $want) "first items=$(($linkTexts | Select-Object -First 2) -join ' / ') clipboard='$clip'"
+
+        $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x49 }   # I: Zoom in
+        Start-Sleep -Milliseconds 800
+        $zoom = Get-Setting $hostKind 'Zoom'
+        $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x52 }   # R: Reset zoom
+        Start-Sleep -Milliseconds 800
+        $zoomReset = Get-Setting $hostKind 'Zoom'
+        Check "${hostKind}: Zoom in and Reset zoom from the menu" ($zoom -eq 110 -and $zoomReset -eq 100) "after zoom in=$zoom after reset=$zoomReset"
+
+        $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+        if ($menu -ne [IntPtr]::Zero) { Send-Key 0x53 }   # S: Settings
+        $panel = Wait-Element $v $CT::Window '^Settings$' 5
+        $menuOverPanel = [IntPtr]::Zero
+        if ($panel) {
+            $title = Find-In $panel $CT::Text '^Settings$'
+            if ($title) { $menuOverPanel = Open-ContextMenu $v $title }
+            if ($menuOverPanel -ne [IntPtr]::Zero) { Send-Escape; Start-Sleep -Milliseconds 300 }
+            [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+            Send-Escape
+            [void](Wait-Gone $v $CT::Window '^Settings$')
+        }
+        Check "${hostKind}: Settings... opens the panel; no menu over a panel" ([bool]$panel -and $menuOverPanel -eq [IntPtr]::Zero) "panel=$([bool]$panel) menu over panel=$($menuOverPanel -ne [IntPtr]::Zero)"
+
+        # Print: Ctrl+P opens WebView2's print dialog
+        $print = $null
+        for ($try = 0; $try -lt 2 -and -not $print; $try++) {
+            if (Focus-Document $v) { Send-CtrlKey 0x50 }
+            $print = Wait-Element $v $CT::Window '^Print$' 8
+        }
+        if ($print) { Send-Escape; [void](Wait-Gone $v $CT::Window '^Print$' 5) }
+        Check "${hostKind}: Ctrl+P opens the print dialog" ([bool]$print) "print dialog=$([bool]$print)"
+
+        # Ctrl+End / Ctrl+Home. A key that changed nothing at all (lost right
+        # after the print dialog closed) is sent once more, and reported.
+        function Wait-Shown($name, $seconds = 2) {
+            $deadline = (Get-Date).AddSeconds($seconds)
+            do { $e = Find-Element $v $CT::Text $name; if ($e -and -not $e.Current.IsOffscreen) { return $true }; Start-Sleep -Milliseconds 200 } while ((Get-Date) -lt $deadline)
+            $false
+        }
+        $keyRetried = @()
+        [void](Focus-Document $v); Send-CtrlKey 0x23
+        $endVisible = Wait-Shown '^Last heading$'
+        if (-not $endVisible) { $keyRetried += 'End'; [void](Focus-Document $v); Send-CtrlKey 0x23; $endVisible = Wait-Shown '^Last heading$' }
+        Send-CtrlKey 0x24
+        $topVisible = Wait-Shown '^Keys$'
+        if (-not $topVisible) { $keyRetried += 'Home'; [void](Focus-Document $v); Send-CtrlKey 0x24; $topVisible = Wait-Shown '^Keys$' }
+        Check "${hostKind}: Ctrl+End and Ctrl+Home go to the bottom and the top" ($endVisible -and $topVisible) "bottom shown=$endVisible top shown=$topVisible retried=$($keyRetried -join ',')"
+
+        if ($hostKind -eq 'plugin') {
+            # N / P / 1-9 reach TC's window, but not while a panel is open. Click
+            # into the text first, as a user would (the first key after focusing
+            # through UI Automation is sometimes lost); keys that all got lost
+            # are sent once more, and reported.
+            $r = $sentence.Current.BoundingRectangle
+            [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+            [void][Win32.Behaviour]::SetCursorPos([int]($r.X + 10), [int]($r.Y + $r.Height / 2)); Start-Sleep -Milliseconds 200
+            [Win32.Behaviour]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); [Win32.Behaviour]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+            Start-Sleep -Milliseconds 500
+            $keysRetried = $false
+            for ($try = 0; $try -lt 2; $try++) {
+                Send-Key 0x4E; Start-Sleep -Milliseconds 300
+                Send-Key 0x50; Start-Sleep -Milliseconds 300
+                Send-Key 0x33; Start-Sleep -Milliseconds 600
+                $keysSeen = Get-HostKeys
+                if ($keysSeen.Count) { break }
+                $keysRetried = $true
+            }
+            $panel = Open-Settings $v
+            Send-Key 0x4E; Start-Sleep -Milliseconds 600
+            $keysWithPanel = Get-HostKeys
+            [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+            Send-Escape
+            [void](Wait-Gone $v $CT::Window '^Settings$')
+            Check 'plugin: N, P and 3 go to Total Commander; not while a panel is open' (($keysSeen -contains 78) -and ($keysSeen -contains 80) -and ($keysSeen -contains 51) -and [bool]$panel -and $keysWithPanel.Count -eq $keysSeen.Count) "keys=$($keysSeen -join ',') with panel=$($keysWithPanel -join ',') retried=$keysRetried"
+
+            # The right-click menu's Find is TC's search (F7).
+            $before = (Get-HostKeys).Count
+            $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
+            if ($menu -ne [IntPtr]::Zero) { Send-Key 0x46 }   # F: Find
+            Start-Sleep -Milliseconds 600
+            $after = @(Get-HostKeys)
+            Check "plugin: the menu's Find... opens Total Commander's search (F7)" ($after.Count -gt $before -and $after[-1] -eq 118) "keys=$($after -join ',')"
+
+            # TC's search: find first, next, backwards, match case, not found.
+            $r1 = Invoke-Host 'search 1 needle'; $s1 = Get-Selection $v
+            $r2 = Invoke-Host 'search 0 needle'; $s2 = Get-Selection $v
+            $r3 = Invoke-Host 'search 8 needle'; $s3 = Get-Selection $v
+            $r4 = Invoke-Host 'search 3 Needle'; $s4 = Get-Selection $v
+            $r5 = Invoke-Host 'search 1 zzz-not-in-the-document'
+            $ok = $r1 -eq '0' -and $r2 -eq '0' -and $r3 -eq '0' -and $r4 -eq '0' -and $r5 -eq '1' -and
+                $s1 -and $s2 -and $s3 -and $s4 -and $s2.Y -gt $s1.Y -and $s3.Y -eq $s1.Y -and $s4.Y -gt $s2.Y -and $s4.Text -ceq 'Needle'
+            Check "plugin: TC's search: first, next, backwards (Shift+F3), match case, 'not found'" $ok "results=$r1,$r2,$r3,$r4,$r5 Y=$($s1.Y),$($s2.Y),$($s3.Y),$($s4.Y) case='$($s4.Text)'"
+
+            # TC's Copy / Select all report success; an unknown command does not.
+            $selectAll = Invoke-Host 'send 3'
+            Set-Clipboard -Value 'before'
+            $copy = Invoke-Host 'send 1'
+            Start-Sleep -Milliseconds 800
+            $clip = Get-Clipboard -Raw
+            $unknown = Invoke-Host 'send 99'
+            Check "plugin: TC's Copy and Select all work and report success" ($selectAll -eq '0' -and $copy -eq '0' -and $unknown -eq '1' -and $clip -match 'Unique probe sentence 4711') "select all=$selectAll copy=$copy unknown=$unknown clipboard has text=$($clip -match 'Unique probe sentence 4711')"
+
+            # TC's print command
+            $printResult = Invoke-Host 'print'
+            $print = Wait-Element $v $CT::Window '^Print$' 8
+            if ($print) { [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle)); Send-Escape; [void](Wait-Gone $v $CT::Window '^Print$' 5) }
+            Check "plugin: TC's print command opens the print dialog" ($printResult -eq '0' -and [bool]$print) "result=$printResult dialog=$([bool]$print)"
+        }
+        Stop-Viewer $v
+    }
+
+
 }
 catch {
     # An error in the test itself is a failure, never a silent pass.
@@ -1189,14 +1449,25 @@ catch {
     Write-Output ("FAIL  test aborted: {0} (line {1})" -f $_, $_.InvocationInfo.ScriptLineNumber)
 }
 finally {
+    # Every step on its own: one that fails must not skip the others. A step
+    # that fails is reported and counted.
+    function Cleanup($what, [scriptblock]$step) {
+        try { & $step } catch { $script:failures++; Write-Output ("FAIL  cleanup: {0}: {1}" -f $what, $_) }
+    }
     # Only windows this test started (tracked by process), never others.
-    foreach ($p in $started) { if (-not $p.HasExited) { $p | Stop-Process -Force } }
-    if (Get-Command Restore-Registry -ErrorAction SilentlyContinue) { Restore-Registry }
-    if ($substDefined) { subst "$($substLetter):" /d }
-    if ($netDefined) { net use "$($netLetter):" /delete /y | Out-Null }
-    if ($tcp) { $tcp.Stop() }
-    if ($job) { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
+    Cleanup 'stop test windows' { foreach ($p in $started) { if (-not $p.HasExited) { $p | Stop-Process -Force } } }
+    Cleanup 'restore HKCU\Software\MDView' {
+        $key = 'HKCU:\Software\MDView'   # in case a check overwrote the name
+        if (Get-Command Restore-Registry -ErrorAction SilentlyContinue) { Restore-Registry }
+    }
+    Cleanup 'restore the clipboard' { if ($clipboardSaved -and $null -ne $clipboardBefore) { Set-Clipboard -Value $clipboardBefore } }
+    Cleanup 'remove the subst drive' { if ($substDefined) { subst "$($substLetter):" /d } }
+    Cleanup 'remove the net use drive' { if ($netDefined) { net use "$($netLetter):" /delete /y | Out-Null } }
+    Cleanup 'stop the image server' {
+        if ($tcp) { $tcp.Stop() }
+        if ($job) { Stop-Job $job -ErrorAction SilentlyContinue; Remove-Job $job -Force -ErrorAction SilentlyContinue }
+    }
     Start-Sleep -Seconds 2
-    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+    Cleanup 'remove the test folder' { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
 }
 exit $failures
