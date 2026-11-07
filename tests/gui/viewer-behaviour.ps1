@@ -128,7 +128,7 @@ function Start-PipeProbe($name) {
 
 # ---- registry
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles'
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles', 'Zoom'
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
@@ -143,6 +143,7 @@ function Set-TestRegistry($remoteImages) {
     Restore-Registry
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $key -Name Zoom -ErrorAction SilentlyContinue
     foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
@@ -192,7 +193,7 @@ function Set-NetworkFilesSetting($hostKind, $value) {
 }
 
 # ---- viewer control
-function Start-Viewer($hostKind, $doc) {
+function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni) {
     $savedTemp = $env:TEMP; $savedTmp = $env:TMP; $env:TEMP = $wv2Temp; $env:TMP = $wv2Temp
     try {
         $docArgs = if ($doc) { @('--gui', "`"$doc`"") } else { @('--gui') }
@@ -200,7 +201,7 @@ function Start-Viewer($hostKind, $doc) {
         else {
             $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hostScript`"", '-Dll', "`"$Dll`"", '-Doc', "`"$doc`"",
-                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$tcIni`"")
+                '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$iniFolder`"")
         }
     } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     [void]$started.Add($p)
@@ -245,6 +246,8 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
 '@
 # Windows only lets a process take the foreground under some conditions; a
 # synthetic F24 tap satisfies them and means nothing to MDView (see focus.ps1).
@@ -847,6 +850,116 @@ function Press-DialogButton($d, $name) {
     $welcome = Wait-Element $v $CT::Text 'Open a Markdown file using' 15
     Check 'exe: welcome screen is shown without a file' ([bool]$welcome) "welcome text shown=$([bool]$welcome)"
     Stop-Viewer $v
+
+    # ---- Zoom (#16): Ctrl+Plus / Ctrl+wheel / Ctrl+0, remembered per program.
+    # Measured as the height of the first heading, through UI Automation.
+    function Get-ZoomSetting($hostKind) {
+        if ($hostKind -eq 'exe') { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).Zoom } else { Get-IniValue 'Zoom' }
+    }
+    function Get-HeadingHeight($v, $name) {
+        $e = Find-Element $v $CT::Text "^$name$"
+        if ($e) { $e.Current.BoundingRectangle.Height } else { 0 }
+    }
+    # Keys only reach the document when it has keyboard focus.
+    function Focus-Document($v) {
+        $hwnd = [IntPtr]$v.Win.Current.NativeWindowHandle
+        if (-not (Set-Foreground $hwnd)) { return $false }
+        $doc = Find-Element $v $CT::Document '.*'
+        if (-not $doc) { return $false }
+        $doc.SetFocus(); Start-Sleep -Milliseconds 300
+        $true
+    }
+    function Send-CtrlKey($vk) {
+        [Win32.Behaviour]::keybd_event(0x11, 0x1D, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 2, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event(0x11, 0x1D, 2, [UIntPtr]::Zero)
+    }
+    # One notch of the mouse wheel (120 = up) with Ctrl held, over the document.
+    function Send-CtrlWheel($v, $delta) {
+        $r = $v.Win.Current.BoundingRectangle
+        [void][Win32.Behaviour]::SetCursorPos([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2))
+        Start-Sleep -Milliseconds 200
+        [Win32.Behaviour]::keybd_event(0x11, 0x1D, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::mouse_event(0x0800, 0, 0, $delta, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 100
+        [Win32.Behaviour]::keybd_event(0x11, 0x1D, 2, [UIntPtr]::Zero)
+    }
+    # Waits until the heading is $ratio times $base high; returns the ratio seen.
+    function Wait-Ratio($v, $name, $base, $ratio, $seconds = 5) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        do {
+            $seen = (Get-HeadingHeight $v $name) / $base
+            if ([Math]::Abs($seen - $ratio) -lt 0.05) { break }
+            Start-Sleep -Milliseconds 250
+        } while ((Get-Date) -lt $deadline)
+        [Math]::Round($seen, 2)
+    }
+    # Heights are whole pixels, so a ratio is only close to the step.
+    function Near($seen, $expected) { [Math]::Abs($seen - $expected) -lt 0.05 }
+    $VK_OEM_PLUS = 0xBB; $VK_0 = 0x30
+
+    foreach ($hostKind in 'exe', 'plugin') {
+        $otherKind = if ($hostKind -eq 'exe') { 'plugin' } else { 'exe' }
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'main.md')
+        [void](Wait-Element $v $CT::Text '^Main$')
+        Start-Sleep -Milliseconds 500
+        $base = Get-HeadingHeight $v 'Main'
+        $focused = Focus-Document $v
+        Send-CtrlKey $VK_OEM_PLUS
+        $plus = Wait-Ratio $v 'Main' $base 1.1
+        Start-Sleep -Milliseconds 300
+        $saved = Get-ZoomSetting $hostKind; $other = Get-ZoomSetting $otherKind
+        Check "${hostKind}: Ctrl+Plus zooms to 110% and saves Zoom=110 in its own settings" ($focused -and (Near $plus 1.1) -and $saved -eq 110 -and $null -eq $other) "focused=$focused ratio=$plus Zoom=$saved other=$other"
+
+        Send-CtrlWheel $v 120
+        $up = Wait-Ratio $v 'Main' $base 1.25
+        Send-CtrlWheel $v -120
+        $down = Wait-Ratio $v 'Main' $base 1.1
+        Check "${hostKind}: one Ctrl+wheel notch is one step (110, 125, back to 110)" ((Near $up 1.25) -and (Near $down 1.1)) "up=$up down=$down Zoom=$(Get-ZoomSetting $hostKind)"
+
+        $link = Wait-Element $v $CT::Hyperlink 'Go to second' 5
+        if ($link) { Invoke-Element $link }
+        [void](Wait-Element $v $CT::Text '^Second$' 10)
+        $second = Wait-Ratio $v 'Second' $base 1.1
+        Check "${hostKind}: the zoom stays after following a link" (Near $second 1.1) "ratio=$second"
+        Stop-Viewer $v
+
+        $v = Start-Viewer $hostKind (Join-Path $work 'main.md')
+        [void](Wait-Element $v $CT::Text '^Main$')
+        $restored = Wait-Ratio $v 'Main' $base 1.1
+        Check "${hostKind}: the zoom is restored after a restart" (Near $restored 1.1) "ratio=$restored"
+
+        $focused = Focus-Document $v
+        Send-CtrlKey $VK_0
+        $reset = Wait-Ratio $v 'Main' $base 1.0
+        Start-Sleep -Milliseconds 300
+        $saved = Get-ZoomSetting $hostKind
+        Check "${hostKind}: Ctrl+0 resets to 100% and saves it" ($focused -and (Near $reset 1.0) -and $saved -eq 100) "focused=$focused ratio=$reset Zoom=$saved"
+        Stop-Viewer $v
+    }
+
+    # The plugin with settings that can't be saved: one message, the zoom still works.
+    Set-RemoteImagesSetting 'plugin' $null
+    $badIni = Join-Path $work 'tc-ini-bad'
+    New-Item -ItemType Directory -Force (Join-Path $badIni 'mdview.ini') | Out-Null
+    $v = Start-Viewer 'plugin' (Join-Path $work 'main.md') $badIni
+    [void](Wait-Element $v $CT::Text '^Main$')
+    Start-Sleep -Milliseconds 500
+    $base = Get-HeadingHeight $v 'Main'
+    $focused = Focus-Document $v
+    Send-CtrlKey $VK_OEM_PLUS
+    $dialog = Wait-Dialog $v 8
+    $dialogText = if ($dialog) { Get-DialogText $dialog } else { '' }
+    $closedOk = if ($dialog) { Press-DialogButton $dialog 'OK' } else { $false }
+    [void](Focus-Document $v)
+    Send-CtrlKey $VK_OEM_PLUS
+    $ratio = Wait-Ratio $v 'Main' $base 1.25
+    $again = Wait-Dialog $v 3
+    if ($again) { [void](Press-DialogButton $again 'OK') }
+    Stop-Viewer $v
+    Check "plugin: a zoom that can't be saved is reported once, and zooming still works" ($focused -and $dialogText -match 'Could not save the zoom level' -and $closedOk -and -not $again -and (Near $ratio 1.25)) "focused=$focused text='$dialogText' closed=$closedOk second dialog=$([bool]$again) ratio=$ratio"
 }
 finally {
     # Only windows this test started (tracked by process), never others.

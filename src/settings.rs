@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_OPTION_NON_VOLATILE,
@@ -275,6 +276,43 @@ pub fn set_open_downloaded_without_asking() -> Result<(), String> {
     write_dword(OPEN_DOWNLOADED_WITHOUT_ASKING, 1)
 }
 
+/// Zoom of MDView's pages in percent, one of `markdown::ZOOM_STEPS` (#16).
+const ZOOM: &str = "Zoom";
+
+/// The zoom chosen in this run (0: none yet). Used for the next pages even if
+/// saving it failed.
+static SESSION_ZOOM: AtomicU32 = AtomicU32::new(0);
+/// Saving the zoom failed before in this run; the user was told once.
+static ZOOM_SAVE_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn zoom_in(store: &Store) -> u32 {
+    read_dword_in(store, ZOOM)
+        .filter(|&p| crate::markdown::is_zoom_step(p))
+        .unwrap_or(crate::markdown::DEFAULT_ZOOM)
+}
+
+/// The zoom for the next page.
+pub fn zoom() -> u32 {
+    match SESSION_ZOOM.load(Ordering::Relaxed) {
+        0 => zoom_in(store()),
+        p => p,
+    }
+}
+
+/// Use `percent` from now on and save it. Returns why saving failed, but only
+/// the first time in this run, so zooming doesn't bring up a message per step.
+pub fn set_zoom(percent: u32) -> Option<String> {
+    SESSION_ZOOM.store(percent, Ordering::Relaxed);
+    save_zoom_in(store(), percent, &ZOOM_SAVE_FAILED)
+}
+
+fn save_zoom_in(store: &Store, percent: u32, failed_before: &AtomicBool) -> Option<String> {
+    match write_dword_in(store, ZOOM, percent) {
+        Ok(()) => None,
+        Err(e) => (!failed_before.swap(true, Ordering::Relaxed)).then_some(e),
+    }
+}
+
 /// WebView2 data folder (cache, cookies; not settings) for this process.
 ///
 /// A WebView2 data folder can only be used by one host program at a time:
@@ -455,5 +493,33 @@ mod tests {
         assert_eq!(read_dword_in(&store, REMOTE_IMAGES), Some(1));
         let text = std::fs::read_to_string(dir.0.join("mdview.ini")).unwrap();
         assert!(text.contains("NetworkFiles=2") && text.contains("RemoteImages=1"), "{text:?}");
+    }
+
+    // #16: the zoom is saved in this program's store; a value that isn't one
+    // of the steps (edited by hand) gives the default.
+    #[test]
+    fn test_zoom_is_stored_and_unknown_values_give_100() {
+        let dir = TempFolder::new("zoom");
+        let store = ini_store_for(&dir.0);
+        assert_eq!(zoom_in(&store), 100, "nothing saved yet");
+        let failed = AtomicBool::new(false);
+        assert_eq!(save_zoom_in(&store, 125, &failed), None);
+        assert_eq!(zoom_in(&store), 125);
+        let text = std::fs::read_to_string(dir.0.join("mdview.ini")).unwrap();
+        assert!(text.contains("Zoom=125"), "{text:?}");
+        for bad in [0, 105, 1000] {
+            write_dword_in(&store, ZOOM, bad).unwrap();
+            assert_eq!(zoom_in(&store), 100, "{bad}");
+        }
+    }
+
+    // A failed save is reported once per run, not for every zoom step.
+    #[test]
+    fn test_zoom_save_error_is_reported_once() {
+        let store = Store::Unavailable("no settings folder".to_string());
+        let failed = AtomicBool::new(false);
+        assert_eq!(save_zoom_in(&store, 110, &failed).as_deref(), Some("no settings folder"));
+        assert_eq!(save_zoom_in(&store, 125, &failed), None);
+        assert_eq!(zoom_in(&store), 100);
     }
 }

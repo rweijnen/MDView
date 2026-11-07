@@ -371,6 +371,7 @@ fn main() {
                 dark_mode,
                 markdown::RemoteImages::Blocked,
                 &welcome_bars,
+                &page_look(),
             );
             PAGE_BARS.with(|b| *b.borrow_mut() = welcome_bars);
             (APP_NAME.to_string(), welcome_html)
@@ -404,7 +405,7 @@ fn main() {
             let dark_mode = is_windows_dark_mode();
             // An exported page is the user's own file, opened in their browser:
             // no banner works there, so remote images are allowed.
-            markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Allowed, &[])
+            markdown::wrap_html(&html_body, dark_mode, markdown::RemoteImages::Allowed, &[], &markdown::PageLook::default())
         };
 
         if let Err(e) = io::stdout().write_all(output.as_bytes()) {
@@ -1144,7 +1145,7 @@ fn create_virtual_resource_response(
             }
         };
         PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.set(remote_images == markdown::RemoteImages::Allowed));
-        let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images, &bars);
+        let full_html = markdown::wrap_html(&html_body, dark_mode, remote_images, &bars, &page_look());
         PAGE_BARS.with(|b| *b.borrow_mut() = bars);
         create_web_resource_response(
             environment,
@@ -1324,6 +1325,34 @@ fn post_network_blocked() {
     });
 }
 
+/// How MDView's pages look now (#16).
+fn page_look() -> markdown::PageLook {
+    markdown::PageLook { zoom: settings::zoom() }
+}
+
+/// Ctrl+wheel, Ctrl+Plus/Minus/0 on the page (#16): the next zoom step is
+/// used for this page and every following one, and saved.
+fn handle_zoom(hwnd: HWND, direction: &str) {
+    let Some(percent) = markdown::next_zoom(settings::zoom(), direction) else { return };
+    let save_error = settings::set_zoom(percent);
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let json: Vec<u16> =
+                    markdown::zoom_message(percent).encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(json.as_ptr())) };
+            }
+        }
+    });
+    if let Some(e) = save_error {
+        show_message(
+            Some(hwnd),
+            &format!("Could not save the zoom level:\n\n{e}\n\nThe zoom applies until MDView is closed."),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 /// The user's answer in the network bar.
 fn handle_network_files_choice(hwnd: HWND, choice: &str, document: &Path) {
     let save = |setting| match settings::set_network_files_setting(setting) {
@@ -1411,6 +1440,11 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
             }
         }
         Some("networkStatus") => post_network_blocked(),
+        Some("zoom") => {
+            if let Some(direction) = msg.get("direction") {
+                handle_zoom(hwnd, direction);
+            }
+        }
         Some("bar") => {
             let (Some(bar), Some(choice)) = (msg.get("bar"), msg.get("choice")) else { return };
             if !PAGE_BARS.with(|b| markdown::bar_choice_offered(&b.borrow(), bar, choice)) {
@@ -2280,6 +2314,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 let _ = settings.SetIsScriptEnabled(true);
                                 let _ = settings.SetIsWebMessageEnabled(true);
                                 let _ = settings.SetAreDefaultContextMenusEnabled(true);
+                                // MDView zooms its pages itself, so the zoom is kept (#16).
+                                let _ = settings.SetIsZoomControlEnabled(false);
                                 let _ = settings.SetIsStatusBarEnabled(false);
                                 let _ = settings.SetAreHostObjectsAllowed(false);
                             }
