@@ -141,6 +141,20 @@ $regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'Zoo
 $regBackup = @{}; $regKinds = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n; $regKinds[$n] = (Get-Item -Path $key).GetValueKind($n) } }
+# The standalone viewer adds every file it opens to File > Recent Files
+# (HKCU\Software\MDView\RecentFiles, File0-File9): put the user's list back.
+$recentKey = 'HKCU:\Software\MDView\RecentFiles'
+$recentBackup = @{}
+$r0 = Get-ItemProperty -Path $recentKey -ErrorAction SilentlyContinue
+foreach ($i in 0..9) { if ($r0 -and $null -ne $r0."File$i") { $recentBackup["File$i"] = $r0."File$i" } }
+function Restore-RecentFiles {
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) {
+        $n = "File$i"
+        if ($recentBackup.ContainsKey($n)) { Set-ItemProperty -Path $recentKey -Name $n -Value $recentBackup[$n] -Type String }
+        else { Remove-ItemProperty -Path $recentKey -Name $n -ErrorAction SilentlyContinue }
+    }
+}
 function Restore-Registry {
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
     foreach ($n in $regNames) {
@@ -1587,6 +1601,44 @@ function Press-DialogButton($d, $name) {
     }
 
 
+    # ---- File > Recent Files shows the path (#44), shortened in the middle,
+    # with & shown, and the full path as a tooltip on the highlighted item.
+    $deepDir = Join-Path $work 'recent\a-folder-with-a-long-name\another-folder-with-a-long-name\third-folder-name'
+    New-Item -ItemType Directory -Force $deepDir | Out-Null
+    $deepFile = Join-Path $deepDir 'notes.md'
+    Set-Content $deepFile '# Deep' -NoNewline
+    New-Item -ItemType Directory -Force (Join-Path $work 'R&D') | Out-Null
+    $ampFile = Join-Path $work 'R&D\a&b.md'
+    Set-Content -LiteralPath $ampFile '# Amp' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
+    Set-ItemProperty -Path $recentKey -Name File0 -Value $deepFile -Type String
+    Set-ItemProperty -Path $recentKey -Name File1 -Value $ampFile -Type String
+    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+    [void](Wait-Element $v $CT::Text '^Second$')
+    $menuTexts = @(); $tips = @()
+    for ($try = 0; $try -lt 2 -and -not $menuTexts.Count; $try++) {
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        [Win32.Behaviour]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); Send-Key 0x46; [Win32.Behaviour]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)   # Alt+F
+        $deadline = (Get-Date).AddSeconds(3)
+        do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+        if ($m -ne [IntPtr]::Zero) { $menuTexts = @(Get-MenuTexts $m) }
+    }
+    if ($menuTexts.Count) {
+        # Down through the items; collect the tooltips shown on the way.
+        for ($i = 0; $i -lt 6; $i++) {
+            Send-Key 0x28; Start-Sleep -Milliseconds 1200
+            $tip = Get-Tooltip $v
+            if ($tip) { $tips += $tip }
+        }
+        Send-Escape; Start-Sleep -Milliseconds 200; Send-Escape
+    }
+    Stop-Viewer $v
+    $deepItem = $menuTexts | Where-Object { $_ -like '*notes.md' } | Select-Object -First 1
+    $ampItem = $menuTexts | Where-Object { $_ -like '*a&&b.md' } | Select-Object -First 1
+    Check 'exe: Recent Files show the path, shortened in the middle, with & shown' ($deepItem -match '\\\.\.\.\\' -and $deepItem -like '*\third-folder-name\notes.md' -and $ampItem -like '*R&&D\a&&b.md') "items=$($menuTexts -join ' / ')"
+    Check 'exe: the highlighted recent file shows its full path as a tooltip' ($tips -contains $deepFile) "tooltips=$($tips -join ' / ')"
 }
 catch {
     # An error in the test itself is a failure, never a silent pass.
@@ -1605,6 +1657,7 @@ finally {
         $key = 'HKCU:\Software\MDView'   # in case a check overwrote the name
         if (Get-Command Restore-Registry -ErrorAction SilentlyContinue) { Restore-Registry }
     }
+    Cleanup 'restore File > Recent Files' { if (Get-Command Restore-RecentFiles -ErrorAction SilentlyContinue) { Restore-RecentFiles } }
     Cleanup 'restore the clipboard' { if ($clipboardSaved -and $null -ne $clipboardBefore) { Set-Clipboard -Value $clipboardBefore } }
     Cleanup 'remove the subst drive' { if ($substDefined) { subst "$($substLetter):" /d } }
     Cleanup 'remove the net use drive' { if ($netDefined) { net use "$($netLetter):" /delete /y | Out-Null } }

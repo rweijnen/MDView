@@ -60,6 +60,8 @@ thread_local! {
     /// One tooltip per host window (the plugin can have several Lister windows),
     /// keyed by the host window.
     static TIPS: RefCell<HashMap<isize, HWND>> = RefCell::new(HashMap::new());
+    /// Where to show the tooltip instead of next to the mouse (`show_at`).
+    static ANCHORS: RefCell<HashMap<isize, POINT>> = RefCell::new(HashMap::new());
 }
 
 const TOOL_ID: usize = 1;
@@ -131,6 +133,19 @@ pub fn wrap_for_display(text: &str) -> String {
 /// Show `text` for the link under the mouse, after the system's hover delay.
 /// Replaces what was shown before.
 pub fn show(owner: HWND, text: &str, dark: bool) {
+    ANCHORS.with(|a| a.borrow_mut().remove(&(owner.0 as isize)));
+    show_tip(owner, text, dark);
+}
+
+/// Show `text` at `at` (screen coordinates), for example next to a menu
+/// item (#44), after the hover delay.
+#[allow(dead_code)] // standalone viewer only
+pub fn show_at(owner: HWND, text: &str, dark: bool, at: POINT) {
+    ANCHORS.with(|a| a.borrow_mut().insert(owner.0 as isize, at));
+    show_tip(owner, text, dark);
+}
+
+fn show_tip(owner: HWND, text: &str, dark: bool) {
     let key = owner.0 as isize;
     let existing = TIPS.with(|t| t.borrow().get(&key).copied());
     let Some(window) = existing.or_else(|| create(owner, dark)) else { return };
@@ -170,8 +185,11 @@ unsafe extern "system" fn show_now(window: HWND, _msg: u32, id: usize, _time: u3
     unsafe {
         let _ = KillTimer(Some(window), id);
         let Some(owner) = owner_of(window) else { return };
+        let anchor = ANCHORS.with(|a| a.borrow().get(&(owner.0 as isize)).copied());
         let mut cursor = POINT::default();
-        if GetCursorPos(&mut cursor).is_err() {
+        if let Some(at) = anchor {
+            cursor = at;
+        } else if GetCursorPos(&mut cursor).is_err() {
             return;
         }
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
@@ -182,7 +200,9 @@ unsafe extern "system" fn show_now(window: HWND, _msg: u32, id: usize, _time: u3
         let work = info.rcWork;
         let max_width = ((work.right - work.left) * 2 / 3).max(200);
         SendMessageW(window, TTM_SETMAXTIPWIDTH, None, Some(LPARAM(max_width as isize)));
-        track_position(window, cursor.x + 12, cursor.y + 20);
+        // Next to the mouse; exactly at the anchor when there is one.
+        let (dx, dy) = if anchor.is_some() { (0, 0) } else { (12, 20) };
+        track_position(window, cursor.x + dx, cursor.y + dy);
         let mut empty = [0u16; 1];
         let tool = tool_info(owner, empty.as_mut_ptr());
         SendMessageW(window, TTM_TRACKACTIVATE, Some(WPARAM(1)), Some(LPARAM(&tool as *const _ as isize)));

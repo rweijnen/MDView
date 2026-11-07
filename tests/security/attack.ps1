@@ -220,6 +220,10 @@ $regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'Zoo
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
+$recentKey = 'HKCU:\Software\MDView\RecentFiles'
+$recentBackup = @{}
+$r0 = Get-ItemProperty -Path $recentKey -ErrorAction SilentlyContinue
+foreach ($i in 0..9) { if ($r0 -and $null -ne $r0."File$i") { $recentBackup["File$i"] = $r0."File$i" } }
 function Restore-Registry {
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
     foreach ($n in $regNames) {
@@ -380,6 +384,12 @@ try {
 }
 finally {
     Restore-Registry
+    # The standalone viewer adds every file it opens to File > Recent Files.
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) {
+        if ($recentBackup.ContainsKey("File$i")) { Set-ItemProperty -Path $recentKey -Name "File$i" -Value $recentBackup["File$i"] -Type String }
+        else { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
+    }
     $tcp.Stop()
     Stop-Job $serverJob -ErrorAction SilentlyContinue; Remove-Job $serverJob -Force -ErrorAction SilentlyContinue
     Get-Process mdview -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Stop-Process -Force -ErrorAction SilentlyContinue

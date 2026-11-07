@@ -922,6 +922,60 @@ fn add_to_recent_files(file_path: &str) {
 }
 
 /// Update the recent files submenu
+/// Longest path shown in File > Recent Files before it is shortened.
+const RECENT_PATH_CHARS: usize = 60;
+
+/// A recent file's menu text (#44): its access key and its path, shortened in
+/// the middle (drive, first folder and file name stay), with `&` doubled so
+/// it is shown, not used as an access key. The full path is the tooltip.
+fn recent_menu_text(index: usize, path: &str) -> String {
+    let key = if index < 9 { format!("&{}", index + 1) } else { "1&0".to_string() };
+    format!("{key} {}", shorten_path(path, RECENT_PATH_CHARS).replace('&', "&&"))
+}
+
+/// `C:\Work\...\docs\README.md`: keeps the root and first folder and as
+/// many of the last parts as fit, always the file name.
+fn shorten_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('\\').collect();
+    if parts.len() <= 3 {
+        return path.to_string();
+    }
+    // A UNC path starts with two empty parts: keep \\server\share.
+    let head_len = if path.starts_with("\\\\") { 4.min(parts.len() - 1) } else { 2 };
+    let head = parts[..head_len].join("\\");
+    let mut tail: Vec<&str> = vec![parts[parts.len() - 1]];
+    for part in parts[head_len..parts.len() - 1].iter().rev() {
+        let candidate = format!("{head}\\...\\{part}\\{}", tail.join("\\"));
+        if candidate.chars().count() > max {
+            break;
+        }
+        tail.insert(0, part);
+    }
+    if tail.len() == parts.len() - head_len {
+        return path.to_string();
+    }
+    format!("{head}\\...\\{}", tail.join("\\"))
+}
+/// The highlighted recent file's full path, next to its menu item.
+fn show_recent_file_tooltip(hwnd: HWND, menu: HMENU, item: u32) {
+    let index = (item - IDM_FILE_RECENT_BASE) as usize;
+    let Some(path) = RECENT_FILES.with(|f| f.borrow().get(index).cloned()) else { return };
+    unsafe {
+        let count = GetMenuItemCount(Some(menu));
+        for position in 0..count.max(0) {
+            if GetMenuItemID(menu, position) == item {
+                let mut rect = RECT::default();
+                if GetMenuItemRect(Some(hwnd), menu, position as u32, &mut rect).is_ok() {
+                    linkstatus::show_at(hwnd, &path, is_windows_dark_mode(), POINT { x: rect.right + 8, y: rect.top });
+                }
+                return;
+            }
+        }
+    }
+}
 fn update_recent_files_menu() {
     unsafe {
         MENU_HANDLE.with(|menu| {
@@ -948,11 +1002,7 @@ fn update_recent_files_menu() {
                     } else {
                         // Add recent files (native menu items)
                         for (i, path) in files.iter().enumerate() {
-                            let filename = Path::new(path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.clone());
-                            let text = format!("&{} {}", i + 1, filename);
+                            let text = recent_menu_text(i, path);
                             let _ = insert_menu_item(
                                 file_menu,
                                 2 + i as u32,
@@ -2869,6 +2919,22 @@ unsafe extern "system" fn window_proc(
             handle_queued_links(hwnd);
             LRESULT(0)
         }
+        // #44: the full path of a recent file as a tooltip next to its item.
+        WM_MENUSELECT => {
+            let item = (wparam.0 & 0xFFFF) as u32;
+            let flags = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            let recent = IDM_FILE_RECENT_BASE..IDM_FILE_RECENT_BASE + 10;
+            if flags != 0xFFFF && flags & MF_POPUP.0 == 0 && recent.contains(&item) {
+                show_recent_file_tooltip(hwnd, HMENU(lparam.0 as *mut _), item);
+            } else {
+                linkstatus::hide(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_EXITMENULOOP => {
+            linkstatus::hide(hwnd);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_MDVIEW_MENU => {
             show_context_menu(hwnd);
             LRESULT(0)
@@ -3110,6 +3176,24 @@ mod tests {
         assert_eq!(CAPABILITIES_KEY, "Software\\MDView\\Capabilities");
         assert_eq!(FILE_ASSOCIATIONS_KEY, "Software\\MDView\\Capabilities\\FileAssociations");
         assert!(links::REFUSED_PROGRAM.starts_with("MDView does not open"));
+    }
+
+    // #44: recent files show their path, shortened in the middle; & is shown.
+    #[test]
+    fn test_recent_files_show_the_path() {
+        assert_eq!(recent_menu_text(0, r"C:\docs\README.md"), r"&1 C:\docs\README.md");
+        assert_eq!(recent_menu_text(9, r"C:\a.md"), r"1&0 C:\a.md");
+        assert_eq!(recent_menu_text(1, r"C:\R&D\a&b.md"), r"&2 C:\R&&D\a&&b.md");
+        let long = r"C:\Work\projects\customer-name\2026\documentation\drafts\docs\README.md";
+        let short = shorten_path(long, 60);
+        assert!(short.chars().count() <= 60, "{short}");
+        assert!(short.starts_with(r"C:\Work\...\") && short.ends_with(r"\docs\README.md"), "{short}");
+        let unc = r"\\server\share\very\long\folder\names\that\go\on\and\on\and\on\file.md";
+        let short = shorten_path(unc, 40);
+        assert!(short.starts_with(r"\\server\share\...\") && short.ends_with(r"\file.md"), "{short}");
+        // A file name longer than the limit still shows in full.
+        let name = format!(r"C:\a\b\c\{}.md", "x".repeat(70));
+        assert!(shorten_path(&name, 60).ends_with(&format!("{}.md", "x".repeat(70))));
     }
 
     #[test]
