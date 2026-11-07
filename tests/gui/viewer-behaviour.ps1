@@ -6,7 +6,8 @@
 # (#24: Open, remove the mark, Don't ask again, Close), Close on the
 # remote-images bar, paths from documents (#49: no escape to other drives,
 # shares, pipes; absolute paths; the network bar: Load files, Always load,
-# Never; links to a share ask first), and the welcome screen.
+# Never; links to a share ask first), the welcome screen, the remembered zoom
+# (#16) and the tooltip that shows where a link goes (#60).
 #
 # The "remote" images come from a local server on 127.0.0.1. Backs up and
 # restores HKCU\Software\MDView; test windows get their own TEMP (own WebView2
@@ -960,6 +961,90 @@ function Press-DialogButton($d, $name) {
     if ($again) { [void](Press-DialogButton $again 'OK') }
     Stop-Viewer $v
     Check "plugin: a zoom that can't be saved is reported once, and zooming still works" ($focused -and $dialogText -match 'Could not save the zoom level' -and $closedOk -and -not $again -and (Near $ratio 1.25)) "focused=$focused text='$dialogText' closed=$closedOk second dialog=$([bool]$again) ratio=$ratio"
+
+    # ---- Where a link goes (#60): a Windows tooltip with what a click would open.
+    $longDir = (1..6 | ForEach-Object { "a-rather-long-folder-name-number-$_" }) -join '/'
+    Set-Content (Join-Path $work 'hover.md') -NoNewline -Value ((@(
+        '# Hover', '',
+        '[web link](https://example.com/real)', '',
+        '[https://example.org/looks-like-this](https://example.com/real)', '',
+        '<a href="https://example.com/real" title="https://bank.example/">titled link</a>', '',
+        '[relative link](second.md)', '',
+        "[other drive link]($($substLetter):\big.jpg)", '',
+        "[share link](<$shareUrl/second.md>)", '',
+        '[anchor link](#bottom)', '',
+        '[program link](run.exe)', '',
+        "[long link]($longDir/file.md)", '',
+        (('filler line' + "`n`n") * 10), '## Bottom', '', 'end') -join "`n"))
+    $hoverCases = @(
+        @('web link', 'https://example.com/real'),
+        @('https://example.org/looks-like-this', 'https://example.com/real'),
+        @('titled link', 'https://example.com/real'),
+        @('relative link', (Join-Path $work 'second.md')),
+        @('other drive link', "$($substLetter):\big.jpg"),
+        @('share link', "$shareWork\second.md"),
+        @('anchor link', '#bottom'),
+        @('program link', "$(Join-Path $work 'run.exe') (not opened)"),
+        @('long link', (Join-Path $work (($longDir -replace '/', '\') + '\file.md')))
+    )
+    # The viewer process's visible Windows tooltip and its text, if one is shown.
+    function Get-Tooltip($v) {
+        $script:tipText = $null
+        $targetPid = $v.Proc.Id
+        $cb = [Win32.Behaviour+EnumProc]{
+            param($h, $l)
+            $procId = 0
+            [void][Win32.Behaviour]::GetWindowThreadProcessId($h, [ref]$procId)
+            if ($procId -eq $targetPid -and [Win32.Behaviour]::IsWindowVisible($h)) {
+                $c = New-Object System.Text.StringBuilder 64
+                [void][Win32.Behaviour]::GetClassName($h, $c, 64)
+                if ($c.ToString() -eq 'tooltips_class32') {
+                    # A tooltip has no window text; UI Automation reads its text.
+                    # Long targets are shown with line breaks; compare the text itself.
+                    $script:tipText = try { ([string]$AE::FromHandle($h).Current.Name) -replace "[`r`n]", '' } catch { "(unreadable: $_)" }
+                    return $false
+                }
+            }
+            $true
+        }
+        [void][Win32.Behaviour]::EnumWindows($cb, [IntPtr]::Zero)
+        $script:tipText
+    }
+    function Wait-Tooltip($v, $want, $seconds = 4) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        do { $tip = Get-Tooltip $v; if ($tip -eq $want) { return $tip }; Start-Sleep -Milliseconds 200 } while ((Get-Date) -lt $deadline)
+        $tip
+    }
+    function Move-MouseTo($e) {
+        $r = $e.Current.BoundingRectangle
+        [void][Win32.Behaviour]::SetCursorPos([int]($r.X + [Math]::Min(20, $r.Width / 2)), [int]($r.Y + $r.Height / 2))
+    }
+
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'hover.md')
+        $heading = Wait-Element $v $CT::Text '^Hover$'
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        foreach ($case in $hoverCases) {
+            $link = Find-Element $v $CT::Hyperlink ([regex]::Escape($case[0]))
+            if (-not $link) { Check "${hostKind}: hovering '$($case[0])' shows where it goes" $false 'link not found'; continue }
+            if ($heading) { Move-MouseTo $heading; Start-Sleep -Milliseconds 300 }
+            # Links lower on the page can be below the window: scroll to it first.
+            if ($link.Current.IsOffscreen) {
+                try { $link.GetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern).ScrollIntoView() } catch { }
+                Start-Sleep -Milliseconds 500
+            }
+            Move-MouseTo $link
+            $tip = Wait-Tooltip $v $case[1]
+            Check "${hostKind}: hovering '$($case[0])' shows where it goes" ($tip -eq $case[1]) "tooltip='$tip' expected='$($case[1])'"
+        }
+        if ($heading) { Move-MouseTo $heading }
+        $deadline = (Get-Date).AddSeconds(3)
+        do { $left = Get-Tooltip $v; if (-not $left) { break }; Start-Sleep -Milliseconds 200 } while ((Get-Date) -lt $deadline)
+        Check "${hostKind}: the tooltip goes away when the mouse leaves the link" (-not $left) "tooltip='$left'"
+        Stop-Viewer $v
+    }
+
 }
 finally {
     # Only windows this test started (tracked by process), never others.

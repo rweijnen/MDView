@@ -829,6 +829,36 @@ a {{ cursor: pointer; }}
             }}
         }});
     }}
+
+    // Where a link goes (#60): MDView shows it in a Windows tooltip, worked
+    // out the same way as a click. The link's own title (from the document)
+    // is set aside meanwhile, so it can't show a second, different hint.
+    if (webview) {{
+        var hovered = null, hoveredTitle = null;
+        function hoverEnd() {{
+            if (!hovered) return;
+            if (hoveredTitle !== null) hovered.setAttribute('title', hoveredTitle);
+            hovered = null;
+            hoveredTitle = null;
+            webview.postMessage({{type: 'hoverLink', url: ''}});
+        }}
+        document.addEventListener('mouseover', function(e) {{
+            var link = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+            if (link === hovered) return;
+            hoverEnd();
+            if (!link) return;
+            hovered = link;
+            hoveredTitle = link.getAttribute('title');
+            if (hoveredTitle !== null) link.removeAttribute('title');
+            webview.postMessage({{type: 'hoverLink', url: link.href, href: link.getAttribute('href')}});
+        }});
+        document.addEventListener('mouseout', function(e) {{
+            if (hovered && !(e.relatedTarget && hovered.contains(e.relatedTarget))) hoverEnd();
+        }});
+        document.addEventListener('mousedown', hoverEnd, true);
+        window.addEventListener('scroll', hoverEnd, true);
+        window.addEventListener('blur', hoverEnd);
+    }}
 }})();
 </script>
 </body>
