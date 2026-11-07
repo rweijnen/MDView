@@ -4,6 +4,7 @@ mod clipboard;
 mod contextmenu;
 mod files;
 mod fonts;
+mod history;
 mod links;
 mod linkstatus;
 mod markdown;

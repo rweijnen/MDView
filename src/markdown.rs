@@ -663,6 +663,62 @@ if (webview) (function() {
 })();
 "##;
 
+/// "Back" at the top of the page (#46), when there is something to go back to:
+/// "Back to a.md" after following a link (MDView sends `history` with the
+/// previous document's name), "Back" after a jump to a heading. A click is
+/// the browser's own Back; MDView keeps the documents' real paths.
+const BACK_SCRIPT: &str = r##"
+if (webview) (function() {
+    var info = {back: false, previous: ''};
+    var host = null, button = null;
+    var ARROW = String.fromCharCode(0x2190);
+    function linkColor() {
+        var a = document.createElement('a');
+        a.href = '#';
+        document.body.appendChild(a);
+        var color = getComputedStyle(a).color;
+        a.remove();
+        return color;
+    }
+    function render() {
+        var inDocument = !!(history.state && history.state.mdviewAnchor);
+        if (!info.back && !inDocument) {
+            if (host) { host.remove(); host = null; }
+            return;
+        }
+        if (!host) {
+            host = document.createElement('div');
+            host.setAttribute('data-mdview-back', '');
+            var shadow = host.attachShadow({mode: 'closed'});
+            var style = document.createElement('style');
+            style.textContent = ':host{all:initial;display:block;margin:0 0 8px}' +
+                'button{font:13px "Segoe UI",-apple-system,Helvetica,Arial,sans-serif;border:none;background:transparent;cursor:pointer;padding:4px 0;min-height:28px}' +
+                'button:hover{text-decoration:underline}:focus-visible{outline:2px solid currentColor;outline-offset:2px}';
+            shadow.appendChild(style);
+            button = document.createElement('button');
+            button.type = 'button';
+            button.style.color = linkColor();
+            button.addEventListener('click', function() { history.back(); });
+            shadow.appendChild(button);
+            document.body.insertBefore(host, document.body.firstChild);
+        }
+        var label = inDocument || !info.previous ? 'Back' : 'Back to ' + info.previous;
+        button.textContent = ARROW + ' ' + label;
+        button.setAttribute('aria-label', label);
+    }
+    window.__mdviewHistoryChanged = render;
+    webview.addEventListener('message', function(e) {
+        var m = e.data;
+        if (m && m.type === 'history') {
+            info.back = m.back === true;
+            info.previous = typeof m.previous === 'string' ? m.previous : '';
+            render();
+        }
+    });
+    webview.postMessage({type: 'historyStatus'});
+})();
+"##;
+
 /// The keyboard help (#59): F1 asks MDView, which sends `showHelp` with this
 /// program's keys. A panel like the settings panel (closed shadow root, text
 /// with `textContent`); Esc, F1 or Close closes it.
@@ -1126,6 +1182,7 @@ pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, ba
     let help_script = HELP_SCRIPT;
     let panel_script = PANEL_SCRIPT;
     let message_script = MESSAGE_SCRIPT;
+    let back_script = BACK_SCRIPT;
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
     let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
@@ -1346,15 +1403,32 @@ a {{ cursor: pointer; }}
         if (!target) return false;
 
         target.scrollIntoView();
-        if (history && history.replaceState) {{
-            history.replaceState(null, '', hash);
-        }}
         return true;
     }}
 
     if (location.hash) {{
         scrollToHash(location.hash);
     }}
+
+    // A jump to a heading is a history entry of its own (#46): Back returns
+    // to where the reader was. The entry left remembers its scroll position.
+    function jumpToHash(hash) {{
+        var id = decodeURIComponent(hash.slice(1));
+        if (!id || !document.getElementById(id)) return;
+        if (history.pushState) {{
+            history.replaceState({{mdviewY: window.scrollY, mdviewAnchor: history.state && history.state.mdviewAnchor}}, '', location.href);
+            history.pushState({{mdviewAnchor: true}}, '', hash);
+        }}
+        scrollToHash(hash);
+        if (window.__mdviewHistoryChanged) window.__mdviewHistoryChanged();
+    }}
+    window.addEventListener('popstate', function(e) {{
+        var s = e.state;
+        if (s && typeof s.mdviewY === 'number') window.scrollTo(0, s.mdviewY);
+        else if (location.hash) scrollToHash(location.hash);
+        else window.scrollTo(0, 0);
+        if (window.__mdviewHistoryChanged) window.__mdviewHistoryChanged();
+    }});
 
     document.addEventListener('click', function(e) {{
         var link = e.target.closest('a');
@@ -1366,7 +1440,7 @@ a {{ cursor: pointer; }}
 
         if (href.charAt(0) === '#') {{
             e.preventDefault();
-            scrollToHash(href);
+            jumpToHash(href);
             return;
         }}
 
@@ -1451,6 +1525,7 @@ a {{ cursor: pointer; }}
 {settings_script}
 {help_script}
 {message_script}
+{back_script}
 }})();
 </script>
 </body>

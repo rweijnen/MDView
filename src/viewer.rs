@@ -68,6 +68,8 @@ thread_local! {
     static PANEL_OPEN: RefCell<std::collections::HashSet<isize>> = RefCell::new(std::collections::HashSet::new());
     /// Per viewer: the shown document's file, watched for changes (#17).
     static WATCH: RefCell<HashMap<isize, crate::watch::Watch>> = RefCell::new(HashMap::new());
+    /// Per viewer: the documents shown, with their real paths (#46).
+    static HISTORY: RefCell<HashMap<isize, crate::history::History>> = RefCell::new(HashMap::new());
     /// Per viewer: the right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<HashMap<isize, crate::contextmenu::Request>> = RefCell::new(HashMap::new());
 }
@@ -522,6 +524,8 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                 if user_initiated.as_bool() {
                                                     queue_link(hwnd, uri, false);
                                                 }
+                                            } else if crate::vpath::is_document_origin(&uri) {
+                                                document_navigation(hwnd, navigation_kind(&args), &uri);
                                             }
                                         } else {
                                             let _ = args.SetCancel(true);
@@ -532,6 +536,16 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             );
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
+
+                            // Back is possible or not any more: tell the page (#46).
+                            let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
+                                move |_webview, _args| {
+                                    post_history(hwnd);
+                                    Ok(())
+                                },
+                            ));
+                            let mut history_token: i64 = 0;
+                            let _ = webview.add_HistoryChanged(&history_handler, &mut history_token);
 
                             // No new windows: a link the user opened in a new
                             // window goes through the link policy.
@@ -848,6 +862,7 @@ fn cleanup_viewer_state(hwnd: HWND) {
     PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
     DOCUMENT_CHOICES.with(|c| c.borrow_mut().remove(&key));
     WATCH.with(|w| w.borrow_mut().remove(&key));
+    HISTORY.with(|h| h.borrow_mut().remove(&key));
     PANEL_OPEN.with(|p| p.borrow_mut().remove(&key));
     PENDING_MENU.with(|m| m.borrow_mut().remove(&key));
 }
@@ -1145,7 +1160,7 @@ fn post_key_to_lister(hwnd: HWND, vk: u16) {
 /// reported the click.
 fn show_context_menu(hwnd: HWND) {
     let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize))) else { return };
-    let items = crate::shortcuts::menu_items(request.link.is_some(), request.has_selection, crate::settings::zoom(), true);
+    let items = crate::shortcuts::menu_items(request.link.is_some(), request.has_selection, can_go(hwnd), crate::settings::zoom(), true);
     if let Some(command) = crate::contextmenu::show(hwnd, request.screen, &items) {
         run_menu_command(hwnd, command, request.link.as_deref());
     }
@@ -1182,6 +1197,8 @@ fn run_menu_command(hwnd: HWND, command: crate::shortcuts::MenuCommand, link: Op
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Back => go(hwnd, true),
+        Forward => go(hwnd, false),
         Reload => reload_page(hwnd),
         Settings => open_settings(hwnd),
         Help => open_help(hwnd),
@@ -1272,6 +1289,70 @@ fn is_internal_virtual_url(url: &str) -> bool {
 /// origin, and a page MDView itself loads with NavigateToString. Everything
 /// else (script or <meta refresh> navigation, other files, other sites) is
 /// cancelled; a link the user clicked goes through `queue_link`.
+/// What kind of navigation WebView2 starts (new document, back/forward, reload).
+fn navigation_kind(args: &ICoreWebView2NavigationStartingEventArgs) -> crate::history::Kind {
+    let Ok(args3) = args.cast::<ICoreWebView2NavigationStartingEventArgs3>() else { return crate::history::Kind::New };
+    let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
+    if unsafe { args3.NavigationKind(&mut kind) }.is_err() {
+        return crate::history::Kind::New;
+    }
+    match kind {
+        COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD => crate::history::Kind::BackOrForward,
+        COREWEBVIEW2_NAVIGATION_KIND_RELOAD => crate::history::Kind::Reload,
+        _ => crate::history::Kind::New,
+    }
+}
+
+/// A document navigation starts (#46): this viewer's history gives the real
+/// path, which becomes the current document before WebView2 asks for the
+/// page (a document URL doesn't name the drive or share).
+fn document_navigation(hwnd: HWND, kind: crate::history::Kind, uri: &str) {
+    let key = hwnd.0 as isize;
+    let path = HISTORY.with(|h| {
+        h.borrow_mut()
+            .entry(key)
+            .or_default()
+            .navigate(kind, uri, |u| resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from))
+    });
+    if let Some(path) = path {
+        CURRENT_FILES.with(|f| f.borrow_mut().insert(key, path.to_string_lossy().into_owned()));
+    }
+}
+
+/// Tell this viewer's page whether it can go back, and to which document.
+fn post_history(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    let can_go = can_go(hwnd);
+    let previous = HISTORY.with(|h| h.borrow().get(&key).and_then(|h| h.previous_name()));
+    post_to_page(hwnd, &crate::history::history_message(can_go.back, previous.as_deref()));
+}
+
+fn can_go(hwnd: HWND) -> crate::shortcuts::CanGo {
+    CONTROLLERS
+        .with(|c| {
+            let controller = c.borrow().get(&(hwnd.0 as isize)).cloned()?;
+            let webview = unsafe { controller.CoreWebView2() }.ok()?;
+            let (mut back, mut forward) = (windows::core::BOOL(0), windows::core::BOOL(0));
+            unsafe {
+                let _ = webview.CanGoBack(&mut back);
+                let _ = webview.CanGoForward(&mut forward);
+            }
+            Some(crate::shortcuts::CanGo { back: back.as_bool(), forward: forward.as_bool() })
+        })
+        .unwrap_or_default()
+}
+
+/// Back or forward in this viewer's history (right-click menu).
+fn go(hwnd: HWND, back: bool) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { if back { webview.GoBack() } else { webview.GoForward() } };
+            }
+        }
+    });
+}
+
 fn navigation_allowed(hwnd: HWND, url: &str) -> bool {
     if crate::vpath::is_document_origin(url) {
         return resolve_virtual_mdview_url(hwnd, url)
@@ -1336,6 +1417,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
         Some("messageShown") | Some("messageChoice") => handle_message_reply(hwnd, msg),
         Some("openSettings") => open_settings(hwnd),
         Some("openHelp") => open_help(hwnd),
+        Some("historyStatus") => post_history(hwnd),
         Some("panel") => PANEL_OPEN.with(|p| {
             let key = hwnd.0 as isize;
             if msg.get("open").map(String::as_str) == Some("true") { p.borrow_mut().insert(key); } else { p.borrow_mut().remove(&key); }

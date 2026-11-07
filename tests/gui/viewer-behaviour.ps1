@@ -1348,7 +1348,17 @@ function Press-DialogButton($d, $name) {
         @{ Name = 'a missing file'; Args = @('--gui', "`"$(Join-Path $work 'missing.md')`""); Text = 'not found' },
         @{ Name = 'an unknown option'; Args = @('--no-such-option'); Text = 'Use --help' }
     )) {
-        $p = Start-Process -FilePath $Exe -ArgumentList $case.Args -PassThru
+        # Started the way Explorer starts it: from a program without a console
+        # (rundll32), so MDView can't write to one and must show a message.
+        $before = Get-Date
+        Start-Process -FilePath "$env:WINDIR\System32\rundll32.exe" -ArgumentList (@('shell32.dll,ShellExec_RunDLL', "`"$Exe`"") + $case.Args)
+        $p = $null
+        $deadline = (Get-Date).AddSeconds(10)
+        while (-not $p -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+            $p = Get-Process mdview -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe -and $_.StartTime -ge $before.AddSeconds(-1) } | Select-Object -First 1
+        }
+        if (-not $p) { Check "exe: $($case.Name) at startup shows a message, then MDView exits" $false 'MDView did not start'; continue }
         [void]$started.Add($p)
         $sv = @{ Proc = $p }
         $d = Wait-Dialog $sv 10
@@ -1624,6 +1634,69 @@ function Press-DialogButton($d, $name) {
         $yAfter = if ($b2) { $b2.Current.BoundingRectangle.Y } else { $null }
         Stop-Viewer $v
         Check "${hostKind}: a changed file is reloaded, keeping the scroll position" ([bool]$after -and $bottomShown -and $null -ne $yAfter -and [Math]::Abs($yAfter - $yBefore) -le 4) "reloaded=$([bool]$after) at bottom=$bottomShown Y before=$yBefore after=$yAfter"
+    }
+
+    # ---- Back and forward (#46).
+    function Send-AltKey($vk) {
+        [Win32.Behaviour]::keybd_event(0x12, 0x38, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 1, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 3, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event(0x12, 0x38, 2, [UIntPtr]::Zero)
+    }
+    # A key once more if the page didn't change at all (input lost after a focus change).
+    function Send-AltUntil($v, $vk, $heading) {
+        for ($try = 0; $try -lt 2; $try++) {
+            [void](Focus-Document $v); Send-AltKey $vk
+            $h = Wait-Element $v $CT::Text "^$heading$" 5
+            if ($h) { return $true }
+        }
+        $false
+    }
+    $mainPath = Join-Path $work 'main.md'
+    $crossDir = if ($substDefined) { "$($substLetter):\" } else { $null }
+    if ($crossDir) {
+        Set-Content (Join-Path $crossDir 'cross.md') -NoNewline -Value ("# Cross`n`n[to main on C:](<file:///$($mainPath -replace '\\', '/')>)")
+    }
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind $mainPath
+        [void](Wait-Element $v $CT::Text '^Main$')
+        $noBackAtStart = -not (Find-Element $v $CT::Button '^Back')
+        $link = Wait-Element $v $CT::Hyperlink 'Go to second' 5
+        if ($link) { Invoke-Element $link }
+        $second = Wait-Element $v $CT::Text '^Second$' 10
+        $backLine = Wait-Element $v $CT::Button '^Back to main\.md$' 5
+        $title = if ($hostKind -eq 'exe') { $v.Proc.Refresh(); $v.Proc.MainWindowTitle } else { 'second.md - MDView' }
+        if ($backLine) { Invoke-Element $backLine }
+        $backToMain = Wait-Element $v $CT::Text '^Main$' 10
+        $forward = Send-AltUntil $v 0x27 'Second'
+        $back = Send-AltUntil $v 0x25 'Main'
+        Check "${hostKind}: after a link, 'Back to main.md' and Alt+Left / Alt+Right go back and forward" ($noBackAtStart -and [bool]$second -and [bool]$backLine -and [bool]$backToMain -and $forward -and $back -and $title -eq 'second.md - MDView') "no back line at start=$noBackAtStart back line=$([bool]$backLine) back=$([bool]$backToMain) forward=$forward alt+left=$back title='$title'"
+
+        # A jump to a heading: Back returns to where the reader was.
+        $top = Find-Element $v $CT::Text '^Main$'
+        $yTop = if ($top) { $top.Current.BoundingRectangle.Y } else { $null }
+        $jump = Find-Element $v $CT::Hyperlink 'Jump to bottom'
+        if ($jump) { Invoke-Element $jump }
+        Start-Sleep -Milliseconds 800
+        $mainAway = Find-Element $v $CT::Text '^Main$'
+        $scrolled = (-not $mainAway) -or $mainAway.Current.IsOffscreen
+        $backInDoc = Wait-Element $v $CT::Button '^Back$' 5
+        if ($backInDoc) { Invoke-Element $backInDoc }
+        Start-Sleep -Milliseconds 800
+        $topAgain = Find-Element $v $CT::Text '^Main$'
+        $restored = $topAgain -and -not $topAgain.Current.IsOffscreen -and [Math]::Abs($topAgain.Current.BoundingRectangle.Y - $yTop) -le 4
+        Stop-Viewer $v
+        Check "${hostKind}: after a jump to a heading, Back returns to the place before" ($scrolled -and [bool]$backInDoc -and $restored) "scrolled=$scrolled back line=$([bool]$backInDoc) position restored=$restored"
+
+        if (-not $crossDir) { Skip "${hostKind}: Back to a document on another drive" "subst $($substLetter): was not created"; continue }
+        $v = Start-Viewer $hostKind (Join-Path $crossDir 'cross.md')
+        $link = Wait-Element $v $CT::Hyperlink 'to main on C:' 15
+        if ($link) { Invoke-Element $link }
+        $onMain = Wait-Element $v $CT::Text '^Main$' 10
+        $crossAgain = Send-AltUntil $v 0x25 'Cross'
+        Stop-Viewer $v
+        Check "${hostKind}: Back to a document on another drive shows it again" ([bool]$onMain -and $crossAgain) "on main=$([bool]$onMain) back on cross=$crossAgain"
     }
 
     # ---- Drag and drop on the standalone viewer (#54). A small window here

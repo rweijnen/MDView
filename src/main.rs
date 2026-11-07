@@ -6,6 +6,7 @@ mod clipboard;
 mod contextmenu;
 mod files;
 mod fonts;
+mod history;
 mod links;
 mod linkstatus;
 mod markdown;
@@ -499,6 +500,8 @@ const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
 const IDM_HELP_KEYS: u32 = 2002;
+const IDM_GO_BACK: u32 = 3001;
+const IDM_GO_FORWARD: u32 = 3002;
 const IDM_EDIT_FIND: u32 = 1201;
 const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
@@ -706,6 +709,15 @@ fn create_menu() -> windows::core::Result<HMENU> {
             PCWSTR(edit_text.as_ptr()),
         )?;
 
+        // Go menu (#46): back and forward between documents and headings.
+        let go_menu = CreatePopupMenu()?;
+        let back_text: Vec<u16> = "&Back\tAlt+Left\0".encode_utf16().collect();
+        AppendMenuW(go_menu, MF_STRING, IDM_GO_BACK as usize, PCWSTR(back_text.as_ptr()))?;
+        let forward_text: Vec<u16> = "&Forward\tAlt+Right\0".encode_utf16().collect();
+        AppendMenuW(go_menu, MF_STRING, IDM_GO_FORWARD as usize, PCWSTR(forward_text.as_ptr()))?;
+        let go_text: Vec<u16> = "&Go\0".encode_utf16().collect();
+        AppendMenuW(menu_bar, MF_POPUP, go_menu.0 as usize, PCWSTR(go_text.as_ptr()))?;
+
         let help_text: Vec<u16> = "&Help\0".encode_utf16().collect();
         AppendMenuW(
             menu_bar,
@@ -738,6 +750,16 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
                 fVirt: FVIRTKEY,
                 key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F1.0,
                 cmd: IDM_HELP_KEYS as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FALT,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT.0,
+                cmd: IDM_GO_BACK as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FALT,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_RIGHT.0,
+                cmd: IDM_GO_FORWARD as u16,
             },
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL,
@@ -1491,7 +1513,17 @@ fn print_page(hwnd: HWND) {
 /// reported the click.
 fn show_context_menu(hwnd: HWND) {
     let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().take()) else { return };
-    let items = shortcuts::menu_items(request.link.is_some(), request.has_selection, settings::zoom(), false);
+    let can_go = CONTROLLER.with(|c| {
+        let controller = c.borrow().clone()?;
+        let webview = unsafe { controller.CoreWebView2() }.ok()?;
+        let (mut back, mut forward) = (windows::core::BOOL(0), windows::core::BOOL(0));
+        unsafe {
+            let _ = webview.CanGoBack(&mut back);
+            let _ = webview.CanGoForward(&mut forward);
+        }
+        Some(shortcuts::CanGo { back: back.as_bool(), forward: forward.as_bool() })
+    });
+    let items = shortcuts::menu_items(request.link.is_some(), request.has_selection, can_go.unwrap_or_default(), settings::zoom(), false);
     if let Some(command) = contextmenu::show(hwnd, request.screen, &items) {
         run_menu_command(hwnd, command, request.link.as_deref());
     }
@@ -1519,6 +1551,8 @@ fn run_menu_command(hwnd: HWND, command: shortcuts::MenuCommand, link: Option<&s
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Back => go(true),
+        Forward => go(false),
         Reload => reload_page(),
         Settings => open_settings(),
         Help => open_help(),
@@ -1618,6 +1652,70 @@ fn navigation_allowed(url: &str) -> bool {
     false
 }
 
+/// What kind of navigation WebView2 starts (new document, back/forward, reload).
+fn navigation_kind(args: &ICoreWebView2NavigationStartingEventArgs) -> history::Kind {
+    let Ok(args3) = args.cast::<ICoreWebView2NavigationStartingEventArgs3>() else { return history::Kind::New };
+    let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
+    if unsafe { args3.NavigationKind(&mut kind) }.is_err() {
+        return history::Kind::New;
+    }
+    match kind {
+        COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD => history::Kind::BackOrForward,
+        COREWEBVIEW2_NAVIGATION_KIND_RELOAD => history::Kind::Reload,
+        _ => history::Kind::New,
+    }
+}
+
+/// A document navigation starts (#46): MDView's history gives its real path,
+/// which becomes the current document before WebView2 asks for the page (a
+/// document URL doesn't name the drive or share), and the window title.
+fn document_navigation(kind: history::Kind, uri: &str) {
+    let path = HISTORY.with(|h| {
+        h.borrow_mut().navigate(kind, uri, |u| resolve_virtual_mdview_url(u).map(std::path::PathBuf::from))
+    });
+    let Some(path) = path else { return };
+    let path = path.to_string_lossy().into_owned();
+    CURRENT_FILE.with(|f| *f.borrow_mut() = Some(path.clone()));
+    if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+        set_window_title(hwnd, &path);
+    }
+}
+
+/// Tell the page whether it can go back, and to which document (#46).
+fn post_history() {
+    let can_go_back = CONTROLLER.with(|c| {
+        let controller = c.borrow().clone()?;
+        let webview = unsafe { controller.CoreWebView2() }.ok()?;
+        let mut can = windows::core::BOOL(0);
+        unsafe { webview.CanGoBack(&mut can) }.ok()?;
+        Some(can.as_bool())
+    });
+    let previous = HISTORY.with(|h| h.borrow().previous_name());
+    post_to_page(&history::history_message(can_go_back.unwrap_or(false), previous.as_deref()));
+}
+
+/// Back or forward in WebView2's history (Go menu, right-click menu).
+fn go(back: bool) {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { if back { webview.GoBack() } else { webview.GoForward() } };
+            }
+        }
+    });
+}
+
+fn set_window_title(hwnd: HWND, file_path: &str) {
+    let filename = Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+    let title: Vec<u16> = format!("{filename} - {APP_NAME}\0").encode_utf16().collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
+    }
+}
+
 /// Whether a message comes from a page MDView itself loaded.
 fn is_trusted_page(source: &str) -> bool {
     if crate::vpath::is_document_origin(source) {
@@ -1668,6 +1766,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
         Some("messageShown") | Some("messageChoice") => handle_message_reply(hwnd, msg),
         Some("openSettings") => open_settings(),
         Some("openHelp") => open_help(),
+        Some("historyStatus") => post_history(),
         Some("panel") => PANEL_OPEN.with(|p| p.set(msg.get("open").map(String::as_str) == Some("true"))),
         // N / P / 1-9 are for Total Commander's Lister; nothing to do here.
         Some("listerKey") => {}
@@ -1812,15 +1911,7 @@ fn load_file_into_webview(hwnd: HWND, file_path: &str) {
         });
     }
 
-    // Update window title
-    let filename = Path::new(file_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_path.to_string());
-    let title: Vec<u16> = format!("{filename} - {APP_NAME}\0").encode_utf16().collect();
-    unsafe {
-        let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
-    }
+    set_window_title(hwnd, file_path);
 
     // Store current file and add to recent
     CURRENT_FILE.with(|f| {
@@ -2469,6 +2560,8 @@ thread_local! {
     static PANEL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The shown document's file, watched for changes (#17).
     static WATCH: RefCell<Option<watch::Watch>> = const { RefCell::new(None) };
+    /// The documents shown, with their real paths, for back and forward (#46).
+    static HISTORY: RefCell<history::History> = RefCell::new(history::History::default());
     /// The right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<Option<contextmenu::Request>> = const { RefCell::new(None) };
 }
@@ -2674,6 +2767,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                 if user_initiated.as_bool() {
                                                     queue_link(uri, false);
                                                 }
+                                            } else if crate::vpath::is_document_origin(&uri) {
+                                                document_navigation(navigation_kind(&args), &uri);
                                             }
                                         } else {
                                             let _ = args.SetCancel(true);
@@ -2684,6 +2779,16 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             );
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
+
+                            // Back is possible or not any more: tell the page (#46).
+                            let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
+                                |_webview, _args| {
+                                    post_history();
+                                    Ok(())
+                                },
+                            ));
+                            let mut history_token: i64 = 0;
+                            let _ = webview.add_HistoryChanged(&history_handler, &mut history_token);
 
                             // No new windows: a link the user opened in a new
                             // window goes through the link policy.
@@ -3014,6 +3119,14 @@ unsafe extern "system" fn window_proc(
                 }
                 IDM_FILE_UNREGISTER => {
                     let _ = unregister_file_association();
+                    LRESULT(0)
+                }
+                IDM_GO_BACK => {
+                    go(true);
+                    LRESULT(0)
+                }
+                IDM_GO_FORWARD => {
+                    go(false);
                     LRESULT(0)
                 }
                 IDM_HELP_KEYS => {
