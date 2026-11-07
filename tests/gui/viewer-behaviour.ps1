@@ -1474,7 +1474,8 @@ function Press-DialogButton($d, $name) {
         $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
         $texts = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) } else { @() }
         $findText = if ($hostKind -eq 'exe') { '&Find... | Ctrl+F' } else { '&Find... | F7' }
-        $expected = '&Back | Alt+Left (greyed)', 'Forwar&d | Alt+Right (greyed)', '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
+        $reloadText = if ($hostKind -eq 'exe') { 'R&eload | F5' } else { 'R&eload | Ctrl+R' }
+        $expected = $reloadText, '&Back | Alt+Left (greyed)', 'Forwar&d | Alt+Right (greyed)', '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
         $missing = @($expected | Where-Object { $texts -notcontains $_ })
         # WebView2's own menu has these; MDView's Back has a key after it.
         $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Refresh|Save as|^Back$' })
@@ -1635,6 +1636,27 @@ function Press-DialogButton($d, $name) {
         $yAfter = if ($b2) { $b2.Current.BoundingRectangle.Y } else { $null }
         Stop-Viewer $v
         Check "${hostKind}: a changed file is reloaded, keeping the scroll position" ([bool]$after -and $bottomShown -and $null -ne $yAfter -and [Math]::Abs($yAfter - $yBefore) -le 4) "reloaded=$([bool]$after) at bottom=$bottomShown Y before=$yBefore after=$yAfter"
+    }
+
+    # A file on a network location is not checked (a check there could stall
+    # the window); Ctrl+R reloads it, in both programs (F5 is TC's in Lister).
+    $netFile = Join-Path $work 'onnet.md'
+    foreach ($hostKind in 'exe', 'plugin') {
+        if (-not $shareReachable) { Skip "${hostKind}: a file on a share is not reloaded by itself; Ctrl+R reloads it" '\\localhost\C$ is not reachable'; continue }
+        Set-Content $netFile -NoNewline -Value "# Net before`n`ntext"
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $shareWork 'onnet.md')
+        $shown = Wait-Element $v $CT::Text '^Net before$' 15
+        Set-Content $netFile -NoNewline -Value "# Net after`n`ntext"
+        Start-Sleep -Seconds 4
+        $notReloaded = [bool](Find-Element $v $CT::Text '^Net before$') -and -not (Find-Element $v $CT::Text '^Net after$')
+        $reloaded = $false
+        for ($try = 0; $try -lt 2 -and -not $reloaded; $try++) {
+            [void](Focus-Document $v); Send-CtrlKey 0x52
+            $reloaded = [bool](Wait-Element $v $CT::Text '^Net after$' 5)
+        }
+        Stop-Viewer $v
+        Check "${hostKind}: a file on a share is not reloaded by itself; Ctrl+R reloads it" ([bool]$shown -and $notReloaded -and $reloaded) "shown=$([bool]$shown) not reloaded by itself=$notReloaded Ctrl+R reloaded=$reloaded"
     }
 
     # ---- Back and forward (#46).

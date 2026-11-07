@@ -33,9 +33,14 @@ pub fn shortcuts(is_plugin: bool) -> Vec<Group> {
         window.push(("Esc", "Close Lister"));
     } else {
         window.push(("Ctrl+O", "Open a file"));
-        reading.push(("F5", "Reload the document (also automatic when the file changes)"));
         window.push(("Esc", "Close the window"));
     }
+    // In Total Commander, F5 is TC's own key; Ctrl+R works in both (#17).
+    reading.push(if is_plugin {
+        ("Ctrl+R", "Reload the document (automatic for files on this computer)")
+    } else {
+        ("F5 / Ctrl+R", "Reload the document (automatic for files on this computer)")
+    });
     window.extend([("Ctrl+,", "Settings"), ("F1", "These keyboard shortcuts"), ("Right-click", "Menu")]);
     vec![
         Group { title: "Reading", keys: reading },
@@ -130,10 +135,8 @@ pub fn menu_items(on_link: bool, has_selection: bool, can_go: CanGo, zoom: u32, 
     items.push(item(MenuCommand::ZoomOut, "Zoom o&ut\tCtrl+Minus", true));
     items.push(item(MenuCommand::ZoomReset, &format!("&Reset zoom ({zoom}%)\tCtrl+0"), zoom != 100));
     items.push(None);
-    if !is_plugin {
-        // In Total Commander, F5 is TC's own key.
-        items.push(item(MenuCommand::Reload, "R&eload\tF5", true));
-    }
+    // In Total Commander, F5 is TC's own key: Ctrl+R there.
+    items.push(item(MenuCommand::Reload, if is_plugin { "R&eload\tCtrl+R" } else { "R&eload\tF5" }, true));
     items.push(item(MenuCommand::Settings, "&Settings...\tCtrl+,", true));
     items.push(item(MenuCommand::Help, "&Keyboard shortcuts\tF1", true));
     items
@@ -201,7 +204,7 @@ mod tests {
         assert!(labels(&link).contains(&"&Find...\tF7".to_string()), "plugin: TC's search");
         assert!(labels(&plain).contains(&"&Find...\tCtrl+F".to_string()));
         assert!(labels(&plain).contains(&"R&eload\tF5".to_string()), "viewer: reload");
-        assert!(!labels(&link).iter().any(|l| l.starts_with("R&eload")), "plugin: F5 is TC's");
+        assert!(labels(&link).contains(&"R&eload\tCtrl+R".to_string()), "plugin: F5 is TC's, Ctrl+R reloads");
         for item in link.iter().flatten() {
             assert_eq!(MenuCommand::from_id(item.command as u32), Some(item.command));
         }

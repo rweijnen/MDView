@@ -1256,7 +1256,11 @@ fn create_virtual_resource_response(
             match files::read_text(file_path) {
                 Ok(markdown_content) => {
                     // This version is the one shown: watch it for changes (#17).
-                    WATCH.with(|w| *w.borrow_mut() = Some(watch::Watch::new(file_path, watch::stamp(file_path))));
+                    // Not on a network location: a check there could stall the
+                    // window; F5 / Ctrl+R reload it.
+                    let watched = (!vpath::on_network(file_path, vpath::drive_kind))
+                        .then(|| watch::Watch::new(file_path, watch::stamp(file_path)));
+                    WATCH.with(|w| *w.borrow_mut() = watched);
                     let remote_images = remote_images_for(file_path);
                     let bars = DOCUMENT_CHOICES.with(|c| {
                         let mut choices = c.borrow_mut();

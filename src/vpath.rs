@@ -335,6 +335,16 @@ pub fn location(path: &Path, document: &Path, probe: impl Fn(char) -> DriveKind)
     })
 }
 
+/// Whether a file is on a share or a network drive. Decided from the path text
+/// and `probe` alone: never touches the network.
+pub fn on_network(path: &Path, probe: impl Fn(char) -> DriveKind) -> bool {
+    match Root::of(path) {
+        Some(Root::Unc { .. }) => true,
+        Some(Root::Disk(letter)) => probe(letter) == DriveKind::Network,
+        None => false,
+    }
+}
+
 /// `\\?\...` and `\\.\...` name devices and raw paths, never a document's file.
 fn special_path(path: &str) -> bool {
     path.starts_with(r"\\?\") || path.starts_with(r"\\.\") || path.starts_with(r"\??\")
@@ -388,6 +398,15 @@ pub fn absolute_link_target(dest: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_on_network_from_the_path_text_and_drive_kind() {
+        let probe = |l: char| if l == 'Z' { DriveKind::Network } else { DriveKind::Local };
+        assert!(on_network(Path::new(r"\\server\share\a.md"), probe));
+        assert!(on_network(Path::new(r"Z:\docs\a.md"), probe));
+        assert!(!on_network(Path::new(r"C:\docs\a.md"), probe));
+        assert!(!on_network(Path::new(r"docs\a.md"), probe), "no root: not a network path");
+    }
 
     const DOC: &str = r"C:\docs\note.md";
 

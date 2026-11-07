@@ -254,7 +254,16 @@ fn create_virtual_resource_response(
             match crate::files::read_text(file_path) {
                 Ok(markdown_content) => {
                     // This version is the one shown: watch it for changes (#17).
-                    WATCH.with(|w| w.borrow_mut().insert(hwnd.0 as isize, crate::watch::Watch::new(file_path, crate::watch::stamp(file_path))));
+                    // Not on a network location: a check there could stall
+                    // Total Commander; Ctrl+R reloads it.
+                    WATCH.with(|w| {
+                        let mut all = w.borrow_mut();
+                        if crate::vpath::on_network(file_path, crate::vpath::drive_kind) {
+                            all.remove(&(hwnd.0 as isize));
+                        } else {
+                            all.insert(hwnd.0 as isize, crate::watch::Watch::new(file_path, crate::watch::stamp(file_path)));
+                        }
+                    });
                     let remote_images = remote_images_for(hwnd, file_path);
                     // The plugin never asks to register (#37): TC is the host.
                     let bars = DOCUMENT_CHOICES.with(|c| {
