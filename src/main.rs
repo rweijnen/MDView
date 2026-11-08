@@ -1,18 +1,22 @@
 #![windows_subsystem = "windows"]
 
 mod dark_menu;
+mod droptarget;
 mod clipboard;
 mod contextmenu;
 mod files;
 mod fonts;
+mod history;
 mod links;
 mod linkstatus;
 mod markdown;
+mod messages;
 mod settings;
 mod settings_page;
 mod shortcuts;
 mod terminal;
 mod vpath;
+mod watch;
 mod zone;
 
 use std::cell::RefCell;
@@ -266,6 +270,17 @@ fn send_enter_key() {
     }
 }
 
+/// An error before or while the window starts (#53): on the console when
+/// there is one, else in a message box, so it is never lost.
+fn report_startup_error(has_console: bool, text: &str) {
+    if has_console {
+        eprintln!("Error: {text}");
+        send_enter_key();
+    } else {
+        message_box(None, &messages::Message::error(text));
+    }
+}
+
 fn read_input(file_path: Option<&str>) -> io::Result<String> {
     match file_path {
         Some(path) => {
@@ -293,8 +308,7 @@ fn main() {
     let opts = match parse_args(has_console) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Error: {}", e);
-            eprintln!("Use --help for usage information.");
+            report_startup_error(has_console, &format!("{e}\n\nUse --help for usage information."));
             std::process::exit(1);
         }
     };
@@ -344,21 +358,40 @@ fn main() {
 
     if opts.gui_mode {
         // GUI mode - open window with WebView2
+        let mut gui_file = opts.file_path.clone();
         let (title, full_html) = if let Some(ref path) = opts.file_path {
             // The document is not read here: it is loaded through its virtual
             // URL and served by create_virtual_resource_response, which first
             // checks its Mark of the Web (#24).
             if !Path::new(path).exists() {
-                eprintln!("Error reading input: File not found: {path}");
+                report_startup_error(has_console, &format!("{APP_NAME} could not open this file; it was not found:\n\n{path}"));
                 std::process::exit(1);
             }
-            let full_html = String::new();
-            let title = Path::new(path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            (title, full_html)
+            if !links::is_markdown(Path::new(path)) || virtual_url_for_file(Path::new(path)).is_none() {
+                // #55 / #53: a page that says why, never an empty window.
+                // Nothing from the file is read.
+                gui_file = None;
+                let (heading, reason) = if links::is_markdown(Path::new(path)) {
+                    ("MDView cannot show this file", markdown::NO_ADDRESS)
+                } else {
+                    ("Not a Markdown file", markdown::NOT_MARKDOWN)
+                };
+                let notice = markdown::wrap_html(
+                    &markdown::notice_html(heading, path, reason),
+                    is_windows_dark_mode(),
+                    markdown::RemoteImages::Blocked,
+                    &[],
+                    &page_look(),
+                );
+                (APP_NAME.to_string(), notice)
+            } else {
+                let title = Path::new(path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                (title, String::new())
+            }
         } else {
             // No file - show welcome screen
             let dark_mode = is_windows_dark_mode();
@@ -383,8 +416,8 @@ fn main() {
             (APP_NAME.to_string(), welcome_html)
         };
 
-        if let Err(e) = run_gui(&title, &full_html, opts.file_path.as_deref()) {
-            eprintln!("Error: {}", e);
+        if let Err(e) = run_gui(&title, &full_html, gui_file.as_deref()) {
+            report_startup_error(has_console, &format!("{APP_NAME} could not start its window:\n\n{}", e.message()));
             std::process::exit(1);
         }
     } else {
@@ -449,7 +482,7 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    DragFinish, DragQueryFileW, FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog, HDROP,
+    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FileOpenDialog,
     IFileOpenDialog, SHCNE_ASSOCCHANGED, SHCNF_IDLIST,
     SHChangeNotify, SHCreateMemStream, SIGDN_FILESYSPATH, ShellExecuteW,
 };
@@ -467,6 +500,8 @@ const IDM_FILE_OPEN: u32 = 1001;
 const IDM_FILE_EXIT: u32 = 1002;
 const IDM_HELP_ABOUT: u32 = 2001;
 const IDM_HELP_KEYS: u32 = 2002;
+const IDM_GO_BACK: u32 = 3001;
+const IDM_GO_FORWARD: u32 = 3002;
 const IDM_EDIT_FIND: u32 = 1201;
 const IDM_FILE_REGISTER: u32 = 1010;
 const IDM_FILE_UNREGISTER: u32 = 1011;
@@ -674,6 +709,15 @@ fn create_menu() -> windows::core::Result<HMENU> {
             PCWSTR(edit_text.as_ptr()),
         )?;
 
+        // Go menu (#46): back and forward between documents and headings.
+        let go_menu = CreatePopupMenu()?;
+        let back_text: Vec<u16> = "&Back\tAlt+Left\0".encode_utf16().collect();
+        AppendMenuW(go_menu, MF_STRING, IDM_GO_BACK as usize, PCWSTR(back_text.as_ptr()))?;
+        let forward_text: Vec<u16> = "&Forward\tAlt+Right\0".encode_utf16().collect();
+        AppendMenuW(go_menu, MF_STRING, IDM_GO_FORWARD as usize, PCWSTR(forward_text.as_ptr()))?;
+        let go_text: Vec<u16> = "&Go\0".encode_utf16().collect();
+        AppendMenuW(menu_bar, MF_POPUP, go_menu.0 as usize, PCWSTR(go_text.as_ptr()))?;
+
         let help_text: Vec<u16> = "&Help\0".encode_utf16().collect();
         AppendMenuW(
             menu_bar,
@@ -706,6 +750,16 @@ fn create_accelerators() -> windows::core::Result<HACCEL> {
                 fVirt: FVIRTKEY,
                 key: windows::Win32::UI::Input::KeyboardAndMouse::VK_F1.0,
                 cmd: IDM_HELP_KEYS as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FALT,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_LEFT.0,
+                cmd: IDM_GO_BACK as u16,
+            },
+            ACCEL {
+                fVirt: FVIRTKEY | FALT,
+                key: windows::Win32::UI::Input::KeyboardAndMouse::VK_RIGHT.0,
+                cmd: IDM_GO_FORWARD as u16,
             },
             ACCEL {
                 fVirt: FVIRTKEY | FCONTROL,
@@ -892,6 +946,60 @@ fn add_to_recent_files(file_path: &str) {
 }
 
 /// Update the recent files submenu
+/// Longest path shown in File > Recent Files before it is shortened.
+const RECENT_PATH_CHARS: usize = 60;
+
+/// A recent file's menu text (#44): its access key and its path, shortened in
+/// the middle (drive, first folder and file name stay), with `&` doubled so
+/// it is shown, not used as an access key. The full path is the tooltip.
+fn recent_menu_text(index: usize, path: &str) -> String {
+    let key = if index < 9 { format!("&{}", index + 1) } else { "1&0".to_string() };
+    format!("{key} {}", shorten_path(path, RECENT_PATH_CHARS).replace('&', "&&"))
+}
+
+/// `C:\Work\...\docs\README.md`: keeps the root and first folder and as
+/// many of the last parts as fit, always the file name.
+fn shorten_path(path: &str, max: usize) -> String {
+    if path.chars().count() <= max {
+        return path.to_string();
+    }
+    let parts: Vec<&str> = path.split('\\').collect();
+    if parts.len() <= 3 {
+        return path.to_string();
+    }
+    // A UNC path starts with two empty parts: keep \\server\share.
+    let head_len = if path.starts_with("\\\\") { 4.min(parts.len() - 1) } else { 2 };
+    let head = parts[..head_len].join("\\");
+    let mut tail: Vec<&str> = vec![parts[parts.len() - 1]];
+    for part in parts[head_len..parts.len() - 1].iter().rev() {
+        let candidate = format!("{head}\\...\\{part}\\{}", tail.join("\\"));
+        if candidate.chars().count() > max {
+            break;
+        }
+        tail.insert(0, part);
+    }
+    if tail.len() == parts.len() - head_len {
+        return path.to_string();
+    }
+    format!("{head}\\...\\{}", tail.join("\\"))
+}
+/// The highlighted recent file's full path, next to its menu item.
+fn show_recent_file_tooltip(hwnd: HWND, menu: HMENU, item: u32) {
+    let index = (item - IDM_FILE_RECENT_BASE) as usize;
+    let Some(path) = RECENT_FILES.with(|f| f.borrow().get(index).cloned()) else { return };
+    unsafe {
+        let count = GetMenuItemCount(Some(menu));
+        for position in 0..count.max(0) {
+            if GetMenuItemID(menu, position) == item {
+                let mut rect = RECT::default();
+                if GetMenuItemRect(Some(hwnd), menu, position as u32, &mut rect).is_ok() {
+                    linkstatus::show_at(hwnd, &path, is_windows_dark_mode(), POINT { x: rect.right + 8, y: rect.top });
+                }
+                return;
+            }
+        }
+    }
+}
 fn update_recent_files_menu() {
     unsafe {
         MENU_HANDLE.with(|menu| {
@@ -918,11 +1026,7 @@ fn update_recent_files_menu() {
                     } else {
                         // Add recent files (native menu items)
                         for (i, path) in files.iter().enumerate() {
-                            let filename = Path::new(path)
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.clone());
-                            let text = format!("&{} {}", i + 1, filename);
+                            let text = recent_menu_text(i, path);
                             let _ = insert_menu_item(
                                 file_menu,
                                 2 + i as u32,
@@ -1014,77 +1118,73 @@ fn save_window_position(hwnd: HWND) {
     }
 }
 
-/// Restore window position from registry
-fn restore_window_position(hwnd: HWND) -> bool {
-    unsafe {
-        let mut hkey = std::mem::zeroed();
-        let subkey: Vec<u16> = format!("{}\0", REGISTRY_KEY).encode_utf16().collect();
+/// The saved window position and whether it was maximised; `None` without
+/// a usable saved position.
+fn saved_placement() -> Option<(RECT, bool)> {
+    let read = |name| settings::read_dword(name).map(|v| v as i32);
+    let (l, t, r, b, cmd) = (read("Left")?, read("Top")?, read("Right")?, read("Bottom")?, read("ShowCmd")?);
+    // At least 100x100, as the window can never be smaller.
+    (r > l && b > t && (r - l) >= 100 && (b - t) >= 100)
+        .then(|| (RECT { left: l, top: t, right: r, bottom: b }, show_cmd_to_restore(cmd) == SW_SHOWMAXIMIZED.0 as u32))
+}
 
-        if RegOpenKeyExW(
-            HKEY_CURRENT_USER,
-            PCWSTR(subkey.as_ptr()),
-            Some(0),
-            KEY_READ,
-            &mut hkey,
-        )
-        .is_err()
-        {
-            return false;
-        }
-
-        let read_dword = |name: &str| -> Option<i32> {
-            let name_wide: Vec<u16> = format!("{}\0", name).encode_utf16().collect();
-            let mut value: u32 = 0;
-            let mut size: u32 = 4;
-            let mut data_type = REG_VALUE_TYPE::default();
-            if RegQueryValueExW(
-                hkey,
-                PCWSTR(name_wide.as_ptr()),
-                None,
-                Some(&mut data_type),
-                Some(&mut value as *mut u32 as *mut u8),
-                Some(&mut size),
-            )
-            .is_ok()
-            {
-                Some(value as i32)
-            } else {
-                None
-            }
-        };
-
-        let left = read_dword("Left");
-        let top = read_dword("Top");
-        let right = read_dword("Right");
-        let bottom = read_dword("Bottom");
-        let show_cmd = read_dword("ShowCmd");
-
-        let _ = RegCloseKey(hkey);
-
-        if let (Some(l), Some(t), Some(r), Some(b), Some(cmd)) =
-            (left, top, right, bottom, show_cmd)
-        {
-            // Validate window is at least partially visible
-            if r > l && b > t && (r - l) >= 100 && (b - t) >= 100 {
-                let placement = WINDOWPLACEMENT {
-                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                    showCmd: show_cmd_to_restore(cmd),
-                    rcNormalPosition: RECT {
-                        left: l,
-                        top: t,
-                        right: r,
-                        bottom: b,
-                    },
-                    ..Default::default()
-                };
-                let _ = SetWindowPlacement(hwnd, &placement);
-                return true;
-            }
-        }
-        false
+/// How the window is shown first (#58): a shortcut or program that asks for
+/// maximised or minimised (`STARTUPINFO.wShowWindow`) wins; otherwise the
+/// saved state (maximised or normal).
+fn startup_show_cmd(requested: Option<u16>, saved_maximized: bool) -> SHOW_WINDOW_CMD {
+    match requested.map(|r| SHOW_WINDOW_CMD(r as i32)) {
+        Some(SW_SHOWMAXIMIZED) => SW_SHOWMAXIMIZED,
+        Some(SW_SHOWMINIMIZED) | Some(SW_MINIMIZE) | Some(SW_SHOWMINNOACTIVE) => SW_SHOWMINIMIZED,
+        _ if saved_maximized => SW_SHOWMAXIMIZED,
+        _ => SW_SHOWNORMAL,
     }
 }
 
+/// What the program was started with (a shortcut's "Run" setting).
+fn requested_show_cmd() -> Option<u16> {
+    use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
+    let mut info = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    unsafe { GetStartupInfoW(&mut info) };
+    ((info.dwFlags & STARTF_USESHOWWINDOW).0 != 0).then_some(info.wShowWindow)
+}
+
+/// Without a saved position: 70% x 75% of the work area of the monitor the
+/// mouse is on, centred.
+fn default_window_rect() -> RECT {
+    unsafe {
+        let mut cursor = POINT::default();
+        let _ = GetCursorPos(&mut cursor);
+        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let work = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            info.rcWork
+        } else {
+            RECT { left: 0, top: 0, right: GetSystemMetrics(SM_CXSCREEN), bottom: GetSystemMetrics(SM_CYSCREEN) }
+        };
+        let (w, h) = ((work.right - work.left) * 70 / 100, (work.bottom - work.top) * 75 / 100);
+        let x = work.left + (work.right - work.left - w) / 2;
+        let y = work.top + (work.bottom - work.top - h) / 2;
+        RECT { left: x, top: y, right: x + w, bottom: y + h }
+    }
+}
+
+/// Put the hidden window where it opens and show it once (#58).
+fn place_and_show(hwnd: HWND) {
+    let (rect, saved_maximized) = saved_placement().unwrap_or_else(|| (default_window_rect(), false));
+    let show = startup_show_cmd(requested_show_cmd(), saved_maximized);
+    unsafe {
+        let placement = WINDOWPLACEMENT {
+            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+            // Only the position; the window stays hidden until ShowWindow.
+            showCmd: SW_HIDE.0 as u32,
+            rcNormalPosition: rect,
+            ..Default::default()
+        };
+        let _ = SetWindowPlacement(hwnd, &placement);
+        let _ = ShowWindow(hwnd, show);
+        let _ = UpdateWindow(hwnd);
+    }
+}
 /// The URL a document is shown at (see `vpath`).
 fn virtual_url_for_file(path: &Path) -> Option<String> {
     vpath::document_url(path)
@@ -1155,6 +1255,12 @@ fn create_virtual_resource_response(
         } else {
             match files::read_text(file_path) {
                 Ok(markdown_content) => {
+                    // This version is the one shown: watch it for changes (#17).
+                    // Not on a network location: a check there could stall the
+                    // window; F5 / Ctrl+R reload it.
+                    let watched = (!vpath::on_network(file_path, vpath::drive_kind))
+                        .then(|| watch::Watch::new(file_path, watch::stamp(file_path)));
+                    WATCH.with(|w| *w.borrow_mut() = watched);
                     let remote_images = remote_images_for(file_path);
                     let bars = DOCUMENT_CHOICES.with(|c| {
                         let mut choices = c.borrow_mut();
@@ -1359,15 +1465,14 @@ fn post_network_blocked() {
 }
 
 /// Send a message to the page (`PostWebMessageAsJson`).
-fn post_to_page(json: &str) {
+/// Returns whether it could be sent.
+fn post_to_page(json: &str) -> bool {
     CONTROLLER.with(|c| {
-        if let Some(controller) = c.borrow().as_ref() {
-            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
-                let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) };
-            }
-        }
-    });
+        let Some(controller) = c.borrow().clone() else { return false };
+        let Ok(webview) = (unsafe { controller.CoreWebView2() }) else { return false };
+        let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) }.is_ok()
+    })
 }
 
 /// File > Settings... or Ctrl+, (#50): the page shows the settings panel.
@@ -1404,7 +1509,7 @@ fn print_page(hwnd: HWND) {
         unsafe { webview16.ShowPrintUI(COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER) }.map_err(|e| e.message().to_string())
     });
     if let Err(e) = result {
-        show_message(Some(hwnd), &format!("Could not open the print dialog:\n\n{e}"), MB_OK | MB_ICONERROR);
+        tell_error(hwnd, format!("Could not open the print dialog:\n\n{e}"));
     }
 }
 
@@ -1412,7 +1517,17 @@ fn print_page(hwnd: HWND) {
 /// reported the click.
 fn show_context_menu(hwnd: HWND) {
     let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().take()) else { return };
-    let items = shortcuts::menu_items(request.link.is_some(), request.has_selection, settings::zoom(), false);
+    let can_go = CONTROLLER.with(|c| {
+        let controller = c.borrow().clone()?;
+        let webview = unsafe { controller.CoreWebView2() }.ok()?;
+        let (mut back, mut forward) = (windows::core::BOOL(0), windows::core::BOOL(0));
+        unsafe {
+            let _ = webview.CanGoBack(&mut back);
+            let _ = webview.CanGoForward(&mut forward);
+        }
+        Some(shortcuts::CanGo { back: back.as_bool(), forward: forward.as_bool() })
+    });
+    let items = shortcuts::menu_items(request.link.is_some(), request.has_selection, can_go.unwrap_or_default(), settings::zoom(), false);
     if let Some(command) = contextmenu::show(hwnd, request.screen, &items) {
         run_menu_command(hwnd, command, request.link.as_deref());
     }
@@ -1423,14 +1538,14 @@ fn run_menu_command(hwnd: HWND, command: shortcuts::MenuCommand, link: Option<&s
     match command {
         OpenLink => {
             if let Some(url) = link {
-                queue_link(url.to_string());
+                queue_link(url.to_string(), false);
             }
         }
         CopyLink => {
             let Some(url) = link else { return };
             let action = links::classify_url(url, |u| resolve_virtual_mdview_url(u).map(std::path::PathBuf::from), network_location);
             if let Err(e) = clipboard::set_text(hwnd, &linkstatus::describe_url(url, "", &action)) {
-                show_message(Some(hwnd), &format!("Could not copy the link address:\n\n{e}"), MB_OK | MB_ICONERROR);
+                tell_error(hwnd, format!("Could not copy the link address:\n\n{e}"));
             }
         }
         Copy => run_script("document.execCommand('copy')"),
@@ -1440,6 +1555,9 @@ fn run_menu_command(hwnd: HWND, command: shortcuts::MenuCommand, link: Option<&s
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Back => go(true),
+        Forward => go(false),
+        Reload => reload_page(),
         Settings => open_settings(),
         Help => open_help(),
     }
@@ -1459,7 +1577,12 @@ fn save_settings(msg: &std::collections::HashMap<String, String>) {
                 reload_page();
             }
         }
-        Err(text) => post_to_page(&settings_page::error_message(&text)),
+        Err(text) => {
+            // The settings panel shows it; without a page, a message box.
+            if !post_to_page(&settings_page::error_message(&text)) {
+                message_box(None, &messages::Message::error(text));
+            }
+        }
     }
 }
 
@@ -1483,11 +1606,7 @@ fn handle_zoom(hwnd: HWND, direction: &str) {
         }
     });
     if let Some(e) = save_error {
-        show_message(
-            Some(hwnd),
-            &format!("Could not save the zoom level:\n\n{e}\n\nThe zoom applies until MDView is closed."),
-            MB_OK | MB_ICONERROR,
-        );
+        tell_error(hwnd, format!("Could not save the zoom level:\n\n{e}\n\nThe zoom applies until MDView is closed."));
     }
 }
 
@@ -1496,7 +1615,7 @@ fn handle_network_files_choice(hwnd: HWND, choice: &str, document: &Path) {
     let save = |setting| match settings::set_network_files_setting(setting) {
         Ok(()) => true,
         Err(e) => {
-            show_message(Some(hwnd), &format!("Could not save the network files setting:\n\n{e}"), MB_OK | MB_ICONERROR);
+            tell_error(hwnd, format!("Could not save the network files setting:\n\n{e}"));
             false
         }
     };
@@ -1537,6 +1656,70 @@ fn navigation_allowed(url: &str) -> bool {
     false
 }
 
+/// What kind of navigation WebView2 starts (new document, back/forward, reload).
+fn navigation_kind(args: &ICoreWebView2NavigationStartingEventArgs) -> history::Kind {
+    let Ok(args3) = args.cast::<ICoreWebView2NavigationStartingEventArgs3>() else { return history::Kind::New };
+    let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
+    if unsafe { args3.NavigationKind(&mut kind) }.is_err() {
+        return history::Kind::New;
+    }
+    match kind {
+        COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD => history::Kind::BackOrForward,
+        COREWEBVIEW2_NAVIGATION_KIND_RELOAD => history::Kind::Reload,
+        _ => history::Kind::New,
+    }
+}
+
+/// A document navigation starts (#46): MDView's history gives its real path,
+/// which becomes the current document before WebView2 asks for the page (a
+/// document URL doesn't name the drive or share), and the window title.
+fn document_navigation(kind: history::Kind, uri: &str) {
+    let path = HISTORY.with(|h| {
+        h.borrow_mut().navigate(kind, uri, |u| resolve_virtual_mdview_url(u).map(std::path::PathBuf::from))
+    });
+    let Some(path) = path else { return };
+    let path = path.to_string_lossy().into_owned();
+    CURRENT_FILE.with(|f| *f.borrow_mut() = Some(path.clone()));
+    if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+        set_window_title(hwnd, &path);
+    }
+}
+
+/// Tell the page whether it can go back, and to which document (#46).
+fn post_history() {
+    let can_go_back = CONTROLLER.with(|c| {
+        let controller = c.borrow().clone()?;
+        let webview = unsafe { controller.CoreWebView2() }.ok()?;
+        let mut can = windows::core::BOOL(0);
+        unsafe { webview.CanGoBack(&mut can) }.ok()?;
+        Some(can.as_bool())
+    });
+    let previous = HISTORY.with(|h| h.borrow().previous_name());
+    post_to_page(&history::history_message(can_go_back.unwrap_or(false), previous.as_deref()));
+}
+
+/// Back or forward in WebView2's history (Go menu, right-click menu).
+fn go(back: bool) {
+    CONTROLLER.with(|c| {
+        if let Some(controller) = c.borrow().as_ref() {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { if back { webview.GoBack() } else { webview.GoForward() } };
+            }
+        }
+    });
+}
+
+fn set_window_title(hwnd: HWND, file_path: &str) {
+    let filename = Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| file_path.to_string());
+    let title: Vec<u16> = format!("{filename} - {APP_NAME}\0").encode_utf16().collect();
+    unsafe {
+        let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
+    }
+}
+
 /// Whether a message comes from a page MDView itself loaded.
 fn is_trusted_page(source: &str) -> bool {
     if crate::vpath::is_document_origin(source) {
@@ -1548,21 +1731,27 @@ fn is_trusted_page(source: &str) -> bool {
 
 /// Handle a link outside of the WebView2 event that reported it, so the
 /// confirmation dialog is not shown from inside a WebView2 callback.
-fn queue_link(url: String) {
-    PENDING_LINKS.with(|q| q.borrow_mut().push_back(url));
+/// `ctrl`: the user Ctrl+clicked (a program link may then be run after a
+/// warning).
+fn queue_link(url: String, ctrl: bool) {
+    PENDING_LINKS.with(|q| q.borrow_mut().push_back((url, ctrl)));
     if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
         let _ = unsafe { PostMessageW(Some(hwnd), WM_MDVIEW_LINK, WPARAM(0), LPARAM(0)) };
     }
 }
 
 fn handle_queued_links(hwnd: HWND) {
-    while let Some(url) = PENDING_LINKS.with(|q| q.borrow_mut().pop_front()) {
+    while let Some((url, ctrl)) = PENDING_LINKS.with(|q| q.borrow_mut().pop_front()) {
         let action = links::classify_url(&url, |u| {
             resolve_virtual_mdview_url(u).map(std::path::PathBuf::from)
         }, network_location);
-        links::perform(action, hwnd, |path| {
-            load_file_into_webview(hwnd, &path.to_string_lossy())
-        });
+        links::perform(
+            action,
+            ctrl,
+            hwnd,
+            |path| load_file_into_webview(hwnd, &path.to_string_lossy()),
+            |message, action| tell(hwnd, message, action),
+        );
     }
 }
 
@@ -1572,14 +1761,18 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
         Some("close") => {
             let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
         }
+        // A link the user clicked that isn't a Markdown document (S5): the
+        // link policy decides; `ctrl` for Ctrl+click.
         Some("openLink") => {
             if let Some(url) = msg.get("url") {
-                queue_link(url.clone());
+                queue_link(url.clone(), msg.get("ctrl").map(String::as_str) == Some("true"));
             }
         }
         Some("networkStatus") => post_network_blocked(),
+        Some("messageShown") | Some("messageChoice") => handle_message_reply(hwnd, msg),
         Some("openSettings") => open_settings(),
         Some("openHelp") => open_help(),
+        Some("historyStatus") => post_history(),
         Some("panel") => PANEL_OPEN.with(|p| p.set(msg.get("open").map(String::as_str) == Some("true"))),
         // N / P / 1-9 are for Total Commander's Lister; nothing to do here.
         Some("listerKey") => {}
@@ -1653,7 +1846,7 @@ fn handle_download_gate_choice(hwnd: HWND, choice: &str, document: &Path) {
     };
     match result {
         Ok(()) => reload_page(),
-        Err(message) => show_message(Some(hwnd), &message, MB_OK | MB_ICONERROR),
+        Err(message) => tell_error(hwnd, message),
     }
 }
 
@@ -1690,13 +1883,7 @@ fn save_remote_images_setting(hwnd: HWND, setting: settings::AskSetting) -> bool
     match settings::set_remote_images_setting(setting) {
         Ok(()) => true,
         Err(e) => {
-            let text: Vec<u16> = format!("Could not save the remote images setting:\n\n{e}\0")
-                .encode_utf16()
-                .collect();
-            let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
-            unsafe {
-                MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-            }
+            tell_error(hwnd, format!("Could not save the remote images setting:\n\n{e}"));
             false
         }
     }
@@ -1705,22 +1892,19 @@ fn save_remote_images_setting(hwnd: HWND, setting: settings::AskSetting) -> bool
 /// Load a file into the WebView
 fn load_file_into_webview(hwnd: HWND, file_path: &str) {
     if fs::metadata(file_path).is_err() {
-        let msg: Vec<u16> = format!("Failed to read file:\n{}\0", file_path)
-            .encode_utf16()
-            .collect();
-        let title: Vec<u16> = "Error\0".encode_utf16().collect();
-        unsafe {
-            MessageBoxW(
-                Some(hwnd),
-                PCWSTR(msg.as_ptr()),
-                PCWSTR(title.as_ptr()),
-                MB_OK | MB_ICONERROR,
-            );
-        }
+        tell_error(hwnd, format!("This file was not found:\n\n{file_path}"));
         return;
     }
 
-    if let Some(url) = virtual_url_for_file(Path::new(file_path)) {
+    if !links::is_markdown(Path::new(file_path)) {
+        tell(hwnd, messages::Message::warning(format!("{}\n\n{file_path}", markdown::NOT_MARKDOWN)), None);
+        return;
+    }
+    let Some(url) = virtual_url_for_file(Path::new(file_path)) else {
+        tell_error(hwnd, format!("{}\n\n{file_path}", markdown::NO_ADDRESS));
+        return;
+    };
+    {
         CONTROLLER.with(|c| {
             if let Some(controller) = c.borrow().as_ref() {
                 unsafe {
@@ -1733,54 +1917,13 @@ fn load_file_into_webview(hwnd: HWND, file_path: &str) {
         });
     }
 
-    // Update window title
-    let filename = Path::new(file_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| file_path.to_string());
-    let title: Vec<u16> = format!("{filename} - {APP_NAME}\0").encode_utf16().collect();
-    unsafe {
-        let _ = SetWindowTextW(hwnd, PCWSTR(title.as_ptr()));
-    }
+    set_window_title(hwnd, file_path);
 
     // Store current file and add to recent
     CURRENT_FILE.with(|f| {
         *f.borrow_mut() = Some(file_path.to_string());
     });
     add_to_recent_files(file_path);
-}
-
-/// Handle dropped files
-fn handle_drop_files(hwnd: HWND, hdrop: HDROP) {
-    unsafe {
-        // Get the first dropped file
-        let mut buffer = [0u16; 260];
-        let len = DragQueryFileW(hdrop, 0, Some(&mut buffer));
-        DragFinish(hdrop);
-
-        if len > 0 {
-            let path = String::from_utf16_lossy(&buffer[..len as usize]);
-            // Check if it's a markdown file
-            let ext = Path::new(&path)
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            if ext == "md" || ext == "markdown" {
-                load_file_into_webview(hwnd, &path);
-            } else {
-                let msg: Vec<u16> = "Only Markdown files (.md, .markdown) are supported.\0"
-                    .encode_utf16()
-                    .collect();
-                let title: Vec<u16> = "Unsupported File\0".encode_utf16().collect();
-                MessageBoxW(
-                    Some(hwnd),
-                    PCWSTR(msg.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    MB_OK | MB_ICONWARNING,
-                );
-            }
-        }
-    }
 }
 
 // ============================================================================
@@ -2075,11 +2218,7 @@ fn handle_register_choice(hwnd: HWND, choice: &str) {
         "notNow" => REGISTER_BAR_DISMISSED.with(|d| d.set(true)),
         "never" => {
             if let Err(e) = settings::set_dont_ask_register(true) {
-                show_message(
-                    Some(hwnd),
-                    &format!("Could not save \"Don't ask again\":\n\n{e}"),
-                    MB_OK | MB_ICONERROR,
-                );
+                tell_error(hwnd, format!("Could not save \"Don't ask again\":\n\n{e}"));
             }
         }
         _ => {}
@@ -2112,12 +2251,16 @@ fn open_association_settings(owner: Option<HWND>) {
         );
         // ShellExecute returns a value greater than 32 on success.
         if result.0 as usize <= 32 {
-            show_message(
+            tell_or_box(
                 owner,
-                "MDView is registered, but Windows Settings could not be opened.\n\n\
-                 To use MDView for .md files, open Settings > Apps > Default apps, \
-                 search for MDView and choose it for .md and .markdown.",
-                MB_OK | MB_ICONINFORMATION,
+                messages::Message {
+                    tone: messages::Tone::Info,
+                    ..messages::Message::warning(
+                        "MDView is registered, but Windows Settings could not be opened.\n\n\
+                         To use MDView for .md files, open Settings > Apps > Default apps, \
+                         search for MDView and choose it for .md and .markdown.",
+                    )
+                },
             );
         }
     }
@@ -2127,33 +2270,108 @@ fn open_association_settings(owner: Option<HWND>) {
 fn register_and_open_settings(owner: Option<HWND>) {
     match register_file_association() {
         Ok(()) => open_association_settings(owner),
-        Err(e) => show_message(
-            owner,
-            &format!("Could not register {APP_NAME} as a viewer for .md files:\n\n{e}"),
-            MB_OK | MB_ICONERROR,
-        ),
+        Err(e) => tell_or_box(owner, messages::Message::error(format!("Could not register {APP_NAME} as a viewer for .md files:\n\n{e}"))),
     }
 }
 
-fn show_message(owner: Option<HWND>, text: &str, style: MESSAGEBOX_STYLE) {
-    let text: Vec<u16> = format!("{text}\0").encode_utf16().collect();
-    let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
-    unsafe {
-        MessageBoxW(owner, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style);
+/// Timer ids for messages waiting for the page's confirmation (base + id).
+const MESSAGE_TIMER: usize = 0x4D50_0000;
+/// How long the page may take to confirm a message before it is shown in a
+/// message box instead.
+const MESSAGE_CONFIRM_MS: u32 = 1500;
+
+/// Show a message or ask a question in the page (1.0.0). If the page can't
+/// show it (none yet, or it is reloading), a message box shows it instead,
+/// so it is never lost. `action` runs when the user answers "yes".
+fn tell(hwnd: HWND, message: messages::Message, action: Option<links::Confirmed>) {
+    let id = MESSAGES.with(|m| m.borrow_mut().add(message.clone(), action));
+    if post_to_page(&messages::show_json(id, &message, is_windows_dark_mode())) {
+        unsafe { SetTimer(Some(hwnd), MESSAGE_TIMER + id as usize, MESSAGE_CONFIRM_MS, Some(message_not_confirmed)) };
+    } else {
+        fall_back_to_message_box(hwnd, id);
     }
 }
+
+/// In the page when there is a window; a message box without one (the
+/// --register command line).
+fn tell_or_box(owner: Option<HWND>, message: messages::Message) {
+    match owner {
+        Some(hwnd) => tell(hwnd, message, None),
+        None => {
+            message_box(None, &message);
+        }
+    }
+}
+
+fn tell_error(hwnd: HWND, text: impl Into<String>) {
+    tell(hwnd, messages::Message::error(text), None);
+}
+
+unsafe extern "system" fn message_not_confirmed(hwnd: HWND, _msg: u32, event: usize, _time: u32) {
+    let _ = unsafe { KillTimer(Some(hwnd), event) };
+    fall_back_to_message_box(hwnd, event.wrapping_sub(MESSAGE_TIMER) as u64);
+}
+
+fn fall_back_to_message_box(hwnd: HWND, id: u64) {
+    let Some(item) = MESSAGES.with(|m| m.borrow_mut().not_shown(id)) else { return };
+    if message_box(Some(hwnd), &item.message) {
+        if let Some(action) = item.action {
+            run_confirmed(hwnd, action);
+        }
+    }
+}
+
+/// A message as a Windows message box; returns whether the answer was "yes".
+fn message_box(owner: Option<HWND>, message: &messages::Message) -> bool {
+    let icon = match message.tone {
+        messages::Tone::Info => MB_ICONINFORMATION,
+        messages::Tone::Warning => MB_ICONWARNING,
+        messages::Tone::Error => MB_ICONERROR,
+    };
+    let style = if message.is_question() { MB_YESNO | MB_DEFBUTTON2 | icon } else { MB_OK | icon };
+    let text: Vec<u16> = format!("{}\0", message.text).encode_utf16().collect();
+    let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
+    unsafe { MessageBoxW(owner, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) == IDYES }
+}
+
+/// The user said yes to a question about a link.
+fn run_confirmed(hwnd: HWND, action: links::Confirmed) {
+    links::run_confirmed(
+        action,
+        hwnd,
+        |path| load_file_into_webview(hwnd, &path.to_string_lossy()),
+        |message, action| tell(hwnd, message, action),
+    );
+}
+
+/// The page confirmed or answered a message (`messageShown`, `messageChoice`).
+fn handle_message_reply(hwnd: HWND, msg: &std::collections::HashMap<String, String>) {
+    let Some(id) = msg.get("id").and_then(|i| messages::parse_id(i)) else { return };
+    match msg.get("type").map(String::as_str) {
+        Some("messageShown") => {
+            MESSAGES.with(|m| m.borrow_mut().shown(id));
+            let _ = unsafe { KillTimer(Some(hwnd), MESSAGE_TIMER + id as usize) };
+        }
+        Some("messageChoice") => {
+            let choice = msg.get("choice").map(String::as_str).unwrap_or_default();
+            if let Some(action) = MESSAGES.with(|m| m.borrow_mut().answer(id, choice)) {
+                run_confirmed(hwnd, action);
+            }
+        }
+        _ => {}
+    }
+}
+
 
 fn run_gui(title: &str, html: &str, file_path: Option<&str>) -> windows::core::Result<()> {
     unsafe {
-        // Initialize COM for this thread (required for WebView2)
-        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        if hr.is_err() {
-            return Err(windows::core::Error::from(hr));
-        }
+        // OLE (COM in a single-threaded apartment, plus drag and drop, #54):
+        // needed by WebView2 and by the drop target.
+        windows::Win32::System::Ole::OleInitialize(None)?;
 
         let result = run_gui_inner(title, html, file_path);
 
-        CoUninitialize();
+        windows::Win32::System::Ole::OleUninitialize();
         result
     }
 }
@@ -2218,10 +2436,11 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             .collect();
 
         let hwnd = CreateWindowExW(
-            WS_EX_ACCEPTFILES, // Enable drag & drop
+            WINDOW_EX_STYLE::default(), // drops: OLE drop target (droptarget.rs, #54)
             PCWSTR(class_name_wide.as_ptr()),
             PCWSTR(title_wide.as_ptr()),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            // Hidden until it is in place (#58).
+            WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             1024,
@@ -2241,6 +2460,17 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         MAIN_HWND.with(|h| {
             *h.borrow_mut() = Some(hwnd);
         });
+
+        // Check the shown document for changes (#17).
+        SetTimer(Some(hwnd), WATCH_TIMER, watch::INTERVAL_MS, None);
+
+        // Dropping a Markdown file on the window (#54).
+        if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
+            message_box(
+                Some(hwnd),
+                &messages::Message::warning(format!("Dropping files on this window will not work:\n\n{e}")),
+            );
+        }
 
         // Store current file path
         if let Some(path) = file_path {
@@ -2280,26 +2510,12 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
             std::mem::size_of::<i32>() as u32,
         );
 
+        // #58: shown once, already in its place, before WebView2 starts.
+        place_and_show(hwnd);
+
         // Initialize WebView2
         init_webview2_gui(hwnd, html)?;
 
-        // Restore window position (if saved), otherwise center on screen
-        let position_restored = restore_window_position(hwnd);
-
-        if !position_restored {
-            // Center window on primary monitor - use 70% of screen size
-            let screen_width = GetSystemMetrics(SM_CXSCREEN);
-            let screen_height = GetSystemMetrics(SM_CYSCREEN);
-            let window_width = (screen_width * 70) / 100;
-            let window_height = (screen_height * 75) / 100;
-            let x = (screen_width - window_width) / 2;
-            let y = (screen_height - window_height) / 2;
-            let _ = SetWindowPos(hwnd, None, x, y, window_width, window_height, SWP_NOZORDER);
-        }
-
-        // Show window
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = UpdateWindow(hwnd);
         // Activation inside ShowWindow focuses this window before WebView2 can
         // take focus; hand it to the document now that the window is shown.
         focus_webview();
@@ -2330,7 +2546,9 @@ thread_local! {
     static MAIN_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
     static ENVIRONMENT: RefCell<Option<ICoreWebView2Environment>> = const { RefCell::new(None) };
     /// Links waiting to be handled outside the WebView2 event that reported them.
-    static PENDING_LINKS: RefCell<std::collections::VecDeque<String>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    static PENDING_LINKS: RefCell<std::collections::VecDeque<(String, bool)>> = const { RefCell::new(std::collections::VecDeque::new()) };
+    /// Messages and questions shown in the page, not answered yet (1.0.0).
+    static MESSAGES: RefCell<messages::Pending<links::Confirmed>> = RefCell::new(messages::Pending::default());
     /// Set just before MDView calls NavigateToString, so only that navigation
     /// to a data:/about:blank page is allowed.
     static EXPECT_STRING_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2346,6 +2564,10 @@ thread_local! {
     static DOCUMENT_CHOICES: RefCell<markdown::DocumentChoices> = RefCell::new(markdown::DocumentChoices::default());
     /// A settings or help panel is open on the page: no right-click menu (#59).
     static PANEL_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The shown document's file, watched for changes (#17).
+    static WATCH: RefCell<Option<watch::Watch>> = const { RefCell::new(None) };
+    /// The documents shown, with their real paths, for back and forward (#46).
+    static HISTORY: RefCell<history::History> = RefCell::new(history::History::default());
     /// The right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<Option<contextmenu::Request>> = const { RefCell::new(None) };
 }
@@ -2356,6 +2578,10 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
+/// A Markdown file was dropped on the window (#54): open it.
+const WM_MDVIEW_DROP: u32 = WM_APP + 4;
+/// Timer that checks the shown document's file for changes (#17).
+const WATCH_TIMER: usize = 0x4D57;
 
 /// Edit > Find: open WebView2's built-in find bar.
 fn open_find(hwnd: HWND) {
@@ -2366,18 +2592,7 @@ fn open_find(hwnd: HWND) {
 }
 
 fn show_find_error(hwnd: HWND, e: &windows::core::Error) {
-    let msg: Vec<u16> = format!("Could not open the find bar: {}\0", e.message())
-    .encode_utf16()
-    .collect();
-    let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
-    unsafe {
-        MessageBoxW(
-            Some(hwnd),
-            PCWSTR(msg.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OK | MB_ICONWARNING,
-        );
-    }
+    tell_error(hwnd, format!("Could not open the find bar: {}", e.message()));
 }
 
 fn start_find(hwnd: HWND) -> windows::core::Result<()> {
@@ -2462,7 +2677,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
-                        // Disable external drop so our WM_DROPFILES handler works
+                        // WebView2 must not take drops itself: MDView's drop target
+                        // (droptarget.rs) decides what can be dropped (#54).
                         if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
                             let _ = controller4.SetAllowExternalDrop(false);
                         }
@@ -2540,6 +2756,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                     if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
                                         linkstatus::hide(hwnd);
                                     }
+                                    // A message shown on the page leaves with it.
+                                    MESSAGES.with(|m| m.borrow_mut().page_left());
                                     if let Some(args) = args {
                                         let mut uri_ptr: windows::core::PWSTR =
                                             windows::core::PWSTR::null();
@@ -2550,11 +2768,14 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             windows::Win32::System::Com::CoTaskMemFree(Some(
                                                 uri_ptr.0 as *const _,
                                             ));
+                                            // Never opened elsewhere from here: WebView2 can call a
+                                            // navigation the document started itself (<meta refresh>,
+                                            // S5) user-initiated. Clicked links reach the link policy
+                                            // through the page script (`openLink`).
                                             if !navigation_allowed(&uri) {
                                                 let _ = args.SetCancel(true);
-                                                if user_initiated.as_bool() {
-                                                    queue_link(uri);
-                                                }
+                                            } else if crate::vpath::is_document_origin(&uri) {
+                                                document_navigation(navigation_kind(&args), &uri);
                                             }
                                         } else {
                                             let _ = args.SetCancel(true);
@@ -2566,25 +2787,24 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
 
-                            // No new windows: a link the user opened in a new
-                            // window goes through the link policy.
+                            // Back is possible or not any more: tell the page (#46).
+                            let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
+                                |_webview, _args| {
+                                    post_history();
+                                    Ok(())
+                                },
+                            ));
+                            let mut history_token: i64 = 0;
+                            let _ = webview.add_HistoryChanged(&history_handler, &mut history_token);
+
+                            // No new windows, and nothing opened from here (see S5 at
+                            // NavigationStarting): a link opened with Shift+click or the
+                            // middle button reaches the link policy through the page script.
                             let new_window_handler =
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
                                             let _ = args.SetHandled(true);
-                                            let mut user_initiated = windows::core::BOOL(0);
-                                            let _ = args.IsUserInitiated(&mut user_initiated);
-                                            let mut uri_ptr = windows::core::PWSTR::null();
-                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
-                                                let uri = uri_ptr.to_string().unwrap_or_default();
-                                                windows::Win32::System::Com::CoTaskMemFree(Some(
-                                                    uri_ptr.0 as *const _,
-                                                ));
-                                                if user_initiated.as_bool() {
-                                                    queue_link(uri);
-                                                }
-                                            }
                                         }
                                         Ok(())
                                     },
@@ -2632,7 +2852,11 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 EXPECT_STRING_PAGE.with(|e| e.set(true));
                                 if let Err(e) = webview.NavigateToString(PCWSTR(html_wide.as_ptr()))
                                 {
-                                    eprintln!("NavigateToString failed: {:?}", e);
+                                    // #53: no page at all; say so instead of an empty window.
+                                    message_box(
+                                        Some(hwnd),
+                                        &messages::Message::error(format!("{APP_NAME} could not show its page:\n\n{}", e.message())),
+                                    );
                                 }
                             }
 
@@ -2715,14 +2939,8 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
     // Own WebView2 data folder for this host program (#33)
     let user_data_folder = match settings::webview2_data_folder() {
         Ok(folder) => folder.to_string_lossy().into_owned(),
-        Err(e) => {
-            let text: Vec<u16> = format!("{APP_NAME} cannot start its viewer:\n\n{e}\0").encode_utf16().collect();
-            let title: Vec<u16> = concat!(app_name!(), "\0").encode_utf16().collect();
-            unsafe {
-                MessageBoxW(Some(hwnd), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-            }
-            return Err(windows::core::Error::new(E_FAIL, e));
-        }
+        // Reported once, by main (report_startup_error).
+        Err(e) => return Err(windows::core::Error::new(E_FAIL, format!("cannot create the WebView2 data folder: {e}"))),
     };
     let user_data_wide = pwstr_from_str(&user_data_folder);
     unsafe {
@@ -2799,6 +3017,41 @@ unsafe extern "system" fn window_proc(
             handle_queued_links(hwnd);
             LRESULT(0)
         }
+        // #44: the full path of a recent file as a tooltip next to its item.
+        WM_MENUSELECT => {
+            let item = (wparam.0 & 0xFFFF) as u32;
+            let flags = ((wparam.0 >> 16) & 0xFFFF) as u32;
+            let recent = IDM_FILE_RECENT_BASE..IDM_FILE_RECENT_BASE + 10;
+            if flags != 0xFFFF && flags & MF_POPUP.0 == 0 && recent.contains(&item) {
+                show_recent_file_tooltip(hwnd, HMENU(lparam.0 as *mut _), item);
+            } else {
+                linkstatus::hide(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_EXITMENULOOP => {
+            linkstatus::hide(hwnd);
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // #17: reload the shown document once its file has changed.
+        WM_TIMER if wparam.0 == WATCH_TIMER => {
+            let changed = WATCH.with(|w| {
+                w.borrow_mut().as_mut().is_some_and(|w| {
+                    let now = watch::stamp(&w.path);
+                    w.tick(now)
+                })
+            });
+            if changed {
+                reload_page();
+            }
+            LRESULT(0)
+        }
+        WM_MDVIEW_DROP => {
+            if let Some(path) = droptarget::take_dropped() {
+                load_file_into_webview(hwnd, &path.to_string_lossy());
+            }
+            LRESULT(0)
+        }
         WM_MDVIEW_MENU => {
             show_context_menu(hwnd);
             LRESULT(0)
@@ -2864,6 +3117,14 @@ unsafe extern "system" fn window_proc(
                     let _ = unregister_file_association();
                     LRESULT(0)
                 }
+                IDM_GO_BACK => {
+                    go(true);
+                    LRESULT(0)
+                }
+                IDM_GO_FORWARD => {
+                    go(false);
+                    LRESULT(0)
+                }
                 IDM_HELP_KEYS => {
                     open_help();
                     LRESULT(0)
@@ -2890,11 +3151,6 @@ unsafe extern "system" fn window_proc(
                 }
                 _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
             }
-        }
-        WM_DROPFILES => {
-            let hdrop = HDROP(wparam.0 as _);
-            handle_drop_files(hwnd, hdrop);
-            LRESULT(0)
         }
         WM_DESTROY => {
             // Save window position before closing
@@ -3040,6 +3296,37 @@ mod tests {
         assert_eq!(CAPABILITIES_KEY, "Software\\MDView\\Capabilities");
         assert_eq!(FILE_ASSOCIATIONS_KEY, "Software\\MDView\\Capabilities\\FileAssociations");
         assert!(links::REFUSED_PROGRAM.starts_with("MDView does not open"));
+    }
+
+    // #44: recent files show their path, shortened in the middle; & is shown.
+    #[test]
+    fn test_recent_files_show_the_path() {
+        assert_eq!(recent_menu_text(0, r"C:\docs\README.md"), r"&1 C:\docs\README.md");
+        assert_eq!(recent_menu_text(9, r"C:\a.md"), r"1&0 C:\a.md");
+        assert_eq!(recent_menu_text(1, r"C:\R&D\a&b.md"), r"&2 C:\R&&D\a&&b.md");
+        let long = r"C:\Work\projects\customer-name\2026\documentation\drafts\docs\README.md";
+        let short = shorten_path(long, 60);
+        assert!(short.chars().count() <= 60, "{short}");
+        assert!(short.starts_with(r"C:\Work\...\") && short.ends_with(r"\docs\README.md"), "{short}");
+        let unc = r"\\server\share\very\long\folder\names\that\go\on\and\on\and\on\file.md";
+        let short = shorten_path(unc, 40);
+        assert!(short.starts_with(r"\\server\share\...\") && short.ends_with(r"\file.md"), "{short}");
+        // A file name longer than the limit still shows in full.
+        let name = format!(r"C:\a\b\c\{}.md", "x".repeat(70));
+        assert!(shorten_path(&name, 60).ends_with(&format!("{}.md", "x".repeat(70))));
+    }
+
+    #[test]
+    fn test_startup_follows_the_shortcut_then_the_saved_state() {
+        // #58: a shortcut set to Maximized / Minimized wins; "Normal window"
+        // (or nothing) keeps the saved state.
+        assert_eq!(startup_show_cmd(Some(SW_SHOWMAXIMIZED.0 as u16), false), SW_SHOWMAXIMIZED);
+        assert_eq!(startup_show_cmd(Some(SW_SHOWMINNOACTIVE.0 as u16), true), SW_SHOWMINIMIZED);
+        assert_eq!(startup_show_cmd(Some(SW_SHOWMINIMIZED.0 as u16), false), SW_SHOWMINIMIZED);
+        assert_eq!(startup_show_cmd(Some(SW_SHOWNORMAL.0 as u16), true), SW_SHOWMAXIMIZED);
+        assert_eq!(startup_show_cmd(Some(SW_SHOWDEFAULT.0 as u16), false), SW_SHOWNORMAL);
+        assert_eq!(startup_show_cmd(None, false), SW_SHOWNORMAL);
+        assert_eq!(startup_show_cmd(None, true), SW_SHOWMAXIMIZED);
     }
 
     #[test]

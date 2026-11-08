@@ -63,9 +63,11 @@ $tcp = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0
 $tcp.Start()
 $port = $tcp.LocalEndpoint.Port
 $hits = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+# Each request with the headers that say what sent it (prefetch, navigation, ...).
+$hitDetails = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
 $pages = [System.Collections.Concurrent.ConcurrentDictionary[string, string]]::new()
-$serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token -ScriptBlock {
-    param($tcp, $hits, $pages, $token)
+$serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token, $hitDetails -ScriptBlock {
+    param($tcp, $hits, $pages, $token, $hitDetails)
     $png = [Convert]::FromBase64String('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==')
     while ($true) {
         try { $client = $tcp.AcceptTcpClient() } catch { break }
@@ -73,11 +75,15 @@ $serverJob = Start-ThreadJob -ArgumentList $tcp, $hits, $pages, $token -ScriptBl
             $stream = $client.GetStream()
             $reader = [System.IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 4096, $true)
             $requestLine = $reader.ReadLine()
-            while (($line = $reader.ReadLine()) -ne $null -and $line -ne '') { }
+            $seen = @()
+            while (($line = $reader.ReadLine()) -ne $null -and $line -ne '') {
+                if ($line -match '^(User-Agent|Sec-Purpose|Purpose|Sec-Fetch-Dest|Sec-Fetch-Mode|Sec-Fetch-User|Referer):') { $seen += $line }
+            }
             if (-not $requestLine) { continue }
             $parts = $requestLine.Split(' ')
             $method = $parts[0]; $path = $parts[1]
             $hits.Enqueue("$method $path")
+            $hitDetails.Enqueue("$((Get-Date).ToString('HH:mm:ss.fff')) $method $path | $($seen -join ' | ')")
             $headers = "Access-Control-Allow-Origin: *`r`nAccess-Control-Allow-Private-Network: true`r`nAccess-Control-Allow-Methods: *`r`nAccess-Control-Allow-Headers: *`r`n"
             $body = [byte[]]@(); $status = '204 No Content'; $type = 'text/plain'
             if ($method -eq 'OPTIONS') {
@@ -200,6 +206,12 @@ $cases = @(
     @{ Id = 'E2'; Safe = 'MDView does not connect to the pipe'; Title = 'double-encoded \\.\pipe\ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E2`n`n![e2]($('../' * 30)%255C%255C.%255Cpipe%255C$(Get-PipeName 'E2'))" }
     @{ Id = 'E3'; Safe = 'MDView does not connect to the pipe'; Title = 'CSS url() with encoded //./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E3`n`n<div style=`"width:10px;height:10px;background:url($('../' * 30)%2F%2F.%2Fpipe%2F$(Get-PipeName 'E3'))`"></div>" }
     @{ Id = 'E4'; Safe = 'MDView does not connect to the pipe'; Title = 'image with an absolute \\.\pipe\ or file://./pipe/ path is opened on load'; Detect = 'pipe'; AllowNetwork = $true; Doc = "# E4`n`n![e4a](\\\\.\pipe\$(Get-PipeName 'E4'))`n`n![e4b](file:////./pipe/$(Get-PipeName 'E4'))`n`n![e4c](https://unc.mdview.example/./pipe/$(Get-PipeName 'E4'))" }
+    # Files that aren't Markdown, given directly (#55): never shown as a page,
+    # never run. The standalone viewer shows a notice; the plugin declines them.
+    @{ Id = 'D1'; Ext = 'js'; Safe = 'the file is not run; the viewer says it only opens Markdown, the plugin declines it'; Title = 'a .js file given directly is run'; Canary = $true; Doc = "WScript.CreateObject('WScript.Shell').Run('canary-D1.cmd')" }
+    @{ Id = 'D2'; Ext = 'html'; Safe = 'the page is not shown; nothing runs'; Title = 'an .html file given directly runs its script'; Canary = $true; Doc = "<html><body><p>D2</p><script>document.body.insertAdjacentHTML('beforeend','<p>PWNED-D2</p>'); if (window.chrome && chrome.webview) chrome.webview.postMessage({type:'openLink', url: new URL('canary-D2.cmd', location.href).href})</script></body></html>" }
+    @{ Id = 'D3'; Ext = 'svg'; Safe = 'the image is not shown as a page; nothing runs'; Title = 'an .svg file given directly runs its script'; Doc = "<svg xmlns='http://www.w3.org/2000/svg'><text y='20'>D3</text><script>document.documentElement.insertAdjacentHTML('beforeend','<text y=`"40`">PWNED-D3</text>')</script></svg>" }
+    @{ Id = 'D4'; Ext = 'hta'; Safe = 'the file is not run'; Title = 'an .hta file given directly is run'; Canary = $true; Doc = "<html><head><script language='VBScript'>CreateObject(""WScript.Shell"").Run ""canary-D4.cmd""</script></head><body>PWNED-D4</body></html>" }
     @{ Id = 'E5'; Safe = 'MDView does not connect to the pipe (a real click shows a refusal message)'; Title = 'clicking a link to file://./pipe/ opens the pipe'; Detect = 'pipe'; AllowNetwork = $true; Click = 'e5 pipe link'; Doc = "# E5`n`n[e5 pipe link](<file://./pipe/$(Get-PipeName 'E5')>)" }
 )
 $pages['S5'] = "<html><body>left MDView (S5)</body></html>"
@@ -214,6 +226,10 @@ $regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'Zoo
 $regBackup = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n } }
+$recentKey = 'HKCU:\Software\MDView\RecentFiles'
+$recentBackup = @{}
+$r0 = Get-ItemProperty -Path $recentKey -ErrorAction SilentlyContinue
+foreach ($i in 0..9) { if ($r0 -and $null -ne $r0."File$i") { $recentBackup["File$i"] = $r0."File$i" } }
 function Restore-Registry {
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
     foreach ($n in $regNames) {
@@ -223,7 +239,7 @@ function Restore-Registry {
 }
 function Set-TestRegistry {
     Restore-Registry
-    foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
+    foreach ($kv in @{ Left = 20; Top = 20; Right = 1000; Bottom = 740; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
 }
@@ -232,13 +248,16 @@ function Set-TestRegistry {
 $results = @()
 function Invoke-Case($case, $hostKind) {
     $id = $case.Id
-    $doc = Join-Path $attack "case-$id.md"
+    $ext = if ($case.Ext) { $case.Ext } else { 'md' }
+    $doc = Join-Path $attack "case-$id.$ext"
     $text = if ($case.DocFn) { & $case.DocFn } else { $case.Doc }
     Set-Content -Path $doc -Value $text -NoNewline
-    foreach ($c in 'B1', 'B4', 'B6', 'F3', 'U1') { if ($id -eq $c) { New-Canary $c | Out-Null } }
+    foreach ($c in 'B1', 'B4', 'B6', 'F3', 'U1', 'D1', 'D2', 'D4') { if ($id -eq $c) { New-Canary $c | Out-Null } }
     Remove-Item (Join-Path $attack "marker-$id.txt") -ErrorAction SilentlyContinue
     $calcBefore = Get-CalcIds
     $hitsBefore = $hits.Count
+    # A browser the viewer started (a document must never open one by itself).
+    $browserBefore = @(Get-Process msedge, chrome, firefox -ErrorAction SilentlyContinue | ForEach-Object Id)
     $dlBefore = @(Get-ChildItem $downloads -Filter "*$token*" -ErrorAction SilentlyContinue)
     Set-TestRegistry
     # Network files allowed in both programs' settings (registry; the plugin's
@@ -280,7 +299,9 @@ function Invoke-Case($case, $hostKind) {
     if ($win) {
         $deadline = (Get-Date).AddSeconds(20)
         while ((Get-Date) -lt $deadline -and -not $proc.HasExited -and -not $pageLoaded) {
-            if (Find-Text $win "^$id$") { $pageLoaded = $true } else { Start-Sleep -Milliseconds 300 }
+            # A file given directly (#55) shows MDView's notice instead of a document.
+            $shownText = if ($case.Ext) { '^Not a Markdown file$' } else { "^$id$" }
+            if (Find-Text $win $shownText) { $pageLoaded = $true } else { Start-Sleep -Milliseconds 300 }
         }
     }
     Start-Sleep -Seconds 2
@@ -293,7 +314,9 @@ function Invoke-Case($case, $hostKind) {
     Start-Sleep -Seconds ([Math]::Max(1, $Seconds - 4))
     if (-not $proc.HasExited) { $dialogs += Close-Dialogs $proc; Start-Sleep -Milliseconds 500 }
 
-    $marker = if ($win -and -not $proc.HasExited) { Find-Text $win "PWNED-$id|LEAK-" } else { $null }
+    # The markers are paragraphs of their own; MDView's messages may quote a link
+    # that contains the text (S6: "MDView does not open this kind of link").
+    $marker = if ($win -and -not $proc.HasExited) { Find-Text $win "^PWNED-$id$|^LEAK-" } else { $null }
     $exitedEarly = $proc.HasExited
     if ($hostKind -eq 'plugin' -and (Test-Path $statusFile)) { $status = Get-Content $statusFile -Raw }
     if (-not $proc.HasExited) { $proc | Stop-Process -Force; $proc.WaitForExit(5000) | Out-Null }
@@ -302,6 +325,17 @@ function Invoke-Case($case, $hostKind) {
     $pipeResult = $null
     if ($pipe) { $pipe.Cancel.Cancel(); $pipeResult = Receive-Job $pipe.Job -Wait; Remove-Job $pipe.Job -Force }
 
+    # A browser starts slowly: for cases that try to leave the document, wait
+    # for one (or its request) before the next case, so whatever this case
+    # caused is counted here, not in the next case.
+    $newBrowsers = { @(Get-Process msedge, chrome, firefox -ErrorAction SilentlyContinue | Where-Object { $browserBefore -notcontains $_.Id }) }
+    if ($navigatesAway) {
+        $deadline = (Get-Date).AddSeconds(12)
+        while ((Get-Date) -lt $deadline -and -not (& $newBrowsers).Count) { Start-Sleep -Milliseconds 500 }
+        if ((& $newBrowsers).Count) { Start-Sleep -Seconds 5 }
+    }
+    $browsers = & $newBrowsers
+    foreach ($b in $browsers) { Stop-Process -Id $b.Id -Force -ErrorAction SilentlyContinue }
     $newHits = @($hits.ToArray() | Select-Object -Skip $hitsBefore)
     $newCalc = @(Get-CalcIds | Where-Object { $calcBefore -notcontains $_ })
     foreach ($pidCalc in $newCalc) { Stop-Process -Id $pidCalc -Force -ErrorAction SilentlyContinue }
@@ -326,17 +360,30 @@ function Invoke-Case($case, $hostKind) {
         'download' { if ($dlNew.Count) { $observed += "file saved to Downloads ($($dlNew.Name -join ', '), deleted)"; $worked = $true } elseif (@($newHits | Where-Object { $_ -match '/download' }).Count) { $observed += 'download requested, not saved' } }
     }
     if ($id -in 'S5', 'B6') { if (@($newHits | Where-Object { $_ -match "/page-$id" }).Count) { $observed += "navigated to server page /page-$id"; $worked = $true } }
+    if ($browsers.Count) { $observed += "a browser was started ($((@($browsers | ForEach-Object ProcessName) | Sort-Object -Unique) -join ', '), closed)"; $worked = $true }
     if ($id -eq 'U1' -and $dlNew.Count) { $observed += 'canary saved to Downloads (deleted)'; $worked = $true }
     if ($pipeResult -eq 'CONNECTED') { $observed += "MDView connected to the named pipe $(Get-PipeName $id)"; $worked = $true }
     if ($dialogs.Count) { $observed += "dialog: $($dialogs -join ' | ')" }
     # A case that could not run is an error, never a pass.
     $notRun = $null
-    if ($hostKind -eq 'plugin' -and $status -eq 'load-failed') { $notRun = 'plugin failed to load the document' }
+    if ($hostKind -eq 'plugin' -and $status -eq 'load-failed' -and $case.Ext) { $observed += 'declined by the plugin (TC uses another viewer)' }
+    elseif ($hostKind -eq 'plugin' -and $case.Ext) { $notRun = "the plugin did not decline the file (status: $status)"; $worked = $true; $observed += 'the plugin opened a file that is not Markdown' }
+    elseif ($hostKind -eq 'plugin' -and $status -eq 'load-failed') { $notRun = 'plugin failed to load the document' }
     elseif (-not $win -and -not ($case.Close -and $exitedEarly)) { $notRun = 'viewer window not found' }
     elseif (-not $pageLoaded -and -not $navigatesAway -and -not ($case.Close -and $exitedEarly)) { $notRun = 'document did not load' }
     if (-not $observed.Count) { $observed += 'nothing happened' }
 
     $result = if ($worked) { 'FAIL (attack worked)' } elseif ($notRun) { "ERROR (did not run: $notRun)" } else { 'PASS (blocked)' }
+    # The plugin's debug log (debug builds always write it) shows what it saw.
+    $pluginLog = Join-Path $wv2Temp 'mdview_debug.log'
+    if ($worked) {
+        Write-Host "  requests for this case:"
+        @($hitDetails.ToArray() | Where-Object { $_ -match "/page-$id|c=$id" }) | ForEach-Object { Write-Host "    $_" }
+    }
+    if ($worked -and $hostKind -eq 'plugin' -and (Test-Path $pluginLog)) {
+        Write-Host "  plugin log (navigation):"
+        Get-Content $pluginLog | Select-String 'navigat|history|Navigate|request' | Select-Object -Last 40 | ForEach-Object { Write-Host "    $($_.Line)" }
+    }
     [pscustomobject]@{ Case = $id; Host = $hostKind; Attack = $case.Title; Safe = $case.Safe; Result = $result; Observed = ($observed -join '; ') }
 }
 
@@ -369,6 +416,12 @@ try {
 }
 finally {
     Restore-Registry
+    # The standalone viewer adds every file it opens to File > Recent Files.
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) {
+        if ($recentBackup.ContainsKey("File$i")) { Set-ItemProperty -Path $recentKey -Name "File$i" -Value $recentBackup["File$i"] -Type String }
+        else { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
+    }
     $tcp.Stop()
     Stop-Job $serverJob -ErrorAction SilentlyContinue; Remove-Job $serverJob -Force -ErrorAction SilentlyContinue
     Get-Process mdview -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Stop-Process -Force -ErrorAction SilentlyContinue

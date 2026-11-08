@@ -4,14 +4,17 @@ mod clipboard;
 mod contextmenu;
 mod files;
 mod fonts;
+mod history;
 mod links;
 mod linkstatus;
 mod markdown;
+mod messages;
 mod settings;
 mod settings_page;
 mod shortcuts;
 mod viewer;
 mod vpath;
+mod watch;
 mod zone;
 
 use std::ffi::{CStr, c_char, c_int};
@@ -90,12 +93,8 @@ pub extern "system" fn ListLoad(
     file_to_load: *const c_char,
     show_flags: c_int,
 ) -> HWND {
-    let file_path = unsafe {
-        match CStr::from_ptr(file_to_load).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return HWND::default(),
-        }
-    };
+    // TC passes the ANSI version's path in the Windows code page.
+    let Some(file_path) = (unsafe { ansi_to_string(file_to_load) }) else { return HWND::default() };
 
     let dark_mode = (show_flags & LCP_DARKMODE) != 0;
     load_markdown_file(parent_win, &file_path, dark_mode)
@@ -126,6 +125,10 @@ pub extern "system" fn ListCloseWindow(list_win: HWND) {
 }
 
 fn load_markdown_file(parent: HWND, file_path: &str, dark_mode: bool) -> HWND {
+    // #55: only Markdown; declining lets TC use another viewer for the file.
+    if !links::is_markdown(std::path::Path::new(file_path)) {
+        return HWND::default();
+    }
     // Only check that the file can be opened; TC shows its own message if not.
     // The content is read later, after its Mark of the Web was checked (#24).
     if files::open_read_only(std::path::Path::new(file_path)).is_err() {

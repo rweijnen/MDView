@@ -15,6 +15,7 @@ pub fn shortcuts(is_plugin: bool) -> Vec<Group> {
         ("Ctrl+Home / Ctrl+End", "Top / bottom of the document"),
         ("Ctrl+mouse wheel, Ctrl+Plus / Ctrl+Minus", "Zoom in / out"),
         ("Ctrl+0", "Zoom to 100%"),
+        ("Alt+Left / Alt+Right", "Back / forward (also the mouse's back and forward buttons)"),
     ];
     let mut find = if is_plugin {
         vec![
@@ -34,6 +35,12 @@ pub fn shortcuts(is_plugin: bool) -> Vec<Group> {
         window.push(("Ctrl+O", "Open a file"));
         window.push(("Esc", "Close the window"));
     }
+    // In Total Commander, F5 is TC's own key; Ctrl+R works in both (#17).
+    reading.push(if is_plugin {
+        ("Ctrl+R", "Reload the document (automatic for files on this computer)")
+    } else {
+        ("F5 / Ctrl+R", "Reload the document (automatic for files on this computer)")
+    });
     window.extend([("Ctrl+,", "Settings"), ("F1", "These keyboard shortcuts"), ("Right-click", "Menu")]);
     vec![
         Group { title: "Reading", keys: reading },
@@ -74,14 +81,17 @@ pub enum MenuCommand {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    Reload,
     Settings,
     Help,
+    Back,
+    Forward,
 }
 
 impl MenuCommand {
     pub fn from_id(id: u32) -> Option<Self> {
         use MenuCommand::*;
-        [OpenLink, CopyLink, Copy, SelectAll, Find, Print, ZoomIn, ZoomOut, ZoomReset, Settings, Help]
+        [OpenLink, CopyLink, Copy, SelectAll, Find, Print, ZoomIn, ZoomOut, ZoomReset, Reload, Settings, Help, Back, Forward]
             .into_iter()
             .find(|c| *c as u32 == id)
     }
@@ -96,10 +106,20 @@ pub struct MenuItem {
     pub enabled: bool,
 }
 
+/// Where the user can go from the shown page (#46).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CanGo {
+    pub back: bool,
+    pub forward: bool,
+}
+
 /// The right-click menu at the place clicked.
-pub fn menu_items(on_link: bool, has_selection: bool, zoom: u32, is_plugin: bool) -> Vec<Option<MenuItem>> {
+pub fn menu_items(on_link: bool, has_selection: bool, can_go: CanGo, zoom: u32, is_plugin: bool) -> Vec<Option<MenuItem>> {
     let item = |command, label: &str, enabled| Some(MenuItem { command, label: label.to_string(), enabled });
     let mut items = Vec::new();
+    items.push(item(MenuCommand::Back, "&Back\tAlt+Left", can_go.back));
+    items.push(item(MenuCommand::Forward, "Forwar&d\tAlt+Right", can_go.forward));
+    items.push(None);
     if on_link {
         items.push(item(MenuCommand::OpenLink, "&Open link", true));
         items.push(item(MenuCommand::CopyLink, "Copy &link address", true));
@@ -115,6 +135,8 @@ pub fn menu_items(on_link: bool, has_selection: bool, zoom: u32, is_plugin: bool
     items.push(item(MenuCommand::ZoomOut, "Zoom o&ut\tCtrl+Minus", true));
     items.push(item(MenuCommand::ZoomReset, &format!("&Reset zoom ({zoom}%)\tCtrl+0"), zoom != 100));
     items.push(None);
+    // In Total Commander, F5 is TC's own key: Ctrl+R there.
+    items.push(item(MenuCommand::Reload, if is_plugin { "R&eload\tCtrl+R" } else { "R&eload\tF5" }, true));
     items.push(item(MenuCommand::Settings, "&Settings...\tCtrl+,", true));
     items.push(item(MenuCommand::Help, "&Keyboard shortcuts\tF1", true));
     items
@@ -164,19 +186,25 @@ mod tests {
         let labels = |items: &[Option<MenuItem>]| -> Vec<String> {
             items.iter().map(|i| i.as_ref().map_or("-".to_string(), |i| i.label.clone())).collect()
         };
-        let plain = menu_items(false, false, 100, false);
+        let plain = menu_items(false, false, CanGo::default(), 100, false);
         assert!(!labels(&plain).iter().any(|l| l.contains("link")), "link items only on a link");
         let copy = plain.iter().flatten().find(|i| i.command == MenuCommand::Copy).unwrap();
         assert!(!copy.enabled, "Copy is greyed without a selection");
         let reset = plain.iter().flatten().find(|i| i.command == MenuCommand::ZoomReset).unwrap();
         assert!(!reset.enabled && reset.label.contains("(100%)"));
-        let link = menu_items(true, true, 125, true);
-        assert_eq!(link[0].as_ref().unwrap().command, MenuCommand::OpenLink);
-        assert_eq!(link[1].as_ref().unwrap().command, MenuCommand::CopyLink);
+        // #46: Back and Forward come first, greyed when not possible.
+        assert_eq!(plain[0].as_ref().map(|i| (i.command, i.enabled)), Some((MenuCommand::Back, false)));
+        assert_eq!(plain[1].as_ref().map(|i| (i.command, i.enabled)), Some((MenuCommand::Forward, false)));
+        let link = menu_items(true, true, CanGo { back: true, forward: false }, 125, true);
+        assert_eq!(link[0].as_ref().map(|i| (i.command, i.enabled)), Some((MenuCommand::Back, true)));
+        assert_eq!(link[3].as_ref().unwrap().command, MenuCommand::OpenLink);
+        assert_eq!(link[4].as_ref().unwrap().command, MenuCommand::CopyLink);
         assert!(link.iter().flatten().find(|i| i.command == MenuCommand::Copy).unwrap().enabled);
         assert!(labels(&link).contains(&"&Reset zoom (125%)\tCtrl+0".to_string()));
         assert!(labels(&link).contains(&"&Find...\tF7".to_string()), "plugin: TC's search");
         assert!(labels(&plain).contains(&"&Find...\tCtrl+F".to_string()));
+        assert!(labels(&plain).contains(&"R&eload\tF5".to_string()), "viewer: reload");
+        assert!(labels(&link).contains(&"R&eload\tCtrl+R".to_string()), "plugin: F5 is TC's, Ctrl+R reloads");
         for item in link.iter().flatten() {
             assert_eq!(MenuCommand::from_id(item.command as u32), Some(item.command));
         }

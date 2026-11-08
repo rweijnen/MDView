@@ -3,6 +3,8 @@ param(
     [switch]$Release,
     [switch]$x86,
     [switch]$x64,
+    # Standalone viewer only: there is no ARM64 Total Commander to load a plugin (#51).
+    [switch]$arm64,
     [switch]$Clean,
     [switch]$Package,
     [string]$OutputDir = "dist",
@@ -35,6 +37,9 @@ if ($build_x64) {
 if ($build_x86) {
     $targets += [PSCustomObject]@{ Target = "i686-pc-windows-msvc"; Arch = "x86" }
 }
+if ($arm64) {
+    $targets += [PSCustomObject]@{ Target = "aarch64-pc-windows-msvc"; Arch = "arm64" }
+}
 
 $profile = if ($Release) { "--release" } else { "" }
 $profileDir = if ($Release) { "release" } else { "debug" }
@@ -52,8 +57,8 @@ foreach ($item in $targets) {
     $target = $item.Target
     $arch = $item.Arch
 
-    # Install i686 target if needed
-    if ($arch -eq "x86") {
+    # Install the i686 / aarch64 target if needed
+    if ($arch -ne "x64") {
         $installedTargets = @(rustup target list --installed)
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to query installed Rust targets"
@@ -71,7 +76,9 @@ foreach ($item in $targets) {
         }
     }
 
-    $buildCmd = "cargo build --target $target $profile"
+    # ARM64: the standalone viewer only.
+    $binOnly = if ($arch -eq "arm64") { "--bin mdview" } else { "" }
+    $buildCmd = "cargo build --target $target $profile $binOnly"
     Write-Host $buildCmd
     Invoke-Expression $buildCmd
 
@@ -82,7 +89,12 @@ foreach ($item in $targets) {
 
     $outDir = "target\$target\$profileDir"
 
-    if ($arch -eq "x64") {
+    if ($arch -eq "arm64") {
+        Copy-Item "$outDir\mdview.exe" "$OutputDir\mdview-arm64.exe" -Force
+        if (Test-Path "$outDir\mdview.pdb") {
+            Copy-Item "$outDir\mdview.pdb" "$OutputDir\mdview-arm64.pdb" -Force
+        }
+    } elseif ($arch -eq "x64") {
         Copy-Item "$outDir\mdview_wlx.dll" "$OutputDir\mdview.wlx64" -Force
 
         # Keep the x64 exe as mdview64.exe to match distributed release artifact naming

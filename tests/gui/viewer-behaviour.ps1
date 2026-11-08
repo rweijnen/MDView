@@ -141,6 +141,20 @@ $regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'Zoo
 $regBackup = @{}; $regKinds = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n; $regKinds[$n] = (Get-Item -Path $key).GetValueKind($n) } }
+# The standalone viewer adds every file it opens to File > Recent Files
+# (HKCU\Software\MDView\RecentFiles, File0-File9): put the user's list back.
+$recentKey = 'HKCU:\Software\MDView\RecentFiles'
+$recentBackup = @{}
+$r0 = Get-ItemProperty -Path $recentKey -ErrorAction SilentlyContinue
+foreach ($i in 0..9) { if ($r0 -and $null -ne $r0."File$i") { $recentBackup["File$i"] = $r0."File$i" } }
+function Restore-RecentFiles {
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) {
+        $n = "File$i"
+        if ($recentBackup.ContainsKey($n)) { Set-ItemProperty -Path $recentKey -Name $n -Value $recentBackup[$n] -Type String }
+        else { Remove-ItemProperty -Path $recentKey -Name $n -ErrorAction SilentlyContinue }
+    }
+}
 function Restore-Registry {
     if (-not (Test-Path $key)) { New-Item -Path $key | Out-Null }
     foreach ($n in $regNames) {
@@ -156,7 +170,7 @@ function Set-TestRegistry($remoteImages) {
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
     foreach ($n in 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
-    foreach ($kv in @{ Left = 200; Top = 150; Right = 1200; Bottom = 950; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
+    foreach ($kv in @{ Left = 20; Top = 20; Right = 1000; Bottom = 740; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
     if ($null -ne $remoteImages) { Set-ItemProperty -Path $key -Name RemoteImages -Value $remoteImages -Type DWord }
@@ -274,8 +288,10 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint msg, IntPtr w, IntPtr l); [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+[DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
 [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr m);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr m, uint item, System.Text.StringBuilder s, int n, uint flags);
 [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr m, uint item, uint flags);
@@ -341,6 +357,22 @@ function Wait-ImageHeight($v, $name, $seconds = 10) {
     $deadline = (Get-Date).AddSeconds($seconds)
     do { $h = Get-ImageHeight $v $name; if ($h -gt 50) { return $h }; Start-Sleep -Milliseconds 300 } while ((Get-Date) -lt $deadline)
     $h
+}
+# MDView's own message in the page (1.0.0): a dialog named "MDView".
+function Wait-PageMessage($v, $seconds = 8) {
+    $deadline = (Get-Date).AddSeconds($seconds)
+    do { $m = Find-Element $v $CT::Window '^MDView$'; if ($m) { return $m }; Start-Sleep -Milliseconds 250 } while ((Get-Date) -lt $deadline)
+    $null
+}
+function Get-PageMessageText($m) { ($m.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' }
+# Click one of the message's buttons; returns whether it was there.
+function Answer-PageMessage($m, $label) {
+    $b = $m.FindAll($TS::Descendants, (New-Object System.Windows.Automation.PropertyCondition($AE::ControlTypeProperty, $CT::Button))) |
+        Where-Object { $_.Current.Name -eq $label } | Select-Object -First 1
+    if (-not $b) { return $false }
+    Invoke-Element $b
+    Start-Sleep -Milliseconds 600
+    $true
 }
 function Wait-Dialog($v, $seconds = 8) {
     $deadline = (Get-Date).AddSeconds($seconds)
@@ -662,26 +694,22 @@ function Press-DialogButton($d, $name) {
             [void](Wait-Element $v $CT::Text $gateText 15)
             $unblock = Find-GateButton $v 'Open and remove the mark'
             if ($unblock) { Invoke-Element $unblock; Start-Sleep -Seconds 2 }
-            $dialog = Get-Dialog $v
-            $dialogText = if ($dialog) { ($dialog.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' } else { '' }
-            # Close it as the user would. (Invoking OK sends BM_CLICK, which
-            # does nothing while the dialog is not the active window.)
-            if ($dialog) {
-                $dialog.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
-                Start-Sleep -Milliseconds 800
-            }
+            # The message is shown in the page (1.0.0), not in a message box.
+            $dialog = Wait-PageMessage $v 6
+            $dialogText = if ($dialog) { Get-PageMessageText $dialog } else { '' }
+            if ($dialog) { [void](Answer-PageMessage $dialog 'OK') }
         } finally { $held.Close() }
         $gateStays = Find-Element $v $CT::Text $gateText
         $docShown = Find-Element $v $CT::Text '^Unblock me$'
         Check "${hostKind}: removing the mark fails with a clear message, and the gate stays" ([bool]$dialog -and $dialogText -match 'Could not remove the mark' -and $dialogText -match 'unblock\.md' -and [bool]$gateStays -and -not $docShown) "dialog=$([bool]$dialog) text='$dialogText' gate=$([bool]$gateStays) document=$([bool]$docShown)"
         # ...and works once it is no longer in use.
-        $dialogOpen = [bool](Get-Dialog $v)
+        $dialogOpen = [bool](Find-Element $v $CT::Window '^MDView$')
         $unblock = Find-GateButton $v 'Open and remove the mark'
         if ($unblock) { Invoke-Element $unblock }
         $docShown = Wait-Element $v $CT::Text '^Unblock me$' 10
         $marked = Test-Marked 'unblock.md'
-        $dialog2 = Get-Dialog $v
-        $dialog2Text = if ($dialog2) { ($dialog2.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current.Name }) -join ' | ' } else { '' }
+        $dialog2 = Find-Element $v $CT::Window '^MDView$'
+        $dialog2Text = if ($dialog2) { Get-PageMessageText $dialog2 } else { '' }
         Stop-Viewer $v
         Check "${hostKind}: 'Open and remove the mark' removes the stream and shows the document" ([bool]$docShown -and -not $marked) "document=$([bool]$docShown) still marked=$marked dialog before=$dialogOpen dialog after='$dialog2Text'"
         $v = Start-Viewer $hostKind (Join-Path $work 'unblock.md')
@@ -801,13 +829,14 @@ function Press-DialogButton($d, $name) {
         $v = Start-Viewer $hostKind (Join-Path $work 'sharelink.md')
         $link = Wait-Element $v $CT::Hyperlink 'to the share' 15
         if ($link) { Invoke-Element $link }
-        $d = Wait-Dialog $v
-        $text = if ($d) { Get-DialogText $d } else { '' }
-        $no = if ($d) { Press-DialogButton $d 'No' } else { $false }
+        # The question is shown in the page (1.0.0): Cancel / Open.
+        $d = Wait-PageMessage $v
+        $text = if ($d) { Get-PageMessageText $d } else { '' }
+        $no = if ($d) { Answer-PageMessage $d 'Cancel' } else { $false }
         $stayed = Find-Element $v $CT::Text '^Share link$'
         if ($link) { Invoke-Element $link }
-        $d = Wait-Dialog $v
-        $yes = if ($d) { Press-DialogButton $d 'Yes' } else { $false }
+        $d = Wait-PageMessage $v
+        $yes = if ($d) { Answer-PageMessage $d 'Open' } else { $false }
         $second = Wait-Element $v $CT::Text '^Second$' 10
         Stop-Viewer $v
         Check "${hostKind}: a link to a share asks first; No stays, Yes opens it" ($text -match 'network location' -and $text -match 'localhost' -and $no -and [bool]$stayed -and $yes -and [bool]$second) "dialog='$text' no=$no stayed=$([bool]$stayed) yes=$yes opened=$([bool]$second)"
@@ -988,14 +1017,14 @@ function Press-DialogButton($d, $name) {
     $base = Get-HeadingHeight $v 'Main'
     $focused = Focus-Document $v
     Send-CtrlKey $VK_OEM_PLUS
-    $dialog = Wait-Dialog $v 8
-    $dialogText = if ($dialog) { Get-DialogText $dialog } else { '' }
-    $closedOk = if ($dialog) { Press-DialogButton $dialog 'OK' } else { $false }
+    $dialog = Wait-PageMessage $v 8
+    $dialogText = if ($dialog) { Get-PageMessageText $dialog } else { '' }
+    $closedOk = if ($dialog) { Answer-PageMessage $dialog 'OK' } else { $false }
     [void](Focus-Document $v)
     Send-CtrlKey $VK_OEM_PLUS
     $ratio = Wait-Ratio $v 'Main' $base 1.25
-    $again = Wait-Dialog $v 3
-    if ($again) { [void](Press-DialogButton $again 'OK') }
+    $again = Wait-PageMessage $v 3
+    if ($again) { [void](Answer-PageMessage $again 'OK') }
     Stop-Viewer $v
     Check "plugin: a zoom that can't be saved is reported once, and zooming still works" ($focused -and $dialogText -match 'Could not save the zoom level' -and $closedOk -and -not $again -and (Near $ratio 1.25)) "focused=$focused text='$dialogText' closed=$closedOk second dialog=$([bool]$again) ratio=$ratio"
 
@@ -1021,7 +1050,7 @@ function Press-DialogButton($d, $name) {
         @('other drive link', "$($substLetter):\big.jpg"),
         @('share link', "$shareWork\second.md"),
         @('anchor link', '#bottom'),
-        @('program link', "$(Join-Path $work 'run.exe') (not opened)"),
+        @('program link', "$(Join-Path $work 'run.exe') (program: Ctrl+click to run)"),
         @('long link', (Join-Path $work (($longDir -replace '/', '\') + '\file.md')))
     )
     # The viewer process's visible Windows tooltip and its text, if one is shown.
@@ -1200,6 +1229,146 @@ function Press-DialogButton($d, $name) {
     Stop-Viewer $v
     Check "plugin: settings that can't be saved: the panel says what failed and stays open" ([bool]$alert -and $alertText -match 'Text size' -and $alertText -match 'mdview\.ini' -and $alertText -notmatch 'other settings were saved' -and $stillOpen) "alert='$alertText' open=$stillOpen"
 
+    # ---- Messages in the page and Ctrl+click on program links (1.0.0).
+    # tool.cmd only writes a marker file next to itself.
+    $marker = Join-Path $work 'tool-ran.txt'
+    Set-Content (Join-Path $work 'tool.cmd') -Value "@echo ran> `"%~dp0tool-ran.txt`"`r`n" -NoNewline
+    Set-Content (Join-Path $work 'program.md') -NoNewline -Value ((@(
+        '# Program link', '', '[run the tool](tool.cmd)', '',
+        # An imitation of MDView's question: it has no script, so it can do nothing.
+        '<div role="alertdialog" aria-label="Imitation"><p>This link starts a program.</p><button type="button">Run program</button></div>'
+    ) -join "`n"))
+    function Click-Element($v, $element, [switch]$Ctrl) {
+        $r = $element.Current.BoundingRectangle
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        [void][Win32.Behaviour]::SetCursorPos([int]($r.X + [Math]::Min(15, $r.Width / 2)), [int]($r.Y + $r.Height / 2)); Start-Sleep -Milliseconds 200
+        if ($Ctrl) { [Win32.Behaviour]::keybd_event(0x11, 0x1D, 0, [UIntPtr]::Zero); Start-Sleep -Milliseconds 100 }
+        [Win32.Behaviour]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero); [Win32.Behaviour]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        if ($Ctrl) { Start-Sleep -Milliseconds 100; [Win32.Behaviour]::keybd_event(0x11, 0x1D, 2, [UIntPtr]::Zero) }
+    }
+    # Click the link and wait for MDView's message; once more if the click was lost.
+    function Click-For-Message($v, $link, [switch]$Ctrl) {
+        for ($try = 0; $try -lt 2; $try++) {
+            Click-Element $v $link -Ctrl:$Ctrl
+            $m = Wait-PageMessage $v 4
+            if ($m) { return $m }
+        }
+        $null
+    }
+    foreach ($hostKind in 'exe', 'plugin') {
+        Remove-Item $marker -ErrorAction SilentlyContinue
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'program.md')
+        $link = Wait-Element $v $CT::Hyperlink '^run the tool$' 15
+        Start-Sleep -Milliseconds 500
+
+        $m = if ($link) { Click-For-Message $v $link } else { $null }
+        $text = if ($m) { Get-PageMessageText $m } else { '' }
+        $box = Get-Dialog $v
+        $ok = if ($m) { Answer-PageMessage $m 'OK' } else { $false }
+        Start-Sleep -Milliseconds 800
+        Check "${hostKind}: a plain click on a program link runs nothing and says why, in the page" ([bool]$m -and $text -match 'Ctrl\+click' -and $text -match 'tool\.cmd' -and $ok -and -not $box -and -not (Test-Path $marker)) "message=$([bool]$m) message box=$([bool]$box) ran=$(Test-Path $marker) text='$text'"
+
+        $m = if ($link) { Click-For-Message $v $link -Ctrl } else { $null }
+        $text = if ($m) { Get-PageMessageText $m } else { '' }
+        $focusedName = $AE::FocusedElement.Current.Name
+        $cancel = if ($m) { Answer-PageMessage $m 'Cancel' } else { $false }
+        Start-Sleep -Milliseconds 800
+        $ranAfterCancel = Test-Path $marker
+        $m2 = if ($link) { Click-For-Message $v $link -Ctrl } else { $null }
+        if ($m2) { [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle)); Send-Escape; Start-Sleep -Milliseconds 800 }
+        $escClosed = $m2 -and -not (Find-Element $v $CT::Window '^MDView$')
+        $ranAfterEsc = Test-Path $marker
+        Check "${hostKind}: Ctrl+click warns first; Cancel (the default) and Esc run nothing" ([bool]$m -and $text -match 'can harm your computer' -and $text -match 'Run program' -and $focusedName -eq 'Cancel' -and $cancel -and -not $ranAfterCancel -and $escClosed -and -not $ranAfterEsc) "warning=$([bool]$m) focused='$focusedName' cancel ran=$ranAfterCancel esc closed=$escClosed esc ran=$ranAfterEsc"
+
+        $m = if ($link) { Click-For-Message $v $link -Ctrl } else { $null }
+        $run = if ($m) { Answer-PageMessage $m 'Run program' } else { $false }
+        $deadline = (Get-Date).AddSeconds(8)
+        while (-not (Test-Path $marker) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
+        Check "${hostKind}: 'Run program' after Ctrl+click runs it" ($run -and (Test-Path $marker)) "clicked=$run ran=$(Test-Path $marker)"
+        Remove-Item $marker -ErrorAction SilentlyContinue
+
+        $fake = Find-Element $v $CT::Button '^Run program$'
+        if ($fake) { Invoke-Element $fake; Start-Sleep -Seconds 2 }
+        Stop-Viewer $v
+        Check "${hostKind}: a question imitated by the document does nothing" ([bool]$fake -and -not (Test-Path $marker)) "imitation found=$([bool]$fake) ran=$(Test-Path $marker)"
+    }
+
+    # ---- The window opens in its place (#58): from the moment it is visible,
+    # its position never changes (no default size first, then a jump).
+    function Watch-WindowStart($registryPosition) {
+        Set-TestRegistry $null
+        if (-not $registryPosition) { foreach ($n in 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue } }
+        $savedTemp = $env:TEMP; $env:TEMP = $wv2Temp; $env:TMP = $wv2Temp
+        try { $p = Start-Process -FilePath $Exe -ArgumentList '--gui', "`"$(Join-Path $work 'main.md')`"" -PassThru } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTemp }
+        [void]$started.Add($p)
+        $rects = New-Object System.Collections.ArrayList
+        $deadline = (Get-Date).AddSeconds(20)
+        $firstSeen = $null
+        while ((Get-Date) -lt $deadline) {
+            $p.Refresh()
+            $h = $p.MainWindowHandle
+            if ($h -ne 0 -and [Win32.Behaviour]::IsWindowVisible($h)) {
+                if (-not $firstSeen) { $firstSeen = Get-Date }
+                $r = New-Object Win32.Behaviour+RECT
+                [void][Win32.Behaviour]::GetWindowRect($h, [ref]$r)
+                $s = "$($r.L),$($r.T),$($r.R),$($r.B)"
+                if ($rects.Count -eq 0 -or $rects[$rects.Count - 1] -ne $s) { [void]$rects.Add($s) }
+                if ((Get-Date) -gt $firstSeen.AddSeconds(4)) { break }
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        Stop-Viewer @{ Proc = $p }
+        , $rects
+    }
+    $withSaved = Watch-WindowStart $true
+    Check 'exe: with a saved position, the window appears in place and does not move' ($withSaved.Count -eq 1) "positions seen=$($withSaved -join ' -> ')"
+    $withoutSaved = Watch-WindowStart $false
+    Check 'exe: without a saved position, the window appears in place and does not move' ($withoutSaved.Count -eq 1) "positions seen=$($withoutSaved -join ' -> ')"
+    Set-TestRegistry $null
+    # ---- A file that isn't Markdown (#55), errors at startup (#53).
+    Set-Content (Join-Path $work 'notes.txt') -Value 'SECRET-55 must not be shown' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    $v = Start-Viewer 'exe' (Join-Path $work 'notes.txt')
+    $notice = Wait-Element $v $CT::Text '^Not a Markdown file$' 15
+    $content = Find-Element $v $CT::Text 'SECRET-55'
+    Stop-Viewer $v
+    Check 'exe: a file that is not Markdown shows a notice, not its content' ([bool]$notice -and -not $content) "notice=$([bool]$notice) content shown=$([bool]$content)"
+
+    Remove-Item (Join-Path $work 'status.txt') -ErrorAction SilentlyContinue
+    $v = $null
+    try { $v = Start-Viewer 'plugin' (Join-Path $work 'notes.txt') } catch { }
+    Start-Sleep -Seconds 2
+    $status = Get-Content (Join-Path $work 'status.txt') -ErrorAction SilentlyContinue
+    if ($v) { Stop-Viewer $v }
+    Check 'plugin: a file that is not Markdown is declined (TC uses another viewer)' (-not $v -and ($status -contains 'load-failed')) "window=$([bool]$v) status=$($status -join ',')"
+
+    # Without a console (started like Explorer would), a startup error shows a message box.
+    foreach ($case in @(
+        @{ Name = 'a missing file'; Args = @('--gui', "`"$(Join-Path $work 'missing.md')`""); Text = 'not found' },
+        @{ Name = 'an unknown option'; Args = @('--no-such-option'); Text = 'Use --help' }
+    )) {
+        # Started the way Explorer starts it: from a program without a console
+        # (rundll32), so MDView can't write to one and must show a message.
+        $before = Get-Date
+        Start-Process -FilePath "$env:WINDIR\System32\rundll32.exe" -ArgumentList (@('shell32.dll,ShellExec_RunDLL', "`"$Exe`"") + $case.Args)
+        $p = $null
+        $deadline = (Get-Date).AddSeconds(10)
+        while (-not $p -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 200
+            $p = Get-Process mdview -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe -and $_.StartTime -ge $before.AddSeconds(-1) } | Select-Object -First 1
+        }
+        if (-not $p) { Check "exe: $($case.Name) at startup shows a message, then MDView exits" $false 'MDView did not start'; continue }
+        [void]$started.Add($p)
+        $sv = @{ Proc = $p }
+        $d = Wait-Dialog $sv 10
+        $text = if ($d) { Get-DialogText $d } else { '' }
+        $closedBox = if ($d) { Press-DialogButton $d 'OK' } else { $false }
+        $exited = $p.WaitForExit(5000)
+        if (-not $p.HasExited) { $p | Stop-Process -Force }
+        Check "exe: $($case.Name) at startup shows a message, then MDView exits" ([bool]$d -and $text -match [regex]::Escape($case.Text) -and $closedBox -and $exited) "message=$([bool]$d) text='$text' closed=$closedBox exited=$exited"
+    }
+
     # ---- Keys and right-click menu (#59).
     Set-Content (Join-Path $work 'keys.md') -NoNewline -Value ((@(
         '# Keys', '', 'Unique probe sentence 4711.', '', '[second link](second.md)', '',
@@ -1305,9 +1474,11 @@ function Press-DialogButton($d, $name) {
         $menu = if ($sentence) { Open-ContextMenu $v $sentence } else { [IntPtr]::Zero }
         $texts = if ($menu -ne [IntPtr]::Zero) { @(Get-MenuTexts $menu) } else { @() }
         $findText = if ($hostKind -eq 'exe') { '&Find... | Ctrl+F' } else { '&Find... | F7' }
-        $expected = '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
+        $reloadText = if ($hostKind -eq 'exe') { 'R&eload | F5' } else { 'R&eload | Ctrl+R' }
+        $expected = $reloadText, '&Back | Alt+Left (greyed)', 'Forwar&d | Alt+Right (greyed)', '&Copy | Ctrl+C (greyed)', 'Select &all | Ctrl+A', $findText, '&Print... | Ctrl+P', 'Zoom &in | Ctrl+Plus', 'Zoom o&ut | Ctrl+Minus', '&Settings... | Ctrl+,', '&Keyboard shortcuts | F1'
         $missing = @($expected | Where-Object { $texts -notcontains $_ })
-        $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Back|Refresh|Save as' })
+        # WebView2's own menu has these; MDView's Back has a key after it.
+        $webview2Items = @($texts | Where-Object { $_ -match 'Inspect|Refresh|Save as|^Back$' })
         Check "${hostKind}: right-click shows MDView's menu with the keys, not WebView2's" ($menu -ne [IntPtr]::Zero -and -not $missing -and -not $webview2Items) "menu=$($menu -ne [IntPtr]::Zero) missing=$($missing -join ',') webview2=$($webview2Items -join ',') items=$($texts -join ' / ')"
         if ($menu -ne [IntPtr]::Zero) { Send-Key 0x41 }   # A: Select all
         Start-Sleep -Milliseconds 600
@@ -1392,8 +1563,11 @@ function Press-DialogButton($d, $name) {
             for ($try = 0; $try -lt 2; $try++) {
                 Send-Key 0x4E; Start-Sleep -Milliseconds 300
                 Send-Key 0x50; Start-Sleep -Milliseconds 300
-                Send-Key 0x33; Start-Sleep -Milliseconds 600
-                $keysSeen = Get-HostKeys
+                Send-Key 0x33
+                # Until all three arrived (or 3 s), so a late key isn't counted
+                # in the check with the panel open (seen on the GitHub runner).
+                $deadline = (Get-Date).AddSeconds(3)
+                do { Start-Sleep -Milliseconds 300; $keysSeen = @(Get-HostKeys) } while ($keysSeen.Count -lt 3 -and (Get-Date) -lt $deadline)
                 if ($keysSeen.Count) { break }
                 $keysRetried = $true
             }
@@ -1442,6 +1616,258 @@ function Press-DialogButton($d, $name) {
     }
 
 
+    # ---- Reload when the file changes (#17), keeping the scroll position.
+    $autoFile = Join-Path $work 'auto.md'
+    $filler = ('filler line' + "`n`n") * 60
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-Content $autoFile -NoNewline -Value ("# Before`n`n" + $filler + "## Bottom heading`n`nend")
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind $autoFile
+        [void](Wait-Element $v $CT::Text '^Before$')
+        Start-Sleep -Milliseconds 800
+        $bottomShown = $false
+        for ($try = 0; $try -lt 2 -and -not $bottomShown; $try++) {
+            [void](Focus-Document $v); Send-CtrlKey 0x23
+            $deadline = (Get-Date).AddSeconds(2)
+            do { $b = Find-Element $v $CT::Text '^Bottom heading$'; $bottomShown = $b -and -not $b.Current.IsOffscreen; Start-Sleep -Milliseconds 200 } while (-not $bottomShown -and (Get-Date) -lt $deadline)
+        }
+        $yBefore = if ($b) { $b.Current.BoundingRectangle.Y } else { $null }
+        Set-Content $autoFile -NoNewline -Value ("# After`n`n" + $filler + "## Bottom heading`n`nend")
+        $after = Wait-Element $v $CT::Text '^After$' 8
+        Start-Sleep -Milliseconds 800
+        $b2 = Find-Element $v $CT::Text '^Bottom heading$'
+        $yAfter = if ($b2) { $b2.Current.BoundingRectangle.Y } else { $null }
+        Stop-Viewer $v
+        Check "${hostKind}: a changed file is reloaded, keeping the scroll position" ([bool]$after -and $bottomShown -and $null -ne $yAfter -and [Math]::Abs($yAfter - $yBefore) -le 4) "reloaded=$([bool]$after) at bottom=$bottomShown Y before=$yBefore after=$yAfter"
+    }
+
+    # A file on a network location is not checked (a check there could stall
+    # the window); Ctrl+R reloads it, in both programs (F5 is TC's in Lister).
+    $netFile = Join-Path $work 'onnet.md'
+    foreach ($hostKind in 'exe', 'plugin') {
+        if (-not $shareReachable) { Skip "${hostKind}: a file on a share is not reloaded by itself; Ctrl+R reloads it" '\\localhost\C$ is not reachable'; continue }
+        Set-Content $netFile -NoNewline -Value "# Net before`n`ntext"
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $shareWork 'onnet.md')
+        $shown = Wait-Element $v $CT::Text '^Net before$' 15
+        Set-Content $netFile -NoNewline -Value "# Net after`n`ntext"
+        Start-Sleep -Seconds 4
+        $notReloaded = [bool](Find-Element $v $CT::Text '^Net before$') -and -not (Find-Element $v $CT::Text '^Net after$')
+        $reloaded = $false
+        for ($try = 0; $try -lt 2 -and -not $reloaded; $try++) {
+            [void](Focus-Document $v); Send-CtrlKey 0x52
+            $reloaded = [bool](Wait-Element $v $CT::Text '^Net after$' 5)
+        }
+        Stop-Viewer $v
+        Check "${hostKind}: a file on a share is not reloaded by itself; Ctrl+R reloads it" ([bool]$shown -and $notReloaded -and $reloaded) "shown=$([bool]$shown) not reloaded by itself=$notReloaded Ctrl+R reloaded=$reloaded"
+    }
+
+    # ---- Back and forward (#46).
+    function Send-AltKey($vk) {
+        [Win32.Behaviour]::keybd_event(0x12, 0x38, 0, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 1, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event($vk, 0, 3, [UIntPtr]::Zero)
+        [Win32.Behaviour]::keybd_event(0x12, 0x38, 2, [UIntPtr]::Zero)
+    }
+    # A key once more if the page didn't change at all (input lost after a focus change).
+    function Send-AltUntil($v, $vk, $heading) {
+        for ($try = 0; $try -lt 2; $try++) {
+            [void](Focus-Document $v); Send-AltKey $vk
+            $h = Wait-Element $v $CT::Text "^$heading$" 5
+            if ($h) { return $true }
+        }
+        $false
+    }
+    $mainPath = Join-Path $work 'main.md'
+    $crossDir = if ($substDefined) { "$($substLetter):\" } else { $null }
+    if ($crossDir) {
+        Set-Content (Join-Path $crossDir 'cross.md') -NoNewline -Value ("# Cross`n`n[to main on C:](<file:///$($mainPath -replace '\\', '/')>)")
+    }
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-RemoteImagesSetting $hostKind $null
+        $v = Start-Viewer $hostKind $mainPath
+        [void](Wait-Element $v $CT::Text '^Main$')
+        $noBackAtStart = -not (Find-Element $v $CT::Button '^Back')
+        $link = Wait-Element $v $CT::Hyperlink 'Go to second' 5
+        if ($link) { Invoke-Element $link }
+        $second = Wait-Element $v $CT::Text '^Second$' 10
+        $backLine = Wait-Element $v $CT::Button '^Back to main\.md$' 5
+        $title = if ($hostKind -eq 'exe') { $v.Proc.Refresh(); $v.Proc.MainWindowTitle } else { 'second.md - MDView' }
+        if ($backLine) { Invoke-Element $backLine }
+        $backToMain = Wait-Element $v $CT::Text '^Main$' 10
+        $forward = Send-AltUntil $v 0x27 'Second'
+        $back = Send-AltUntil $v 0x25 'Main'
+        Check "${hostKind}: after a link, 'Back to main.md' and Alt+Left / Alt+Right go back and forward" ($noBackAtStart -and [bool]$second -and [bool]$backLine -and [bool]$backToMain -and $forward -and $back -and $title -eq 'second.md - MDView') "no back line at start=$noBackAtStart back line=$([bool]$backLine) back=$([bool]$backToMain) forward=$forward alt+left=$back title='$title'"
+
+        # A jump to a heading: Back returns to where the reader was.
+        $top = Find-Element $v $CT::Text '^Main$'
+        $yTop = if ($top) { $top.Current.BoundingRectangle.Y } else { $null }
+        $jump = Find-Element $v $CT::Hyperlink 'Jump to bottom'
+        if ($jump) { Invoke-Element $jump }
+        Start-Sleep -Milliseconds 800
+        $mainAway = Find-Element $v $CT::Text '^Main$'
+        $scrolled = (-not $mainAway) -or $mainAway.Current.IsOffscreen
+        $backInDoc = Wait-Element $v $CT::Button '^Back$' 5
+        if ($backInDoc) { Invoke-Element $backInDoc }
+        Start-Sleep -Milliseconds 800
+        $topAgain = Find-Element $v $CT::Text '^Main$'
+        $restored = $topAgain -and -not $topAgain.Current.IsOffscreen -and [Math]::Abs($topAgain.Current.BoundingRectangle.Y - $yTop) -le 4
+        Stop-Viewer $v
+        Check "${hostKind}: after a jump to a heading, Back returns to the place before" ($scrolled -and [bool]$backInDoc -and $restored) "scrolled=$scrolled back line=$([bool]$backInDoc) position restored=$restored"
+
+        if (-not $crossDir) { Skip "${hostKind}: Back to a document on another drive" "subst $($substLetter): was not created"; continue }
+        $v = Start-Viewer $hostKind (Join-Path $crossDir 'cross.md')
+        $link = Wait-Element $v $CT::Hyperlink 'to main on C:' 15
+        if ($link) { Invoke-Element $link }
+        $onMain = Wait-Element $v $CT::Text '^Main$' 10
+        $crossAgain = Send-AltUntil $v 0x25 'Cross'
+        Stop-Viewer $v
+        Check "${hostKind}: Back to a document on another drive shows it again" ([bool]$onMain -and $crossAgain) "on main=$([bool]$onMain) back on cross=$crossAgain"
+    }
+
+    # ---- File > Recent Files shows the path (#44), shortened in the middle,
+    # with & shown, and the full path as a tooltip on the highlighted item.
+    $deepDir = Join-Path $work 'recent\a-folder-with-a-long-name\another-folder-with-a-long-name\third-folder-name'
+    New-Item -ItemType Directory -Force $deepDir | Out-Null
+    $deepFile = Join-Path $deepDir 'notes.md'
+    Set-Content $deepFile '# Deep' -NoNewline
+    New-Item -ItemType Directory -Force (Join-Path $work 'R&D') | Out-Null
+    $ampFile = Join-Path $work 'R&D\a&b.md'
+    Set-Content -LiteralPath $ampFile '# Amp' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    if (-not (Test-Path $recentKey)) { New-Item -Path $recentKey -Force | Out-Null }
+    foreach ($i in 0..9) { Remove-ItemProperty -Path $recentKey -Name "File$i" -ErrorAction SilentlyContinue }
+    Set-ItemProperty -Path $recentKey -Name File0 -Value $deepFile -Type String
+    Set-ItemProperty -Path $recentKey -Name File1 -Value $ampFile -Type String
+    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+    [void](Wait-Element $v $CT::Text '^Second$')
+    $menuTexts = @(); $tips = @()
+    for ($try = 0; $try -lt 2 -and -not $menuTexts.Count; $try++) {
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        # The File menu, as Alt+F opens it (WM_SYSCOMMAND SC_KEYMENU 'f'), without
+        # depending on which window has the keyboard focus.
+        [void][Win32.Behaviour]::PostMessage([IntPtr]$v.Win.Current.NativeWindowHandle, 0x0112, [IntPtr]0xF100, [IntPtr][int][char]'f')
+        $deadline = (Get-Date).AddSeconds(3)
+        do { Start-Sleep -Milliseconds 200; $m = Find-Menu $v } while ($m -eq [IntPtr]::Zero -and (Get-Date) -lt $deadline)
+        if ($m -ne [IntPtr]::Zero) { $menuTexts = @(Get-MenuTexts $m) }
+    }
+    if ($menuTexts.Count) {
+        # Down through the items; collect the tooltips shown on the way.
+        for ($i = 0; $i -lt 6; $i++) {
+            Send-Key 0x28; Start-Sleep -Milliseconds 1200
+            $tip = Get-Tooltip $v
+            if ($tip) { $tips += $tip }
+        }
+        Send-Escape; Start-Sleep -Milliseconds 200; Send-Escape
+    }
+    Stop-Viewer $v
+    $deepItem = $menuTexts | Where-Object { $_ -like '*notes.md' } | Select-Object -First 1
+    $ampItem = $menuTexts | Where-Object { $_ -like '*a&&b.md' } | Select-Object -First 1
+    Check 'exe: Recent Files show the path, shortened in the middle, with & shown' ($deepItem -match '\\\.\.\.\\' -and $deepItem -like '*\third-folder-name\notes.md' -and $ampItem -like '*R&&D\a&&b.md') "items=$($menuTexts -join ' / ')"
+    Check 'exe: the highlighted recent file shows its full path as a tooltip' ($tips -contains $deepFile) "tooltips=$($tips -join ' / ')"
+
+    # ---- Drag and drop on the standalone viewer (#54). Last, so a drag that
+    # doesn't end can't affect another check. A small window here
+    # starts a real OLE drag with the files while a second thread moves the
+    # mouse onto MDView and releases it; DoDragDrop says whether MDView
+    # accepted the drop (Copy) or refused it (None).
+    # PowerShell 7 references only the listed assemblies: Thread lives in its own one.
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Windows.Forms.Primitives, System.Threading.Thread, System.ComponentModel.Primitives, System.Collections, System.Threading -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Windows.Forms;
+public static class DragTest {
+    [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+    [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
+    // Returns DoDragDrop's effect (Copy / None), or "timeout (...)" with how far
+    // the drag got. A drag that doesn't end is cancelled by the source, so
+    // the mouse is free for the next test and the thread never keeps the
+    // test process alive.
+    // The effects the target answered during the last drag, in order.
+    public static string LastEffects = "";
+    public static string Drag(string[] files, int fromX, int fromY, int toX, int toY) {
+        string result = null;
+        string stage = "thread started";
+        bool buttonDown = false;
+        bool cancel = false;
+        var effects = new System.Collections.Generic.List<string>();
+        Form form = null;
+        var t = new Thread(() => {
+            form = new Form { StartPosition = FormStartPosition.Manual, Left = fromX - 40, Top = fromY - 40, Width = 80, Height = 80, TopMost = true, ShowInTaskbar = false, Text = "drag source" };
+            form.Shown += (s, e) => {
+                stage = "form shown";
+                SetCursorPos(fromX, fromY);
+                mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero);
+                buttonDown = (GetAsyncKeyState(0x01) & 0x8000) != 0;
+                var mover = new Thread(() => {
+                    Thread.Sleep(400);
+                    for (int i = 1; i <= 25; i++) { SetCursorPos(fromX + (toX - fromX) * i / 25, fromY + (toY - fromY) * i / 25); mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero); Thread.Sleep(40); }
+                    Thread.Sleep(600);
+                    stage = "button released";
+                    mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+                });
+                mover.IsBackground = true;
+                mover.Start();
+                stage = "dragging";
+                // What the window under the cursor answered (MDView's drop target, or none).
+                form.GiveFeedback += (s2, e2) => { var x = e2.Effect.ToString(); lock (effects) { if (effects.Count == 0 || effects[effects.Count - 1] != x) effects.Add(x); } };
+                form.QueryContinueDrag += (s2, e2) => { if (cancel) e2.Action = DragAction.Cancel; };
+                var effect = form.DoDragDrop(new DataObject(DataFormats.FileDrop, files), DragDropEffects.Copy);
+                result = effect.ToString();
+                form.Close();
+            };
+            Application.Run(form);
+        });
+        t.IsBackground = true;
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        bool ended = t.Join(20000);
+        lock (effects) { LastEffects = string.Join(">", effects); }
+        if (ended) return result ?? "no result";
+        string seen = "timeout (stage: " + stage + ", button down after press: " + buttonDown + ")";
+        // No Esc: it would reach MDView and close it. The source cancels the drag.
+        cancel = true;
+        mouse_event(0x0001, 0, 0, 0, UIntPtr.Zero);
+        mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero);
+        if (!t.Join(5000)) {
+            try { if (form != null) form.BeginInvoke(new Action(() => form.Close())); } catch { }
+            t.Join(3000);
+        }
+        return seen;
+    }
+}
+'@
+    Set-Content (Join-Path $work 'dropped.md') '# Dropped document' -NoNewline
+    Set-Content (Join-Path $work 'dropped.txt') 'not markdown' -NoNewline
+    Set-RemoteImagesSetting 'exe' $null
+    $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+    [void](Wait-Element $v $CT::Text '^Second$')
+    $wr = $v.Win.Current.BoundingRectangle
+    $toX = [int]($wr.X + $wr.Width / 2); $toY = [int]($wr.Y + $wr.Height / 2)
+    $fromX = [int]([Math]::Max(60, $wr.X - 60)); $fromY = $toY
+    if ($fromX + 60 -gt $wr.X) { $fromX = [int]($wr.X + 20); $fromY = [int]($wr.Y + 5) }
+    $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY); $txtFx = [DragTest]::LastEffects
+    # A drag that never got any feedback (not even from the drag source's own
+    # window) never moved: the machine doesn't deliver the injected mouse input
+    # to the drag loop (seen on the GitHub runner). That says nothing about
+    # MDView, so the drop checks are skipped, with the reason.
+    if ($txt -like 'timeout*' -and -not $txtFx) {
+        Stop-Viewer $v
+        $why = "the test's drag never moved on this machine: $txt"
+        Skip 'exe: other files and several files cannot be dropped' $why
+        Skip 'exe: a dropped Markdown file is accepted and opened' $why
+    } else {
+        $two = [DragTest]::Drag(@((Join-Path $work 'dropped.md'), (Join-Path $work 'second.md')), $fromX, $fromY, $toX, $toY)
+        $stillSecond = [bool](Find-Element $v $CT::Text '^Second$')
+        $md = [DragTest]::Drag(@((Join-Path $work 'dropped.md')), $fromX, $fromY, $toX, $toY); $mdFx = [DragTest]::LastEffects
+        $opened = Wait-Element $v $CT::Text '^Dropped document$' 10
+        Stop-Viewer $v
+        Check 'exe: other files and several files cannot be dropped' ($txt -eq 'None' -and $two -eq 'None' -and $stillSecond) "txt=$txt (effects $txtFx) two files=$two document unchanged=$stillSecond"
+        Check 'exe: a dropped Markdown file is accepted and opened' ($md -eq 'Copy' -and [bool]$opened) "drop=$md (effects $mdFx) opened=$([bool]$opened)"
+    }
 }
 catch {
     # An error in the test itself is a failure, never a silent pass.
@@ -1460,6 +1886,7 @@ finally {
         $key = 'HKCU:\Software\MDView'   # in case a check overwrote the name
         if (Get-Command Restore-Registry -ErrorAction SilentlyContinue) { Restore-Registry }
     }
+    Cleanup 'restore File > Recent Files' { if (Get-Command Restore-RecentFiles -ErrorAction SilentlyContinue) { Restore-RecentFiles } }
     Cleanup 'restore the clipboard' { if ($clipboardSaved -and $null -ne $clipboardBefore) { Set-Clipboard -Value $clipboardBefore } }
     Cleanup 'remove the subst drive' { if ($substDefined) { subst "$($substLetter):" /d } }
     Cleanup 'remove the net use drive' { if ($netDefined) { net use "$($netLetter):" /delete /y | Out-Null } }

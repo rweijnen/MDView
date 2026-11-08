@@ -50,7 +50,9 @@ thread_local! {
     static CURRENT_FILES: RefCell<HashMap<isize, String>> = RefCell::new(HashMap::new());
     static DARK_MODES: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
     /// Links waiting to be handled outside the WebView2 event that reported them.
-    static PENDING_LINKS: RefCell<std::collections::VecDeque<(isize, String)>> = RefCell::new(std::collections::VecDeque::new());
+    static PENDING_LINKS: RefCell<std::collections::VecDeque<(isize, String, bool)>> = RefCell::new(std::collections::VecDeque::new());
+    /// Per viewer: messages and questions shown in the page, not answered yet (1.0.0).
+    static MESSAGES: RefCell<HashMap<isize, crate::messages::Pending<crate::links::Confirmed>>> = RefCell::new(HashMap::new());
     /// Viewers that are about to call NavigateToString, so only that
     /// navigation to a data:/about:blank page is allowed.
     static EXPECT_STRING_PAGE: RefCell<std::collections::HashSet<isize>> = RefCell::new(std::collections::HashSet::new());
@@ -64,6 +66,10 @@ thread_local! {
     static DOCUMENT_CHOICES: RefCell<HashMap<isize, crate::markdown::DocumentChoices>> = RefCell::new(HashMap::new());
     /// Viewers with a settings or help panel open: no right-click menu (#59).
     static PANEL_OPEN: RefCell<std::collections::HashSet<isize>> = RefCell::new(std::collections::HashSet::new());
+    /// Per viewer: the shown document's file, watched for changes (#17).
+    static WATCH: RefCell<HashMap<isize, crate::watch::Watch>> = RefCell::new(HashMap::new());
+    /// Per viewer: the documents shown, with their real paths (#46).
+    static HISTORY: RefCell<HashMap<isize, crate::history::History>> = RefCell::new(HashMap::new());
     /// Per viewer: the right-click waiting for its menu (see `show_context_menu`).
     static PENDING_MENU: RefCell<HashMap<isize, crate::contextmenu::Request>> = RefCell::new(HashMap::new());
 }
@@ -74,6 +80,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
+/// Timer that checks the shown document's file for changes (#17).
+const WATCH_TIMER: usize = 0x4D57;
 
 pub fn create_viewer(
     parent: HWND,
@@ -131,6 +139,9 @@ pub fn create_viewer(
             let _ = DestroyWindow(hwnd);
             return Err(e);
         }
+
+        // Check the shown document for changes (#17).
+        SetTimer(Some(hwnd), WATCH_TIMER, crate::watch::INTERVAL_MS, None);
 
         Ok(hwnd)
     }
@@ -242,6 +253,17 @@ fn create_virtual_resource_response(
         } else {
             match crate::files::read_text(file_path) {
                 Ok(markdown_content) => {
+                    // This version is the one shown: watch it for changes (#17).
+                    // Not on a network location: a check there could stall
+                    // Total Commander; Ctrl+R reloads it.
+                    WATCH.with(|w| {
+                        let mut all = w.borrow_mut();
+                        if crate::vpath::on_network(file_path, crate::vpath::drive_kind) {
+                            all.remove(&(hwnd.0 as isize));
+                        } else {
+                            all.insert(hwnd.0 as isize, crate::watch::Watch::new(file_path, crate::watch::stamp(file_path)));
+                        }
+                    });
                     let remote_images = remote_images_for(hwnd, file_path);
                     // The plugin never asks to register (#37): TC is the host.
                     let bars = DOCUMENT_CHOICES.with(|c| {
@@ -458,6 +480,11 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                     windows::Win32::System::Com::CoTaskMemFree(
                                                         Some(uri_ptr.0 as *const _),
                                                     );
+                                                    if !is_internal_virtual_url(&uri) {
+                                                        let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT::default();
+                                                        let _ = args.ResourceContext(&mut context);
+                                                        log_debug(&format!("resource request: {uri} (context {})", context.0));
+                                                    }
                                                     let response = if is_internal_virtual_url(&uri) {
                                                         create_response_for_virtual_url(
                                                             hwnd,
@@ -493,6 +520,8 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let nav_handler = webview2_com::NavigationStartingEventHandler::create(
                                 Box::new(move |_webview, args| {
                                     crate::linkstatus::hide(hwnd);
+                                    // A message shown on the page leaves with it.
+                                    MESSAGES.with(|m| { if let Some(p) = m.borrow_mut().get_mut(&(hwnd.0 as isize)) { p.page_left(); } });
                                     if let Some(args) = args {
                                         let mut uri_ptr: windows::core::PWSTR =
                                             windows::core::PWSTR::null();
@@ -503,12 +532,16 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             windows::Win32::System::Com::CoTaskMemFree(Some(
                                                 uri_ptr.0 as *const _,
                                             ));
+                                            log_debug(&format!("navigation starting: {uri} ({:?}, user={})", navigation_kind(&args), user_initiated.as_bool()));
+                                            // Never opened elsewhere from here: WebView2 can call a
+                                            // navigation the document started itself (<meta refresh>,
+                                            // S5) user-initiated. Clicked links reach the link policy
+                                            // through the page script (`openLink`).
                                             if !navigation_allowed(hwnd, &uri) {
                                                 let _ = args.SetCancel(true);
                                                 log_debug(&format!("blocked navigation to {uri}"));
-                                                if user_initiated.as_bool() {
-                                                    queue_link(hwnd, uri);
-                                                }
+                                            } else if crate::vpath::is_document_origin(&uri) {
+                                                document_navigation(hwnd, navigation_kind(&args), &uri);
                                             }
                                         } else {
                                             let _ = args.SetCancel(true);
@@ -520,26 +553,51 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                             let mut nav_token: i64 = 0;
                             let _ = webview.add_NavigationStarting(&nav_handler, &mut nav_token);
 
-                            // No new windows: a link the user opened in a new
-                            // window goes through the link policy.
+                            // Debug log: where each navigation ended up (to trace a
+                            // cancelled navigation that still loaded, attack case S5).
+                            let completed_handler = webview2_com::NavigationCompletedEventHandler::create(Box::new(
+                                move |webview, args| {
+                                    let mut success = windows::core::BOOL(0);
+                                    let mut status = COREWEBVIEW2_WEB_ERROR_STATUS::default();
+                                    if let Some(args) = args {
+                                        let _ = args.IsSuccess(&mut success);
+                                        let _ = args.WebErrorStatus(&mut status);
+                                    }
+                                    let mut source = windows::core::PWSTR::null();
+                                    let source = match webview {
+                                        Some(w) if w.Source(&mut source).is_ok() && !source.is_null() => {
+                                            let s = source.to_string().unwrap_or_default();
+                                            windows::Win32::System::Com::CoTaskMemFree(Some(source.0 as *const _));
+                                            s
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    log_debug(&format!("navigation completed: success={} status={} source={source}", success.as_bool(), status.0));
+                                    Ok(())
+                                },
+                            ));
+                            let mut completed_token: i64 = 0;
+                            let _ = webview.add_NavigationCompleted(&completed_handler, &mut completed_token);
+
+                            // Back is possible or not any more: tell the page (#46).
+                            let history_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
+                                move |_webview, _args| {
+                                    post_history(hwnd);
+                                    Ok(())
+                                },
+                            ));
+                            let mut history_token: i64 = 0;
+                            let _ = webview.add_HistoryChanged(&history_handler, &mut history_token);
+
+                            // No new windows, and nothing opened from here (see S5 at
+                            // NavigationStarting): a link opened with Shift+click or the
+                            // middle button reaches the link policy through the page script.
                             let new_window_handler =
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
                                             let _ = args.SetHandled(true);
-                                            let mut user_initiated = windows::core::BOOL(0);
-                                            let _ = args.IsUserInitiated(&mut user_initiated);
-                                            let mut uri_ptr = windows::core::PWSTR::null();
-                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
-                                                let uri = uri_ptr.to_string().unwrap_or_default();
-                                                windows::Win32::System::Com::CoTaskMemFree(Some(
-                                                    uri_ptr.0 as *const _,
-                                                ));
-                                                log_debug(&format!("blocked new window for {uri}"));
-                                                if user_initiated.as_bool() {
-                                                    queue_link(hwnd, uri);
-                                                }
-                                            }
+                                            log_debug("blocked a new window");
                                         }
                                         Ok(())
                                     },
@@ -584,6 +642,19 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 if let Some(url) = virtual_url_for_file(Path::new(&current_file)) {
                                     let url_wide = pwstr_from_str(&url);
                                     let _ = webview.Navigate(PCWSTR(url_wide.as_ptr()));
+                                } else {
+                                    // #53: a page that says why, never an empty window.
+                                    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+                                    let notice = crate::markdown::wrap_html(
+                                        &crate::markdown::notice_html("MDView cannot show this file", &current_file, crate::markdown::NO_ADDRESS),
+                                        dark,
+                                        crate::markdown::RemoteImages::Blocked,
+                                        &[],
+                                        &page_look(),
+                                    );
+                                    let notice_wide = pwstr_from_str(&notice);
+                                    EXPECT_STRING_PAGE.with(|e| e.borrow_mut().insert(hwnd.0 as isize));
+                                    let _ = webview.NavigateToString(PCWSTR(notice_wide.as_ptr()));
                                 }
                             } else {
                                 let html_wide = pwstr_from_str(&html_for_nav);
@@ -814,12 +885,15 @@ fn cleanup_viewer_state(hwnd: HWND) {
         m.borrow_mut().remove(&(hwnd.0 as isize));
     });
     let key = hwnd.0 as isize;
-    PENDING_LINKS.with(|q| q.borrow_mut().retain(|(k, _)| *k != key));
+    PENDING_LINKS.with(|q| q.borrow_mut().retain(|(k, _, _)| *k != key));
+    MESSAGES.with(|m| m.borrow_mut().remove(&key));
     EXPECT_STRING_PAGE.with(|e| e.borrow_mut().remove(&key));
     REMOTE_IMAGES_ONCE.with(|o| o.borrow_mut().remove(&key));
     PAGE_ALLOWS_REMOTE_IMAGES.with(|a| a.borrow_mut().remove(&key));
     PAGE_BARS.with(|b| b.borrow_mut().remove(&key));
     DOCUMENT_CHOICES.with(|c| c.borrow_mut().remove(&key));
+    WATCH.with(|w| w.borrow_mut().remove(&key));
+    HISTORY.with(|h| h.borrow_mut().remove(&key));
     PANEL_OPEN.with(|p| p.borrow_mut().remove(&key));
     PENDING_MENU.with(|m| m.borrow_mut().remove(&key));
 }
@@ -933,6 +1007,19 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        // #17: reload the shown document once its file has changed.
+        WM_TIMER if wparam.0 == WATCH_TIMER => {
+            let changed = WATCH.with(|w| {
+                w.borrow_mut().get_mut(&(hwnd.0 as isize)).is_some_and(|w| {
+                    let now = crate::watch::stamp(&w.path);
+                    w.tick(now)
+                })
+            });
+            if changed {
+                reload_page(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             crate::linkstatus::hide(hwnd);
             resize_webview(hwnd);
@@ -1068,15 +1155,14 @@ fn post_network_blocked(hwnd: HWND) {
 }
 
 /// Send a message to this viewer's page (`PostWebMessageAsJson`).
-fn post_to_page(hwnd: HWND, json: &str) {
+/// Returns whether it could be sent.
+fn post_to_page(hwnd: HWND, json: &str) -> bool {
     CONTROLLERS.with(|c| {
-        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
-            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
-                let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) };
-            }
-        }
-    });
+        let Some(controller) = c.borrow().get(&(hwnd.0 as isize)).cloned() else { return false };
+        let Ok(webview) = (unsafe { controller.CoreWebView2() }) else { return false };
+        let wide: Vec<u16> = json.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe { webview.PostWebMessageAsJson(PCWSTR(wide.as_ptr())) }.is_ok()
+    })
 }
 
 /// Ctrl+, (#50): the page shows the settings panel with the plugin's settings.
@@ -1105,7 +1191,7 @@ fn post_key_to_lister(hwnd: HWND, vk: u16) {
 /// reported the click.
 fn show_context_menu(hwnd: HWND) {
     let Some(request) = PENDING_MENU.with(|m| m.borrow_mut().remove(&(hwnd.0 as isize))) else { return };
-    let items = crate::shortcuts::menu_items(request.link.is_some(), request.has_selection, crate::settings::zoom(), true);
+    let items = crate::shortcuts::menu_items(request.link.is_some(), request.has_selection, can_go(hwnd), crate::settings::zoom(), true);
     if let Some(command) = crate::contextmenu::show(hwnd, request.screen, &items) {
         run_menu_command(hwnd, command, request.link.as_deref());
     }
@@ -1116,7 +1202,7 @@ fn run_menu_command(hwnd: HWND, command: crate::shortcuts::MenuCommand, link: Op
     match command {
         OpenLink => {
             if let Some(url) = link {
-                queue_link(hwnd, url.to_string());
+                queue_link(hwnd, url.to_string(), false);
             }
         }
         CopyLink => {
@@ -1142,6 +1228,9 @@ fn run_menu_command(hwnd: HWND, command: crate::shortcuts::MenuCommand, link: Op
         ZoomIn => handle_zoom(hwnd, "in"),
         ZoomOut => handle_zoom(hwnd, "out"),
         ZoomReset => handle_zoom(hwnd, "reset"),
+        Back => go(hwnd, true),
+        Forward => go(hwnd, false),
+        Reload => reload_page(hwnd),
         Settings => open_settings(hwnd),
         Help => open_help(hwnd),
     }
@@ -1159,7 +1248,12 @@ fn save_settings(hwnd: HWND, msg: &HashMap<String, String>) {
             post_to_page(hwnd, &crate::settings_page::saved_message());
             reload_page(hwnd);
         }
-        Err(text) => post_to_page(hwnd, &crate::settings_page::error_message(&text)),
+        Err(text) => {
+            // The settings panel shows it; if the page is gone, a message.
+            if !post_to_page(hwnd, &crate::settings_page::error_message(&text)) {
+                show_error(hwnd, &text);
+            }
+        }
     }
 }
 
@@ -1226,6 +1320,70 @@ fn is_internal_virtual_url(url: &str) -> bool {
 /// origin, and a page MDView itself loads with NavigateToString. Everything
 /// else (script or <meta refresh> navigation, other files, other sites) is
 /// cancelled; a link the user clicked goes through `queue_link`.
+/// What kind of navigation WebView2 starts (new document, back/forward, reload).
+fn navigation_kind(args: &ICoreWebView2NavigationStartingEventArgs) -> crate::history::Kind {
+    let Ok(args3) = args.cast::<ICoreWebView2NavigationStartingEventArgs3>() else { return crate::history::Kind::New };
+    let mut kind = COREWEBVIEW2_NAVIGATION_KIND::default();
+    if unsafe { args3.NavigationKind(&mut kind) }.is_err() {
+        return crate::history::Kind::New;
+    }
+    match kind {
+        COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD => crate::history::Kind::BackOrForward,
+        COREWEBVIEW2_NAVIGATION_KIND_RELOAD => crate::history::Kind::Reload,
+        _ => crate::history::Kind::New,
+    }
+}
+
+/// A document navigation starts (#46): this viewer's history gives the real
+/// path, which becomes the current document before WebView2 asks for the
+/// page (a document URL doesn't name the drive or share).
+fn document_navigation(hwnd: HWND, kind: crate::history::Kind, uri: &str) {
+    let key = hwnd.0 as isize;
+    let path = HISTORY.with(|h| {
+        h.borrow_mut()
+            .entry(key)
+            .or_default()
+            .navigate(kind, uri, |u| resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from))
+    });
+    if let Some(path) = path {
+        CURRENT_FILES.with(|f| f.borrow_mut().insert(key, path.to_string_lossy().into_owned()));
+    }
+}
+
+/// Tell this viewer's page whether it can go back, and to which document.
+fn post_history(hwnd: HWND) {
+    let key = hwnd.0 as isize;
+    let can_go = can_go(hwnd);
+    let previous = HISTORY.with(|h| h.borrow().get(&key).and_then(|h| h.previous_name()));
+    post_to_page(hwnd, &crate::history::history_message(can_go.back, previous.as_deref()));
+}
+
+fn can_go(hwnd: HWND) -> crate::shortcuts::CanGo {
+    CONTROLLERS
+        .with(|c| {
+            let controller = c.borrow().get(&(hwnd.0 as isize)).cloned()?;
+            let webview = unsafe { controller.CoreWebView2() }.ok()?;
+            let (mut back, mut forward) = (windows::core::BOOL(0), windows::core::BOOL(0));
+            unsafe {
+                let _ = webview.CanGoBack(&mut back);
+                let _ = webview.CanGoForward(&mut forward);
+            }
+            Some(crate::shortcuts::CanGo { back: back.as_bool(), forward: forward.as_bool() })
+        })
+        .unwrap_or_default()
+}
+
+/// Back or forward in this viewer's history (right-click menu).
+fn go(hwnd: HWND, back: bool) {
+    CONTROLLERS.with(|c| {
+        if let Some(controller) = c.borrow().get(&(hwnd.0 as isize)) {
+            if let Ok(webview) = unsafe { controller.CoreWebView2() } {
+                let _ = unsafe { if back { webview.GoBack() } else { webview.GoForward() } };
+            }
+        }
+    });
+}
+
 fn navigation_allowed(hwnd: HWND, url: &str) -> bool {
     if crate::vpath::is_document_origin(url) {
         return resolve_virtual_mdview_url(hwnd, url)
@@ -1248,8 +1406,10 @@ fn is_trusted_page(hwnd: HWND, source: &str) -> bool {
 
 /// Handle a link outside of the WebView2 event that reported it, so the
 /// confirmation dialog is not shown from inside a WebView2 callback.
-fn queue_link(hwnd: HWND, url: String) {
-    PENDING_LINKS.with(|q| q.borrow_mut().push_back((hwnd.0 as isize, url)));
+/// `ctrl`: the user Ctrl+clicked (a program link may then be run after a
+/// warning).
+fn queue_link(hwnd: HWND, url: String, ctrl: bool) {
+    PENDING_LINKS.with(|q| q.borrow_mut().push_back((hwnd.0 as isize, url, ctrl)));
     let _ = unsafe { PostMessageW(Some(hwnd), WM_MDVIEW_LINK, WPARAM(0), LPARAM(0)) };
 }
 
@@ -1258,18 +1418,20 @@ fn handle_queued_links(hwnd: HWND) {
     loop {
         let next = PENDING_LINKS.with(|q| {
             let mut q = q.borrow_mut();
-            let pos = q.iter().position(|(k, _)| *k == key)?;
-            q.remove(pos).map(|(_, url)| url)
+            let pos = q.iter().position(|(k, _, _)| *k == key)?;
+            q.remove(pos).map(|(_, url, ctrl)| (url, ctrl))
         });
-        let Some(url) = next else { break };
-        // Dialogs belong to Total Commander's Lister window.
-        let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
+        let Some((url, ctrl)) = next else { break };
         let action = crate::links::classify_url(&url, |u| {
             resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from)
         }, |p| network_location(hwnd, p));
-        crate::links::perform(action, owner, |path| {
-            load_file_into_viewer(hwnd, &path.to_string_lossy())
-        });
+        crate::links::perform(
+            action,
+            ctrl,
+            hwnd,
+            |path| load_file_into_viewer(hwnd, &path.to_string_lossy()),
+            |message, action| tell(hwnd, message, action),
+        );
     }
 }
 
@@ -1277,14 +1439,18 @@ fn handle_queued_links(hwnd: HWND) {
 fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) {
     match msg.get("type").map(String::as_str) {
         Some("close") => close_lister(hwnd),
+        // A link the user clicked that isn't a Markdown document (S5): the
+        // link policy decides; `ctrl` for Ctrl+click.
         Some("openLink") => {
             if let Some(url) = msg.get("url") {
-                queue_link(hwnd, url.clone());
+                queue_link(hwnd, url.clone(), msg.get("ctrl").map(String::as_str) == Some("true"));
             }
         }
         Some("networkStatus") => post_network_blocked(hwnd),
+        Some("messageShown") | Some("messageChoice") => handle_message_reply(hwnd, msg),
         Some("openSettings") => open_settings(hwnd),
         Some("openHelp") => open_help(hwnd),
+        Some("historyStatus") => post_history(hwnd),
         Some("panel") => PANEL_OPEN.with(|p| {
             let key = hwnd.0 as isize;
             if msg.get("open").map(String::as_str) == Some("true") { p.borrow_mut().insert(key); } else { p.borrow_mut().remove(&key); }
@@ -1428,14 +1594,85 @@ fn save_remote_images_setting(hwnd: HWND, setting: crate::settings::AskSetting) 
     }
 }
 
-/// Something the user asked for failed: say so, owned by TC's Lister window.
+/// Something the user asked for failed: say so, in the page (1.0.0).
 pub(crate) fn show_error(hwnd: HWND, message: &str) {
     log_debug(message);
+    tell(hwnd, crate::messages::Message::error(message), None);
+}
+
+/// Timer ids for messages waiting for the page's confirmation (base + id).
+const MESSAGE_TIMER: usize = 0x4D50_0000;
+/// How long the page may take to confirm a message before it is shown in a
+/// message box instead.
+const MESSAGE_CONFIRM_MS: u32 = 1500;
+
+/// Show a message or ask a question in this viewer's page. If the page can't
+/// show it (it may be reloading), a message box owned by TC's Lister window
+/// shows it instead, so it is never lost. `action` runs on "yes".
+fn tell(hwnd: HWND, message: crate::messages::Message, action: Option<crate::links::Confirmed>) {
+    let key = hwnd.0 as isize;
+    let id = MESSAGES.with(|m| m.borrow_mut().entry(key).or_default().add(message.clone(), action));
+    let dark = DARK_MODES.with(|m| m.borrow().get(&key).copied().unwrap_or(false));
+    if post_to_page(hwnd, &crate::messages::show_json(id, &message, dark)) {
+        unsafe { SetTimer(Some(hwnd), MESSAGE_TIMER + id as usize, MESSAGE_CONFIRM_MS, Some(message_not_confirmed)) };
+    } else {
+        fall_back_to_message_box(hwnd, id);
+    }
+}
+
+unsafe extern "system" fn message_not_confirmed(hwnd: HWND, _msg: u32, event: usize, _time: u32) {
+    let _ = unsafe { KillTimer(Some(hwnd), event) };
+    fall_back_to_message_box(hwnd, event.wrapping_sub(MESSAGE_TIMER) as u64);
+}
+
+fn fall_back_to_message_box(hwnd: HWND, id: u64) {
+    let item = MESSAGES.with(|m| m.borrow_mut().get_mut(&(hwnd.0 as isize)).and_then(|p| p.not_shown(id)));
+    let Some(item) = item else { return };
+    let message = &item.message;
+    let icon = match message.tone {
+        crate::messages::Tone::Info => MB_ICONINFORMATION,
+        crate::messages::Tone::Warning => MB_ICONWARNING,
+        crate::messages::Tone::Error => MB_ICONERROR,
+    };
+    let style = if message.is_question() { MB_YESNO | MB_DEFBUTTON2 | icon } else { MB_OK | icon };
     let owner = unsafe { GetParent(hwnd) }.ok().filter(|p| !p.is_invalid()).unwrap_or(hwnd);
-    let text: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+    let text: Vec<u16> = format!("{}\0", message.text).encode_utf16().collect();
     let title: Vec<u16> = format!("{}\0", crate::settings::APP_NAME).encode_utf16().collect();
-    unsafe {
-        MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+    let yes = unsafe { MessageBoxW(Some(owner), PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), style) } == IDYES;
+    if yes {
+        if let Some(action) = item.action {
+            run_confirmed(hwnd, action);
+        }
+    }
+}
+
+/// The user said yes to a question about a link.
+fn run_confirmed(hwnd: HWND, action: crate::links::Confirmed) {
+    crate::links::run_confirmed(
+        action,
+        hwnd,
+        |path| load_file_into_viewer(hwnd, &path.to_string_lossy()),
+        |message, action| tell(hwnd, message, action),
+    );
+}
+
+/// The page confirmed or answered a message (`messageShown`, `messageChoice`).
+fn handle_message_reply(hwnd: HWND, msg: &HashMap<String, String>) {
+    let Some(id) = msg.get("id").and_then(|i| crate::messages::parse_id(i)) else { return };
+    let key = hwnd.0 as isize;
+    match msg.get("type").map(String::as_str) {
+        Some("messageShown") => {
+            MESSAGES.with(|m| m.borrow_mut().entry(key).or_default().shown(id));
+            let _ = unsafe { KillTimer(Some(hwnd), MESSAGE_TIMER + id as usize) };
+        }
+        Some("messageChoice") => {
+            let choice = msg.get("choice").map(String::as_str).unwrap_or_default();
+            let action = MESSAGES.with(|m| m.borrow_mut().get_mut(&key).and_then(|p| p.answer(id, choice)));
+            if let Some(action) = action {
+                run_confirmed(hwnd, action);
+            }
+        }
+        _ => {}
     }
 }
 

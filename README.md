@@ -11,7 +11,12 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 - **WebView2 rendering** - Modern HTML rendering with full Markdown support (GUI mode)
 - **Auto dark mode** - Follows Windows appearance settings (GUI mode)
 - **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
-- **Clickable links** - Click `.md` links to navigate, external links open in browser
+- **Clickable links** - Click `.md` links to navigate, external links open in browser; hover a link to see where it goes
+- **Back and forward** - Between documents and headings (Alt+Left / Alt+Right, mouse buttons, "Back to ..." line)
+- **Auto-refresh** - The document reloads when its file changes (files on this computer; on a network location, F5 / Ctrl+R)
+- **Zoom and fonts** - Ctrl+mouse wheel zooms (remembered); Settings (Ctrl+,) sets fonts and sizes
+- **Keyboard help** - F1 lists the keys; right-click menu with copy, find, zoom and more
+- **Safe by default** - Remote images, network files, downloaded documents and program links ask first
 - **ESC to close** - Quick keyboard navigation
 - **Code blocks** - Monospaced and shaded, with formatting preserved
 - **GitHub Flavored Markdown** - Tables, task lists, strikethrough, and more
@@ -28,9 +33,11 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 
 ### Standalone Executable
 
-1. Download `mdview.exe` from the latest release
+1. Download `mdview.exe` (x64) or `mdview-arm64.exe` (Windows on ARM) from the latest release
 2. Place it anywhere in your PATH or desired location
 3. Associate `.md` files with `mdview.exe` or run from command line
+
+On Windows on ARM, Total Commander runs as an x64 program, so it uses the x64 plugin (`mdview.wlx64`). There is no ARM64 plugin.
 
 ## Standalone Executable
 
@@ -109,23 +116,38 @@ mdview --unregister
 
 ### Keyboard Shortcuts (GUI mode)
 
+Press F1 in the viewer for the full list. In Total Commander, Lister's own keys (F3, F7, N, P, 1-7) keep working.
+
 | Key | Action |
 |-----|--------|
 | ESC | Close viewer |
-| Ctrl+O | Open file |
+| Ctrl+O | Open file (or drop a `.md` file on the window) |
 | Ctrl+F | Find in document |
+| F5 / Ctrl+R | Reload (in Total Commander: Ctrl+R) |
+| Alt+Left / Alt+Right | Back / forward |
+| Ctrl+mouse wheel, Ctrl+Plus / Ctrl+Minus, Ctrl+0 | Zoom |
+| Ctrl+, | Settings |
+| F1 | Keyboard help |
 | Click link | Navigate .md files in viewer, open external URLs in browser |
-| Ctrl+Click | Always open link in browser |
+| Ctrl+Click | Always open link in browser; for a program link, asks before running it |
 
 ### Menu Options (GUI mode)
 
 | Menu | Item | Action |
 |------|------|--------|
 | File | Open | Open a Markdown file |
+| File | Recent files | The last opened files (full path as a tooltip) |
+| File | Settings... | Fonts, sizes and remembered answers (Ctrl+,) |
 | File | Register as .md Viewer... | Add MDView to the Open With list |
 | File | Unregister as .md Viewer | Remove MDView from Open With |
 | Edit | Find... | Find in document (Ctrl+F) |
+| Go | Back / Forward | Between documents and headings |
+| Help | Keyboard shortcuts | The keys (F1) |
 | Help | About MDView | Version and license info |
+
+### Settings
+
+The standalone viewer keeps its settings in `HKCU\Software\MDView`; the Total Commander plugin keeps its own in `mdview.ini`, next to `wincmd.ini`.
 
 ## Building from Source
 
@@ -143,6 +165,9 @@ cargo build --release
 # Build x86 version (for 32-bit Total Commander)
 cargo build --release --target i686-pc-windows-msvc
 
+# Build the ARM64 standalone viewer
+cargo build --release --target aarch64-pc-windows-msvc --bin mdview
+
 # Run tests
 cargo test
 ```
@@ -156,6 +181,9 @@ After building, copy the following files for distribution:
 | `target/release/mdview.exe` | Standalone viewer (x64) |
 | `target/release/mdview_wlx.dll` | Rename to `mdview.wlx64` for TC plugin (x64) |
 | `target/i686-pc-windows-msvc/release/mdview_wlx.dll` | Rename to `mdview.wlx` for TC plugin (x86) |
+| `target/aarch64-pc-windows-msvc/release/mdview.exe` | Standalone viewer (ARM64), released as `mdview-arm64.exe` |
+
+`.\build.ps1 -Release -Package -x64 -x86 -arm64` builds all of them, renames them and makes the zip.
 
 ## Troubleshooting
 

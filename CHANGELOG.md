@@ -3,7 +3,7 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
-## v0.2.8
+## v1.0.0
 
 ### New
 - Documents downloaded from the internet (Mark of the Web) are not shown until you choose **Open**, **Open and remove the mark** or **Don't ask again**. (#24)
@@ -11,15 +11,26 @@ release workflow refuses to publish a version without a section here.
 - Hovering over a link shows where it goes in a tooltip: the web address, or the file's path. (#60)
 - Settings (Ctrl+,; in the standalone viewer also **File > Settings…**): font size (a / A / **A**), fonts for text, headings and code, and the answers given in bars (remote images, network files, downloaded documents). Each program keeps its own. (#50)
 - F1 shows the keyboard shortcuts. Right-click opens MDView's own menu: open or copy a link, copy, select all, find, print, zoom, settings. Thanks to [jumpifequal/mdview-for-Total-Commander](https://github.com/jumpifequal/mdview-for-Total-Commander) for the idea. (#59)
+- Back and forward between documents and headings: Alt+Left / Alt+Right, the mouse's back and forward buttons, a "Back to ..." line at the top of the page, **Go > Back / Forward** in the standalone viewer and in the right-click menu. (#46)
+- The document reloads by itself when its file changes, at the same place. Files on a network location are not checked; reload them with F5 or Ctrl+R (in Total Commander, Ctrl+R or **Reload** in the right-click menu). (#17)
+- Standalone viewer: a Markdown file can be dropped on the window. (#54)
+- Messages (link questions, errors) are shown inside the viewer instead of in a Windows message box. (#65)
+- A link to a program or script can be run with Ctrl+click, after a clear warning. A plain click still doesn't run it. (#66)
+- An ARM64 build of the standalone viewer, `mdview-arm64.exe`, for Windows on ARM. Total Commander runs as x64 there and uses the x64 plugin. (#51)
 
 ### Changes
 - The remote-images bar can be closed with ×; it stays closed while the document is open.
 - A link to a network location asks before opening. (#56)
 - The zoom level (Ctrl+mouse wheel, Ctrl+Plus/Minus, Ctrl+0) is remembered, also after following a link or reloading. Each program keeps its own. Thanks to [jumpifequal/mdview-for-Total-Commander](https://github.com/jumpifequal/mdview-for-Total-Commander) for the idea. (#16)
+- Standalone viewer: **File > Recent files** shows the full path, shortened if needed, with the full path as a tooltip. (#44)
 
 ### Fixes
 - Paths are shown with `\` only. (#49)
 - Total Commander plugin: N / P (next / previous file) and 1–9 (view modes) work in the document; F3 / Shift+F3 find forward and backward, match case and whole words work, and "not found" is reported; Copy, Select all and Print from Total Commander's menu work. (#59)
+- Standalone viewer: a document could make MDView open a web page in the browser by itself (`<meta refresh>`); it can't any more. Only links you click are opened.
+- Standalone viewer: errors at startup (a missing file, an unknown option) are shown in a message when there is no console, instead of nothing. (#53)
+- A file that isn't Markdown, given directly, shows a page saying MDView only opens `.md` and `.markdown` files, instead of an empty window; nothing from the file is read. The Total Commander plugin leaves such files to another viewer. (#55)
+- Standalone viewer: the window opens at its saved size and position straight away, instead of first at a default size, and follows the shortcut's "Run: maximized / minimized". (#58)
 
 ## v0.2.7
 
