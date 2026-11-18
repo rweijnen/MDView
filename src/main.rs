@@ -1589,7 +1589,7 @@ fn post_to_page(json: &str) -> bool {
 /// File > Settings... or Ctrl+, (#50): the page shows the settings panel.
 fn open_settings() {
     let (page, notes) = settings_page::current(false);
-    post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, dark_mode()));
+    post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, dark_mode(), is_windows_dark_mode()));
 }
 
 /// F1, Help > Keyboard shortcuts or the menu (#59): the page shows the keys.

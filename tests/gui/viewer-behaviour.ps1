@@ -1240,7 +1240,8 @@ function Press-DialogButton($d, $name) {
     # ---- Colours (#68): Automatic follows Windows (viewer) or TC's dark mode
     # (plugin, lcp_darkmode); Light and Dark override it. The page's background
     # is read from the screen, below the short second.md.
-    function Get-PageShade($v) {
+    # Brightness (0-255) of the page near the bottom of the window.
+    function Get-PageLevel($v) {
         $hwnd = [IntPtr]$v.Win.Current.NativeWindowHandle
         [void](Set-Foreground $hwnd)
         Start-Sleep -Milliseconds 300
@@ -1248,8 +1249,22 @@ function Press-DialogButton($d, $name) {
         [void][Win32.Behaviour]::GetWindowRect($hwnd, [ref]$r)
         $dc = [Win32.Behaviour]::GetDC([IntPtr]::Zero)
         try { $c = [Win32.Behaviour]::GetPixel($dc, [int]($r.L + ($r.R - $r.L) * 0.6), [int]($r.B - 80)) } finally { [void][Win32.Behaviour]::ReleaseDC([IntPtr]::Zero, $dc) }
-        $level = (($c -band 0xFF) + (($c -shr 8) -band 0xFF) + (($c -shr 16) -band 0xFF)) / 3
-        if ($level -lt 80) { 'dark' } elseif ($level -gt 200) { 'light' } else { "unclear ($('{0:X6}' -f $c))" }
+        [int]((($c -band 0xFF) + (($c -shr 8) -band 0xFF) + (($c -shr 16) -band 0xFF)) / 3)
+    }
+    function Get-PageShade($v) {
+        $level = Get-PageLevel $v
+        if ($level -lt 80) { 'dark' } elseif ($level -gt 200) { 'light' } else { "unclear ($level)" }
+    }
+    # With the panel open its scrim lies over the page, so the preview is
+    # measured as a change in brightness: at least 60 darker or lighter.
+    function Wait-LevelChange($v, $from, $darker, $seconds = 5) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        do {
+            $level = Get-PageLevel $v
+            if (($darker -and $level -le $from - 60) -or (-not $darker -and $level -ge $from + 60)) { return $level }
+            Start-Sleep -Milliseconds 300
+        } while ((Get-Date) -lt $deadline)
+        $level
     }
     # The page reloads after a save: wait until it shows the expected shade.
     function Wait-PageShade($v, $expected, $seconds = 8) {
@@ -1315,6 +1330,21 @@ function Press-DialogButton($d, $name) {
         Set-ThemeSetting $hostKind $null
         $v = Start-Viewer $hostKind (Join-Path $work 'second.md')
         [void](Wait-Element $v $CT::Text '^Second$')
+        $darker = $target -eq 'Dark'
+        # Esc after choosing: the preview goes away and nothing is saved.
+        $panel = Open-Settings $v
+        $group = if ($panel) { Find-In $panel $CT::Group '^Colours$' } else { $null }
+        $choice = if ($group) { Find-In $group $CT::Button "^$target$" } else { $null }
+        $open = Get-PageLevel $v
+        if ($choice) { Invoke-Element $choice }
+        $previewed = Wait-LevelChange $v $open $darker
+        [void](Set-Foreground ([IntPtr]$v.Win.Current.NativeWindowHandle))
+        Send-Escape
+        $closed = Wait-Gone $v $CT::Window '^Settings$'
+        $back = Get-PageShade $v
+        $stored = Get-ThemeSetting $hostKind
+        Check "${hostKind}: Colours > $target previews in the page at once; Esc discards it" ([bool]$choice -and [Math]::Abs($previewed - $open) -ge 60 -and $closed -and $back -eq $start -and $null -eq $stored) "choice=$([bool]$choice) level panel open=$open after choosing=$previewed closed=$closed page after Esc=$back Theme=$stored"
+
         $panel = Open-Settings $v
         $group = if ($panel) { Find-In $panel $CT::Group '^Colours$' } else { $null }
         $help = if ($panel) { Find-In $panel $CT::Text $follows } else { $null }

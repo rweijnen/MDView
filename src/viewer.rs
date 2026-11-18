@@ -152,8 +152,12 @@ pub fn create_viewer(
 /// Whether this viewer shows dark colours: the saved choice (#68), and for
 /// Automatic whether TC is in dark mode.
 fn dark_mode(hwnd: HWND) -> bool {
-    let tc_dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
-    crate::settings::theme().0.is_dark(tc_dark)
+    crate::settings::theme().0.is_dark(tc_dark_mode(hwnd))
+}
+
+/// Whether TC is in dark mode for this viewer: what Automatic means here.
+fn tc_dark_mode(hwnd: HWND) -> bool {
+    DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false))
 }
 
 fn register_window_class() -> windows::core::Result<()> {
@@ -1176,7 +1180,7 @@ fn post_to_page(hwnd: HWND, json: &str) -> bool {
 fn open_settings(hwnd: HWND) {
     let dark = dark_mode(hwnd);
     let (page, notes) = crate::settings_page::current(true);
-    post_to_page(hwnd, &crate::settings_page::show_message(&page, &notes, &crate::fonts::installed(), true, dark));
+    post_to_page(hwnd, &crate::settings_page::show_message(&page, &notes, &crate::fonts::installed(), true, dark, tc_dark_mode(hwnd)));
 }
 
 /// F1 or the menu (#59): the page shows the plugin's keys.

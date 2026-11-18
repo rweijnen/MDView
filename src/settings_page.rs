@@ -56,7 +56,9 @@ pub fn current(is_plugin: bool) -> (PageSettings, Vec<String>) {
 }
 
 /// JSON for `PostWebMessageAsJson`: the page opens the panel with these.
-pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_plugin: bool, dark: bool) -> String {
+/// `dark`: the colours shown now; `automatic_dark`: what Automatic means now
+/// (Windows or TC), for the panel's live preview (#68).
+pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_plugin: bool, dark: bool, automatic_dark: bool) -> String {
     let font_list: Vec<String> = fonts
         .iter()
         .map(|f| format!(r#"{{"name":{},"mono":{}}}"#, script_string(&f.name), f.monospace))
@@ -71,7 +73,7 @@ pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_pl
             r#"{{"type":"showSettings","program":{},"dark":{},"#,
             r#""settings":{{"textFont":{},"textSize":{},"headingFont":{},"codeFont":{},"codeSize":{},"#,
             r#""remoteImages":"{}","networkFiles":"{}","askDownloads":{},"askRegister":{},"theme":"{}"}},"#,
-            r#""themeAutomatic":{},"fonts":[{}],"notes":[{}]}}"#
+            r#""themeAutomatic":{},"automaticDark":{},"colours":{},"fonts":[{}],"notes":[{}]}}"#
         ),
         script_string(if is_plugin { "Total Commander plugin" } else { "Standalone viewer" }),
         dark,
@@ -86,6 +88,8 @@ pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_pl
         register,
         page.theme.name(),
         script_string(if is_plugin { "Automatic follows Total Commander." } else { "Automatic follows Windows." }),
+        automatic_dark,
+        crate::markdown::colours_json(),
         font_list.join(","),
         note_list.join(","),
     )
@@ -308,12 +312,16 @@ mod tests {
             ask_register: None,
             theme: Theme::Light,
         };
-        let json = show_message(&page, &["a <note>".to_string()], &installed(), true, true);
+        let json = show_message(&page, &["a <note>".to_string()], &installed(), true, true, false);
+        // The live preview (#68): what Automatic means now, and both palettes.
+        assert!(json.contains(r##""automaticDark":false,"colours":{"light":{"--mdview-bg":"#ffffff","##), "{json}");
+        assert!(json.contains(r##""dark":{"--mdview-bg":"#1e1e1e","##), "{json}");
         assert!(json.starts_with(r#"{"type":"showSettings","program":"Total Commander plugin","dark":true,"#), "{json}");
         // Automatic means TC's dark mode in the plugin, Windows' in the viewer.
         assert!(json.contains(r#""themeAutomatic":"Automatic follows Total Commander.""#), "{json}");
         assert!(json.contains(r#""theme":"light""#), "{json}");
-        let viewer = show_message(&page, &[], &installed(), false, false);
+        let viewer = show_message(&page, &[], &installed(), false, false, true);
+        assert!(viewer.contains(r#""automaticDark":true,"#), "{viewer}");
         assert!(viewer.contains(r#""themeAutomatic":"Automatic follows Windows.""#), "{viewer}");
         assert!(json.contains(r#""textFont":"Georgia","textSize":14,"headingFont":"","#));
         assert!(json.contains(r#""remoteImages":"ask","networkFiles":"always","askDownloads":true,"askRegister":null"#));
