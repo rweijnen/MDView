@@ -2465,7 +2465,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         SetTimer(Some(hwnd), WATCH_TIMER, watch::INTERVAL_MS, None);
 
         // Dropping a Markdown file on the window (#54).
-        if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
+        if let Err(e) = droptarget::register(hwnd, DROP_TIMER) {
             message_box(
                 Some(hwnd),
                 &messages::Message::warning(format!("Dropping files on this window will not work:\n\n{e}")),
@@ -2578,8 +2578,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
-/// A Markdown file was dropped on the window (#54): open it.
-const WM_MDVIEW_DROP: u32 = WM_APP + 4;
+/// Collects one drop's reports, then opens or explains it (#54, droptarget.rs).
+const DROP_TIMER: usize = 0x4D44;
 /// Timer that checks the shown document's file for changes (#17).
 const WATCH_TIMER: usize = 0x4D57;
 
@@ -2829,7 +2829,7 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                                 let uri = uri_ptr.to_string().unwrap_or_default();
                                                 windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.0 as *const _));
                                                 if let (Some(dropped), Some(hwnd)) = (droptarget::page_drop(&uri), MAIN_HWND.with(|h| *h.borrow())) {
-                                                    droptarget::announce(hwnd, WM_MDVIEW_DROP, dropped);
+                                                    droptarget::announce(hwnd, DROP_TIMER, dropped);
                                                 }
                                             }
                                         }
@@ -3073,14 +3073,11 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_MDVIEW_DROP => {
-            match droptarget::take_dropped() {
-                Some(droptarget::Dropped::Markdown(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
-                Some(droptarget::Dropped::NotMarkdown(what)) => tell(
-                    hwnd,
-                    messages::Message::warning(format!("MDView only opens Markdown files (.md, .markdown):\n\n{what}")),
-                    None,
-                ),
+        WM_TIMER if wparam.0 == DROP_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DROP_TIMER) };
+            match droptarget::take_drop() {
+                Some(droptarget::Outcome::Open(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
+                Some(droptarget::Outcome::Tell(text)) => tell(hwnd, messages::Message::warning(text), None),
                 None => {}
             }
             LRESULT(0)

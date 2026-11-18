@@ -12,7 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{HWND, LPARAM, POINTL, WPARAM};
+use windows::Win32::Foundation::{HWND, POINTL};
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, RegisterDragDrop,
@@ -20,7 +20,7 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::SetTimer;
 use windows::core::{Ref, implement};
 
 /// The one Markdown file in a drop, if that is what it is.
@@ -81,27 +81,59 @@ pub fn page_drop(url: &str) -> Option<Dropped> {
     })
 }
 
+/// What MDView does with a drop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Open(PathBuf),
+    /// Nothing is opened; the user is told why.
+    Tell(String),
+}
+
+/// One drop can arrive as several reports (WebView2 asks for a window per
+/// dropped file, ~2 ms apart): reports within this time are one drop.
+pub const COLLECT_MS: u32 = 150;
+
+/// What one drop means: one Markdown file is opened; anything else is
+/// explained, never ignored.
+pub fn outcome(drops: &[Dropped]) -> Option<Outcome> {
+    match drops {
+        [] => None,
+        [Dropped::Markdown(path)] => Some(Outcome::Open(path.clone())),
+        [Dropped::NotMarkdown(what)] => {
+            Some(Outcome::Tell(format!("MDView only opens Markdown files (.md, .markdown):\n\n{what}")))
+        }
+        _ => Some(Outcome::Tell("Drop one Markdown file at a time.".to_string())),
+    }
+}
+
 thread_local! {
-    /// What was dropped, waiting for the window message that handles it.
-    static DROPPED: RefCell<Option<Dropped>> = const { RefCell::new(None) };
+    /// The reports of the drop being collected (see `announce`).
+    static DROPPED: RefCell<Vec<Dropped>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Keep `dropped` and post `message` to `window`; the window procedure then
-/// calls `take_dropped`.
-pub fn announce(window: HWND, message: u32, dropped: Dropped) {
-    DROPPED.with(|d| *d.borrow_mut() = Some(dropped));
-    let _ = unsafe { PostMessageW(Some(window), message, WPARAM(0), LPARAM(0)) };
+/// Add a report to the drop being collected; the first one starts `timer` on
+/// `window`, after which the window procedure calls `take_drop`.
+pub fn announce(window: HWND, timer: usize, dropped: Dropped) {
+    let first = DROPPED.with(|d| {
+        let mut all = d.borrow_mut();
+        all.push(dropped);
+        all.len() == 1
+    });
+    if first {
+        unsafe { SetTimer(Some(window), timer, COLLECT_MS, None) };
+    }
 }
 
-/// What was dropped, once (see `register` and `announce`).
-pub fn take_dropped() -> Option<Dropped> {
-    DROPPED.with(|d| d.borrow_mut().take())
+/// The collected drop, once (see `announce`).
+pub fn take_drop() -> Option<Outcome> {
+    let drops = DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    outcome(&drops)
 }
 
 #[implement(IDropTarget)]
 struct DropTarget {
     window: HWND,
-    message: u32,
+    timer: usize,
     accept: Cell<bool>,
 }
 
@@ -148,16 +180,16 @@ impl IDropTarget_Impl for DropTarget_Impl {
         self.accept.set(file.is_some());
         self.effect(effect);
         if let Some(file) = file {
-            announce(self.window, self.message, Dropped::Markdown(file));
+            announce(self.window, self.timer, Dropped::Markdown(file));
         }
         Ok(())
     }
 }
 
 /// Accept drops on `window`; a dropped Markdown file is announced with
-/// `message` (then `take_dropped`). Needs OLE on this thread.
-pub fn register(window: HWND, message: u32) -> Result<(), String> {
-    let target: IDropTarget = DropTarget { window, message, accept: Cell::new(false) }.into();
+/// `timer` (then `take_drop`). Needs OLE on this thread.
+pub fn register(window: HWND, timer: usize) -> Result<(), String> {
+    let target: IDropTarget = DropTarget { window, timer, accept: Cell::new(false) }.into();
     unsafe { RegisterDragDrop(window, &target) }.map_err(|e| e.message().to_string())
 }
 
@@ -175,6 +207,23 @@ mod tests {
         assert_eq!(markdown_file(&[]), None);
         let long = format!(r"C:\{}\a.md", "x".repeat(300));
         assert_eq!(markdown_file(&[p(&long)]), Some(&p(&long)), "longer than MAX_PATH");
+    }
+
+    // #54: one drop is one Markdown file, or MDView says why not.
+    #[test]
+    fn test_what_a_drop_does() {
+        let md = |s: &str| Dropped::Markdown(PathBuf::from(s));
+        assert_eq!(outcome(&[]), None);
+        assert_eq!(outcome(&[md(r"C:\a.md")]), Some(Outcome::Open(PathBuf::from(r"C:\a.md"))));
+        assert_eq!(
+            outcome(&[Dropped::NotMarkdown(r"C:\a.json".into())]),
+            Some(Outcome::Tell("MDView only opens Markdown files (.md, .markdown):\n\nC:\\a.json".into()))
+        );
+        // Two files dropped together (WebView2 reports each): not the first
+        // or last one silently, but a message.
+        let several = Some(Outcome::Tell("Drop one Markdown file at a time.".into()));
+        assert_eq!(outcome(&[md(r"C:\a.md"), md(r"C:\b.md")]), several);
+        assert_eq!(outcome(&[md(r"C:\a.md"), Dropped::NotMarkdown(r"C:\b.txt".into())]), several);
     }
 
     // #54: a file dropped on the page arrives as its file: URL.
