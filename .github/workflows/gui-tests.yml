@@ -38,7 +38,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build (debug)
-        run: cargo build
+        run: cargo build --locked
 
       - name: WebView2 Runtime
         shell: pwsh

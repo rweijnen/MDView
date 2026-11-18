@@ -47,18 +47,27 @@ jobs:
           targets: i686-pc-windows-msvc, aarch64-pc-windows-msvc
 
       - name: Build x64
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Build x86
-        run: cargo build --release --target i686-pc-windows-msvc
+        run: cargo build --release --locked --target i686-pc-windows-msvc
 
       # The standalone viewer only: Total Commander has no ARM64 version that
       # could load a plugin; on Windows on ARM it runs the x64 plugin (#51).
       - name: Build ARM64 (standalone viewer)
-        run: cargo build --release --target aarch64-pc-windows-msvc --bin mdview
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc --bin mdview
 
       - name: Run tests
-        run: cargo test --release
+        run: cargo test --release --locked
+
+      # Known vulnerabilities in the dependencies (RustSec, #74) fail the build.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
 
       - name: Get current version
         if: env.IS_RELEASE == 'true'
@@ -185,15 +194,22 @@ jobs:
         shell: pwsh
         run: |
           $content = Get-Content Cargo.toml -Raw
-          $newContent = $content -replace 'version\s*=\s*"\d+\.\d+\.\d+"', "version = `"${{ steps.version.outputs.new }}`""
+          # Only the first match: the [package] version, never a dependency's.
+          $newContent = ([regex]'version\s*=\s*"\d+\.\d+\.\d+"').Replace($content, "version = `"${{ steps.version.outputs.new }}`"", 1)
           Set-Content -Path Cargo.toml -Value $newContent -NoNewline
+          # Cargo.lock names MDView's version too (#74); only MDView's own
+          # entry changes, no dependency is updated.
+          cargo update --workspace
+          if ($LASTEXITCODE -ne 0) { Write-Error 'Cargo.lock could not be updated to the new version.'; exit 1 }
+          $locked = Select-String -Path Cargo.lock -Pattern '^name = "mdview"' -Context 0,1 | ForEach-Object { $_.Context.PostContext[0] }
+          if ($locked -ne "version = `"${{ steps.version.outputs.new }}`"") { Write-Error "Cargo.lock has $locked for mdview, expected ${{ steps.version.outputs.new }}."; exit 1 }
 
       - name: Commit version bump
         if: env.IS_RELEASE == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml
+          git add Cargo.toml Cargo.lock
           git commit -m "Bump version to ${{ steps.version.outputs.new }}"
           git push
 
@@ -210,4 +226,4 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Run tests (ARM64)
-        run: cargo test --release
+        run: cargo test --release --locked
