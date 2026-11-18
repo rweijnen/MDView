@@ -231,10 +231,13 @@ function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni, [switch]$TcDark) {
         $docArgs = if ($doc) { @('--gui', "`"$doc`"") } else { @('--gui') }
         if ($hostKind -eq 'exe') { $p = Start-Process -FilePath $Exe -ArgumentList $docArgs -PassThru }
         else {
-            $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
+            $hostArgs = @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hostScript`"", '-Dll', "`"$Dll`"", '-Doc', "`"$doc`"",
                 '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$iniFolder`"",
-                '-CommandFile', "`"$hostCommands`"", '-LogFile', "`"$hostLog`"") + $(if ($TcDark) { @('-Dark') } else { @() })
+                '-CommandFile', "`"$hostCommands`"", '-LogFile', "`"$hostLog`"")
+            # Like TC in dark mode (lcp_darkmode, #68).
+            if ($TcDark) { $hostArgs += '-Dark' }
+            $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList $hostArgs
         }
     } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     [void]$started.Add($p)
