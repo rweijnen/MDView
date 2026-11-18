@@ -2679,8 +2679,9 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
 
                         // Over the page WebView2 takes the drag (MDView's OLE drop
                         // target is not asked there): it reports a dropped file as
-                        // a file: navigation, which NavigationStarting hands to
-                        // droptarget::page_drop (#54). Without this, "no" cursor.
+                        // a new-window request for its file: URL, which
+                        // NewWindowRequested hands to droptarget::page_drop (#54).
+                        // Without this, "no" cursor.
                         match controller.cast::<ICoreWebView2Controller4>() {
                             Ok(controller4) => {
                                 if let Err(e) = controller4.SetAllowExternalDrop(true) {
@@ -2787,14 +2788,7 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             // navigation the document started itself (<meta refresh>,
                                             // S5) user-initiated. Clicked links reach the link policy
                                             // through the page script (`openLink`).
-                                            if let Some(dropped) = droptarget::page_drop(&uri) {
-                                                // A file dropped on the page (#54): never
-                                                // shown by WebView2, MDView opens it.
-                                                let _ = args.SetCancel(true);
-                                                if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
-                                                    droptarget::announce(hwnd, WM_MDVIEW_DROP, dropped);
-                                                }
-                                            } else if !navigation_allowed(&uri) {
+                                            if !navigation_allowed(&uri) {
                                                 let _ = args.SetCancel(true);
                                             } else if crate::vpath::is_document_origin(&uri) {
                                                 document_navigation(navigation_kind(&args), &uri);
@@ -2826,7 +2820,18 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
+                                            // Never a new window. A file dropped on the
+                                            // page arrives here as its file: URL (#54):
+                                            // MDView opens it (or says it can't).
                                             let _ = args.SetHandled(true);
+                                            let mut uri_ptr = windows::core::PWSTR::null();
+                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                                let uri = uri_ptr.to_string().unwrap_or_default();
+                                                windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.0 as *const _));
+                                                if let (Some(dropped), Some(hwnd)) = (droptarget::page_drop(&uri), MAIN_HWND.with(|h| *h.borrow())) {
+                                                    droptarget::announce(hwnd, WM_MDVIEW_DROP, dropped);
+                                                }
+                                            }
                                         }
                                         Ok(())
                                     },

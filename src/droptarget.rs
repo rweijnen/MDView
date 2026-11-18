@@ -5,8 +5,8 @@
 //! - On the window's edge: an OLE drop target, so the cursor shows whether the
 //!   drop is possible (only one `.md` / `.markdown` file).
 //! - On the page: WebView2's own drop handling takes the drag there (the OLE
-//!   target is not asked), and reports the file as a navigation to its
-//!   `file:` URL, which the host cancels and hands to `page_drop`. The cursor
+//!   target is not asked), and reports the file as a new-window request for
+//!   its `file:` URL, which the host refuses and hands to `page_drop`. The cursor
 //!   shows "copy" for any file; anything but Markdown gets a message.
 
 use std::cell::{Cell, RefCell};
@@ -65,10 +65,11 @@ pub enum Dropped {
     NotMarkdown(String),
 }
 
-/// A navigation WebView2 starts for a file dropped on the page: its `file:`
-/// URL. `None` when `url` is not a `file:` URL. A document can start such a
-/// navigation too (WebView2 can't tell them apart); the worst it gets is that
-/// MDView opens another local Markdown file, as a clicked link can.
+/// The new-window request WebView2 makes for a file dropped on the page:
+/// its `file:` URL. `None` when `url` is not a `file:` URL. A document can ask
+/// for such a window too (`window.open`; WebView2 can call it user-initiated,
+/// see S5); the worst it gets is that MDView opens another local Markdown
+/// file, as a clicked link can.
 pub fn page_drop(url: &str) -> Option<Dropped> {
     if !url.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:")) {
         return None;
