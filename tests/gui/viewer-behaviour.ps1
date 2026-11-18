@@ -407,6 +407,21 @@ function Press-DialogButton($d, $name) {
     $false
 }
 
+    # Warm-up: the first start of WebView2 on a fresh machine (its data folder,
+    # the first browser process) can take longer than the checks wait (seen on
+    # GitHub's runners with WebView2 157). Each program shows a document once
+    # first; how long it took is logged, and no document within 60 s fails.
+    foreach ($hostKind in 'exe', 'plugin') {
+        Set-TestRegistry $null
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $v = Start-Viewer $hostKind (Join-Path $work 'second.md')
+        $shown = Wait-Element $v $CT::Text '^Second$' 60
+        $watch.Stop()
+        Stop-Viewer $v
+        Write-Output ("INFO  ${hostKind}: first start showed a document after {0:N1} s" -f $watch.Elapsed.TotalSeconds)
+        if (-not $shown) { Check "${hostKind}: the first start shows a document within 60 s" $false "no document after $([int]$watch.Elapsed.TotalSeconds) s" }
+    }
+
     foreach ($hostKind in 'exe', 'plugin') {
         # Local image, #anchor and .md link
         Set-TestRegistry $null
