@@ -213,7 +213,12 @@ $cases = @(
     @{ Id = 'D3'; Ext = 'svg'; Safe = 'the image is not shown as a page; nothing runs'; Title = 'an .svg file given directly runs its script'; Doc = "<svg xmlns='http://www.w3.org/2000/svg'><text y='20'>D3</text><script>document.documentElement.insertAdjacentHTML('beforeend','<text y=`"40`">PWNED-D3</text>')</script></svg>" }
     @{ Id = 'D4'; Ext = 'hta'; Safe = 'the file is not run'; Title = 'an .hta file given directly is run'; Canary = $true; Doc = "<html><head><script language='VBScript'>CreateObject(""WScript.Shell"").Run ""canary-D4.cmd""</script></head><body>PWNED-D4</body></html>" }
     @{ Id = 'E5'; Safe = 'MDView does not connect to the pipe (a real click shows a refusal message)'; Title = 'clicking a link to file://./pipe/ opens the pipe'; Detect = 'pipe'; AllowNetwork = $true; Click = 'e5 pipe link'; Doc = "# E5`n`n[e5 pipe link](<file://./pipe/$(Get-PipeName 'E5')>)" }
+    # A file dropped on the page reaches MDView as a request for a new window
+    # with its file: URL (#54). A document must not get there by itself.
+    @{ Id = 'W1'; Safe = 'nothing is started'; Title = '<meta refresh> to a file: URL of a program starts it'; Canary = $true; DocFn = { "# W1`n`n<meta http-equiv=`"refresh`" content=`"0;url=$(Get-FileUrl (Join-Path $attack 'canary-W1.cmd'))`">" } }
+    @{ Id = 'W2'; Safe = 'the document on the share is not opened without asking'; Title = 'a target=_blank link to a .md on another share opens it without asking'; Click = 'w2 share link'; DocFn = { "# W2`n`n<a href=`"file://localhost/C`$/$((Join-Path $attack 'share-W2.md').Substring(3) -replace '\\', '/')`" target=`"_blank`">w2 share link</a>" } }
 )
+Set-Content -Path (Join-Path $attack 'share-W2.md') -Value "# Share W2`n`nPWNED-W2" -NoNewline
 $pages['S5'] = "<html><body>left MDView (S5)</body></html>"
 $pages['N1'] = "<html><body>left MDView (N1)</body></html>"
 $pages['N2'] = "<html><body>popup (N2)</body></html>"
