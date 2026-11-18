@@ -1,9 +1,13 @@
 //! Dropping a Markdown file on the standalone viewer's window (#54).
 //!
-//! An OLE drop target, so the cursor shows during the drag whether the drop
-//! is possible: only one `.md` / `.markdown` file is accepted. The dropped
-//! file is opened like File > Open (Mark of the Web check included), outside
-//! the drop callback.
+//! Two ways in, both opened like File > Open (Mark of the Web check
+//! included), outside the callback that reported them:
+//! - On the window's edge: an OLE drop target, so the cursor shows whether the
+//!   drop is possible (only one `.md` / `.markdown` file).
+//! - On the page: WebView2's own drop handling takes the drag there (the OLE
+//!   target is not asked), and reports the file as a navigation to its
+//!   `file:` URL, which the host cancels and hands to `page_drop`. The cursor
+//!   shows "copy" for any file; anything but Markdown gets a message.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -52,13 +56,44 @@ fn dropped_paths(data: &IDataObject) -> Vec<PathBuf> {
     paths
 }
 
-thread_local! {
-    /// The file dropped, waiting for the window message that opens it.
-    static DROPPED: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+/// What was dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Dropped {
+    /// One Markdown file: open it.
+    Markdown(PathBuf),
+    /// Something else, as the user would recognise it: say MDView can't open it.
+    NotMarkdown(String),
 }
 
-/// The dropped file, once (see `register`).
-pub fn take_dropped() -> Option<PathBuf> {
+/// A navigation WebView2 starts for a file dropped on the page: its `file:`
+/// URL. `None` when `url` is not a `file:` URL. A document can start such a
+/// navigation too (WebView2 can't tell them apart); the worst it gets is that
+/// MDView opens another local Markdown file, as a clicked link can.
+pub fn page_drop(url: &str) -> Option<Dropped> {
+    if !url.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:")) {
+        return None;
+    }
+    Some(match crate::vpath::file_url_to_path(url) {
+        Some(path) if crate::links::is_markdown(&path) => Dropped::Markdown(path),
+        Some(path) => Dropped::NotMarkdown(path.display().to_string()),
+        None => Dropped::NotMarkdown(url.to_string()),
+    })
+}
+
+thread_local! {
+    /// What was dropped, waiting for the window message that handles it.
+    static DROPPED: RefCell<Option<Dropped>> = const { RefCell::new(None) };
+}
+
+/// Keep `dropped` and post `message` to `window`; the window procedure then
+/// calls `take_dropped`.
+pub fn announce(window: HWND, message: u32, dropped: Dropped) {
+    DROPPED.with(|d| *d.borrow_mut() = Some(dropped));
+    let _ = unsafe { PostMessageW(Some(window), message, WPARAM(0), LPARAM(0)) };
+}
+
+/// What was dropped, once (see `register` and `announce`).
+pub fn take_dropped() -> Option<Dropped> {
     DROPPED.with(|d| d.borrow_mut().take())
 }
 
@@ -112,8 +147,7 @@ impl IDropTarget_Impl for DropTarget_Impl {
         self.accept.set(file.is_some());
         self.effect(effect);
         if let Some(file) = file {
-            DROPPED.with(|d| *d.borrow_mut() = Some(file));
-            let _ = unsafe { PostMessageW(Some(self.window), self.message, WPARAM(0), LPARAM(0)) };
+            announce(self.window, self.message, Dropped::Markdown(file));
         }
         Ok(())
     }
@@ -140,5 +174,22 @@ mod tests {
         assert_eq!(markdown_file(&[]), None);
         let long = format!(r"C:\{}\a.md", "x".repeat(300));
         assert_eq!(markdown_file(&[p(&long)]), Some(&p(&long)), "longer than MAX_PATH");
+    }
+
+    // #54: a file dropped on the page arrives as its file: URL.
+    #[test]
+    fn test_a_file_dropped_on_the_page() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(page_drop("file:///C:/docs/a%20b.md"), Some(Dropped::Markdown(p(r"C:\docs\a b.md"))));
+        assert_eq!(page_drop("FILE:///C:/docs/x.MARKDOWN"), Some(Dropped::Markdown(p(r"C:\docs\x.MARKDOWN"))));
+        assert_eq!(page_drop("file://server/share/n.md"), Some(Dropped::Markdown(p(r"\\server\share\n.md"))));
+        assert_eq!(page_drop("file:///C:/docs/notes.txt"), Some(Dropped::NotMarkdown(r"C:\docs\notes.txt".into())));
+        assert_eq!(page_drop("file:///C:/tools/setup.exe"), Some(Dropped::NotMarkdown(r"C:\tools\setup.exe".into())));
+        // Device paths are never opened, not even as Markdown.
+        assert!(matches!(page_drop("file:////./pipe/p.md"), Some(Dropped::NotMarkdown(_))));
+        // Not a file: URL, so not a drop: the normal navigation rules apply.
+        for url in ["https://mdview.example/C/a.md", "about:blank", "data:text/html,x", "https://example.com/a.md"] {
+            assert_eq!(page_drop(url), None, "{url}");
+        }
     }
 }

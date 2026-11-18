@@ -2677,10 +2677,25 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
-                        // WebView2 must not take drops itself: MDView's drop target
-                        // (droptarget.rs) decides what can be dropped (#54).
-                        if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
-                            let _ = controller4.SetAllowExternalDrop(false);
+                        // Over the page WebView2 takes the drag (MDView's OLE drop
+                        // target is not asked there): it reports a dropped file as
+                        // a file: navigation, which NavigationStarting hands to
+                        // droptarget::page_drop (#54). Without this, "no" cursor.
+                        match controller.cast::<ICoreWebView2Controller4>() {
+                            Ok(controller4) => {
+                                if let Err(e) = controller4.SetAllowExternalDrop(true) {
+                                    message_box(
+                                        Some(hwnd),
+                                        &messages::Message::warning(format!("Dropping files on the page will not work:\n\n{}", e.message())),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                message_box(
+                                    Some(hwnd),
+                                    &messages::Message::warning(format!("Dropping files on the page will not work (WebView2 is too old):\n\n{}", e.message())),
+                                );
+                            }
                         }
 
                         if let Ok(webview) = controller.CoreWebView2() {
@@ -2772,7 +2787,14 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                             // navigation the document started itself (<meta refresh>,
                                             // S5) user-initiated. Clicked links reach the link policy
                                             // through the page script (`openLink`).
-                                            if !navigation_allowed(&uri) {
+                                            if let Some(dropped) = droptarget::page_drop(&uri) {
+                                                // A file dropped on the page (#54): never
+                                                // shown by WebView2, MDView opens it.
+                                                let _ = args.SetCancel(true);
+                                                if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+                                                    droptarget::announce(hwnd, WM_MDVIEW_DROP, dropped);
+                                                }
+                                            } else if !navigation_allowed(&uri) {
                                                 let _ = args.SetCancel(true);
                                             } else if crate::vpath::is_document_origin(&uri) {
                                                 document_navigation(navigation_kind(&args), &uri);
@@ -3047,8 +3069,14 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_MDVIEW_DROP => {
-            if let Some(path) = droptarget::take_dropped() {
-                load_file_into_webview(hwnd, &path.to_string_lossy());
+            match droptarget::take_dropped() {
+                Some(droptarget::Dropped::Markdown(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
+                Some(droptarget::Dropped::NotMarkdown(what)) => tell(
+                    hwnd,
+                    messages::Message::warning(format!("MDView only opens Markdown files (.md, .markdown):\n\n{what}")),
+                    None,
+                ),
+                None => {}
             }
             LRESULT(0)
         }
