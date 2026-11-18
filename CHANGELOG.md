@@ -3,6 +3,11 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
+## v1.0.1
+
+### Fixes
+- Standalone viewer: a Markdown file dropped on the page now opens (it only worked at the window's edge); other files, or several at once, get a message. In Total Commander, Lister shows that it doesn't accept dropped files. (#54, #71)
+
 ## v1.0.0
 
 ### New
