@@ -2,20 +2,12 @@ name: GUI and security tests
 
 # The end-to-end tests drive real windows with the mouse and keyboard, so
 # they need a desktop of their own: GitHub's Windows runners have one. They
-# run on every push to a branch other than main, on pull requests, and on
-# request (Actions > GUI and security tests > Run workflow).
+# run before every release (called by release.yml; a failure stops the
+# release) and on request (Actions > GUI and security tests > Run workflow,
+# any branch). Before a pull request they are run on a separate test machine
+# and the results go in the pull request (#70).
 on:
-  push:
-    branches-ignore: [main]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'build.rs'
-      - '.github/workflows/gui-tests.yml'
-  pull_request:
-    branches: [main]
+  workflow_call:
   workflow_dispatch:
 
 env:

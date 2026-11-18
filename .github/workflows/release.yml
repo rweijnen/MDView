@@ -23,7 +23,18 @@ permissions:
   contents: write
 
 jobs:
+  # Before a release only: the GUI and attack tests (#70). If they fail, the
+  # build job below is skipped and nothing is published. On pull requests and
+  # pushes this job is skipped and the build runs as usual.
+  gui-tests:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/gui-tests.yml
+    permissions:
+      contents: read
+
   build:
+    needs: gui-tests
+    if: always() && (needs.gui-tests.result == 'success' || needs.gui-tests.result == 'skipped')
     runs-on: windows-latest
     env:
       IS_RELEASE: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
