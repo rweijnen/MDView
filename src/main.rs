@@ -3075,8 +3075,20 @@ unsafe extern "system" fn window_proc(
         }
         WM_TIMER if wparam.0 == DROP_TIMER => {
             let _ = unsafe { KillTimer(Some(hwnd), DROP_TIMER) };
-            match droptarget::take_drop() {
+            match droptarget::take_drop(network_location) {
                 Some(droptarget::Outcome::Open(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
+                Some(droptarget::Outcome::AskNetwork { path, location }) => tell(
+                    hwnd,
+                    messages::Message::confirm(
+                        messages::Tone::Warning,
+                        format!(
+                            "Open this document from a network location?\n\n{}\n\nOpening it connects to {location}. Only open it if you dropped it here yourself or trust this document.",
+                            path.display()
+                        ),
+                        "Open",
+                    ),
+                    Some(links::Confirmed::OpenMarkdown(path)),
+                ),
                 Some(droptarget::Outcome::Tell(text)) => tell(hwnd, messages::Message::warning(text), None),
                 None => {}
             }

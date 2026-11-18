@@ -10,7 +10,7 @@
 //!   shows "copy" for any file; anything but Markdown gets a message.
 
 use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{HWND, POINTL};
 use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
@@ -85,6 +85,10 @@ pub fn page_drop(url: &str) -> Option<Dropped> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Open(PathBuf),
+    /// On another share or a network drive: only after the user agrees, as a
+    /// link there (opening it connects to `location`; a document can ask for
+    /// it without a drop, see `page_drop`).
+    AskNetwork { path: PathBuf, location: String },
     /// Nothing is opened; the user is told why.
     Tell(String),
 }
@@ -93,12 +97,16 @@ pub enum Outcome {
 /// dropped file, ~2 ms apart): reports within this time are one drop.
 pub const COLLECT_MS: u32 = 150;
 
-/// What one drop means: one Markdown file is opened; anything else is
+/// What one drop means: one Markdown file is opened (after a question when
+/// `network_location` names a network location for it); anything else is
 /// explained, never ignored.
-pub fn outcome(drops: &[Dropped]) -> Option<Outcome> {
+pub fn outcome(drops: &[Dropped], network_location: impl Fn(&Path) -> Option<String>) -> Option<Outcome> {
     match drops {
         [] => None,
-        [Dropped::Markdown(path)] => Some(Outcome::Open(path.clone())),
+        [Dropped::Markdown(path)] => Some(match network_location(path) {
+            Some(location) => Outcome::AskNetwork { path: path.clone(), location },
+            None => Outcome::Open(path.clone()),
+        }),
         [Dropped::NotMarkdown(what)] => {
             Some(Outcome::Tell(format!("MDView only opens Markdown files (.md, .markdown):\n\n{what}")))
         }
@@ -125,9 +133,9 @@ pub fn announce(window: HWND, timer: usize, dropped: Dropped) {
 }
 
 /// The collected drop, once (see `announce`).
-pub fn take_drop() -> Option<Outcome> {
+pub fn take_drop(network_location: impl Fn(&Path) -> Option<String>) -> Option<Outcome> {
     let drops = DROPPED.with(|d| std::mem::take(&mut *d.borrow_mut()));
-    outcome(&drops)
+    outcome(&drops, network_location)
 }
 
 #[implement(IDropTarget)]
@@ -213,17 +221,26 @@ mod tests {
     #[test]
     fn test_what_a_drop_does() {
         let md = |s: &str| Dropped::Markdown(PathBuf::from(s));
-        assert_eq!(outcome(&[]), None);
-        assert_eq!(outcome(&[md(r"C:\a.md")]), Some(Outcome::Open(PathBuf::from(r"C:\a.md"))));
+        let local = |_: &Path| None;
+        assert_eq!(outcome(&[], local), None);
+        assert_eq!(outcome(&[md(r"C:\a.md")], local), Some(Outcome::Open(PathBuf::from(r"C:\a.md"))));
         assert_eq!(
-            outcome(&[Dropped::NotMarkdown(r"C:\a.json".into())]),
+            outcome(&[Dropped::NotMarkdown(r"C:\a.json".into())], local),
             Some(Outcome::Tell("MDView only opens Markdown files (.md, .markdown):\n\nC:\\a.json".into()))
         );
         // Two files dropped together (WebView2 reports each): not the first
         // or last one silently, but a message.
         let several = Some(Outcome::Tell("Drop one Markdown file at a time.".into()));
-        assert_eq!(outcome(&[md(r"C:\a.md"), md(r"C:\b.md")]), several);
-        assert_eq!(outcome(&[md(r"C:\a.md"), Dropped::NotMarkdown(r"C:\b.txt".into())]), several);
+        assert_eq!(outcome(&[md(r"C:\a.md"), md(r"C:\b.md")], local), several);
+        assert_eq!(outcome(&[md(r"C:\a.md"), Dropped::NotMarkdown(r"C:\b.txt".into())], local), several);
+        // On another share: asked first, never opened by itself (a document
+        // can ask for such a "drop" too).
+        let share = |p: &Path| p.to_string_lossy().starts_with(r"\\evil").then(|| r"\\evil\share".to_string());
+        assert_eq!(
+            outcome(&[md(r"\\evil\share\x.md")], share),
+            Some(Outcome::AskNetwork { path: PathBuf::from(r"\\evil\share\x.md"), location: r"\\evil\share".into() })
+        );
+        assert_eq!(outcome(&[md(r"C:\a.md")], share), Some(Outcome::Open(PathBuf::from(r"C:\a.md"))));
     }
 
     // #54: a file dropped on the page arrives as its file: URL.
