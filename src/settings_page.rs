@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::fonts::Font;
 use crate::markdown::script_string;
-use crate::settings::{self, AskSetting, FontSettings};
+use crate::settings::{self, AskSetting, FontSettings, Theme};
 
 /// Everything the panel shows and saves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +17,8 @@ pub struct PageSettings {
     pub ask_downloads: bool,
     /// Standalone viewer only: offer to register MDView as .md viewer.
     pub ask_register: Option<bool>,
+    /// Colours (#68).
+    pub theme: Theme,
 }
 
 fn ask_name(setting: AskSetting) -> &'static str {
@@ -39,19 +41,24 @@ fn parse_ask(value: &str) -> Option<AskSetting> {
 /// The settings now saved for this program, and notes on saved values that
 /// are not valid.
 pub fn current(is_plugin: bool) -> (PageSettings, Vec<String>) {
-    let (fonts, notes) = settings::font_settings();
+    let (fonts, mut notes) = settings::font_settings();
+    let (theme, theme_note) = settings::theme();
+    notes.extend(theme_note);
     let page = PageSettings {
         fonts,
         remote_images: settings::remote_images_setting(),
         network_files: settings::network_files_setting(),
         ask_downloads: !settings::open_downloaded_without_asking(),
         ask_register: (!is_plugin).then(|| !settings::dont_ask_register()),
+        theme,
     };
     (page, notes)
 }
 
 /// JSON for `PostWebMessageAsJson`: the page opens the panel with these.
-pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_plugin: bool, dark: bool) -> String {
+/// `dark`: the colours shown now; `automatic_dark`: what Automatic means now
+/// (Windows or TC), for the panel's live preview (#68).
+pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_plugin: bool, dark: bool, automatic_dark: bool) -> String {
     let font_list: Vec<String> = fonts
         .iter()
         .map(|f| format!(r#"{{"name":{},"mono":{}}}"#, script_string(&f.name), f.monospace))
@@ -65,8 +72,8 @@ pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_pl
         concat!(
             r#"{{"type":"showSettings","program":{},"dark":{},"#,
             r#""settings":{{"textFont":{},"textSize":{},"headingFont":{},"codeFont":{},"codeSize":{},"#,
-            r#""remoteImages":"{}","networkFiles":"{}","askDownloads":{},"askRegister":{}}},"#,
-            r#""fonts":[{}],"notes":[{}]}}"#
+            r#""remoteImages":"{}","networkFiles":"{}","askDownloads":{},"askRegister":{},"theme":"{}"}},"#,
+            r#""themeAutomatic":{},"automaticDark":{},"colours":{},"fonts":[{}],"notes":[{}]}}"#
         ),
         script_string(if is_plugin { "Total Commander plugin" } else { "Standalone viewer" }),
         dark,
@@ -79,6 +86,10 @@ pub fn show_message(page: &PageSettings, notes: &[String], fonts: &[Font], is_pl
         ask_name(page.network_files),
         page.ask_downloads,
         register,
+        page.theme.name(),
+        script_string(if is_plugin { "Automatic follows Total Commander." } else { "Automatic follows Windows." }),
+        automatic_dark,
+        crate::markdown::colours_json(),
         font_list.join(","),
         note_list.join(","),
     )
@@ -103,7 +114,7 @@ pub fn parse_save(
 ) -> Result<PageSettings, String> {
     let mut expected = vec![
         "type", "textFont", "textSize", "headingFont", "codeFont", "codeSize", "remoteImages",
-        "networkFiles", "askDownloads",
+        "networkFiles", "askDownloads", "theme",
     ];
     if !is_plugin {
         expected.push("askRegister");
@@ -167,6 +178,13 @@ pub fn parse_save(
         network_files: ask("networkFiles", &mut problems),
         ask_downloads: flag("askDownloads", &mut problems),
         ask_register: (!is_plugin).then(|| flag("askRegister", &mut problems)),
+        theme: match field("theme").and_then(Theme::parse) {
+            Some(t) => t,
+            None => {
+                problems.push("theme must be auto, light or dark".to_string());
+                Theme::Automatic
+            }
+        },
     };
     if problems.is_empty() {
         Ok(page)
@@ -190,6 +208,7 @@ pub fn save(page: &PageSettings) -> Result<(), String> {
     check("Remote images", settings::set_remote_images_setting(page.remote_images));
     check("Network files", settings::set_network_files_setting(page.network_files));
     check("Downloaded documents", settings::set_ask_before_downloaded(page.ask_downloads));
+    check("Colours", settings::set_theme(page.theme));
     if let Some(ask) = page.ask_register {
         check("Offer to register", settings::set_dont_ask_register(!ask));
     }
@@ -226,7 +245,7 @@ mod tests {
         let mut m = message(&[
             ("type", "saveSettings"), ("textFont", "Georgia"), ("textSize", "17"), ("headingFont", ""),
             ("codeFont", "Consolas"), ("codeSize", "0"), ("remoteImages", "always"),
-            ("networkFiles", "never"), ("askDownloads", "false"),
+            ("networkFiles", "never"), ("askDownloads", "false"), ("theme", "dark"),
         ]);
         m.extend(message(extra));
         m
@@ -243,6 +262,11 @@ mod tests {
         assert_eq!(page.network_files, AskSetting::Never);
         assert!(!page.ask_downloads);
         assert_eq!(page.ask_register, Some(true));
+        assert_eq!(page.theme, Theme::Dark);
+        for (name, theme) in [("auto", Theme::Automatic), ("light", Theme::Light)] {
+            let page = parse_save(&valid(&[("theme", name)]), true, &installed(), &FontSettings::default()).unwrap();
+            assert_eq!(page.theme, theme);
+        }
         // The plugin has no register setting.
         let page = parse_save(&valid(&[]), true, &installed(), &FontSettings::default()).unwrap();
         assert_eq!(page.ask_register, None);
@@ -255,6 +279,7 @@ mod tests {
         for (key, value) in [
             ("textFont", "Not Installed"), ("textFont", "x\"; }"), ("textSize", "7"), ("textSize", "big"),
             ("codeSize", "49"), ("remoteImages", "maybe"), ("askDownloads", "yes"), ("color", "red"),
+            ("theme", "Dark"), ("theme", ""), ("theme", "system"),
         ] {
             let err = parse_save(&valid(&[(key, value)]), true, &installed(), &saved).unwrap_err();
             assert!(err.starts_with("Nothing was saved."), "{key}={value}: {err}");
@@ -263,6 +288,9 @@ mod tests {
         let mut missing = valid(&[]);
         missing.remove("codeFont");
         assert!(parse_save(&missing, true, &installed(), &saved).unwrap_err().contains("codeFont is missing"));
+        let mut no_theme = valid(&[]);
+        no_theme.remove("theme");
+        assert!(parse_save(&no_theme, true, &installed(), &saved).unwrap_err().contains("theme must be auto, light or dark"));
         assert!(parse_save(&valid(&[]), false, &installed(), &saved).is_err(), "viewer must send askRegister");
     }
 
@@ -282,9 +310,19 @@ mod tests {
             network_files: AskSetting::Always,
             ask_downloads: true,
             ask_register: None,
+            theme: Theme::Light,
         };
-        let json = show_message(&page, &["a <note>".to_string()], &installed(), true, true);
+        let json = show_message(&page, &["a <note>".to_string()], &installed(), true, true, false);
+        // The live preview (#68): what Automatic means now, and both palettes.
+        assert!(json.contains(r##""automaticDark":false,"colours":{"light":{"--mdview-bg":"#ffffff","##), "{json}");
+        assert!(json.contains(r##""dark":{"--mdview-bg":"#1e1e1e","##), "{json}");
         assert!(json.starts_with(r#"{"type":"showSettings","program":"Total Commander plugin","dark":true,"#), "{json}");
+        // Automatic means TC's dark mode in the plugin, Windows' in the viewer.
+        assert!(json.contains(r#""themeAutomatic":"Automatic follows Total Commander.""#), "{json}");
+        assert!(json.contains(r#""theme":"light""#), "{json}");
+        let viewer = show_message(&page, &[], &installed(), false, false, true);
+        assert!(viewer.contains(r#""automaticDark":true,"#), "{viewer}");
+        assert!(viewer.contains(r#""themeAutomatic":"Automatic follows Windows.""#), "{viewer}");
         assert!(json.contains(r#""textFont":"Georgia","textSize":14,"headingFont":"","#));
         assert!(json.contains(r#""remoteImages":"ask","networkFiles":"always","askDownloads":true,"askRegister":null"#));
         assert!(json.contains(r#"{"name":"Consolas","mono":true}"#));
@@ -300,9 +338,9 @@ mod tests {
                       ("Code font", "cannot write TextSize to C:\\x\\mdview.ini: Access is denied.".to_string())];
         let text = failure_text(&failed, 9).unwrap_err();
         assert_eq!(text, "Not saved: Text size, Code font.\ncannot write TextSize to C:\\x\\mdview.ini: Access is denied.\nThe other settings were saved.");
-        // Everything failed (the plugin saves 8 values): nothing else was saved.
-        let all: Vec<(&'static str, String)> = (0..8).map(|_| ("x", "no settings folder".to_string())).collect();
-        assert!(!failure_text(&all, 8).unwrap_err().contains("other settings were saved"));
-        assert!(failure_text(&all[..7], 8).unwrap_err().contains("other settings were saved"));
+        // Everything failed (the plugin saves 9 values): nothing else was saved.
+        let all: Vec<(&'static str, String)> = (0..9).map(|_| ("x", "no settings folder".to_string())).collect();
+        assert!(!failure_text(&all, 9).unwrap_err().contains("other settings were saved"));
+        assert!(failure_text(&all[..8], 9).unwrap_err().contains("other settings were saved"));
     }
 }

@@ -329,7 +329,18 @@ if (webview) (function() {
         root.setProperty('--mdview-code-font', fontCss(s.codeFont, DEFAULT_CODE));
         root.setProperty('--mdview-code-size', s.codeSize ? s.codeSize + 'px' : '85%');
     }
-    function unpreview() { VARS.forEach(function(v) { root.removeProperty(v); }); }
+    // Colour variables set by the preview (#68), removed with the fonts'.
+    var colourVars = [];
+    function previewColours(palette) {
+        Object.keys(palette).forEach(function(k) {
+            root.setProperty(k, palette[k]);
+            if (colourVars.indexOf(k) < 0) colourVars.push(k);
+        });
+    }
+    function unpreview() {
+        VARS.concat(colourVars).forEach(function(v) { root.removeProperty(v); });
+        colourVars = [];
+    }
 
     function close(keepPreview) {
         if (!open) return;
@@ -380,6 +391,7 @@ if (webview) (function() {
         var advBody = el('div', {});
         var advButton = el('button', {type: 'button', className: 'adv', 'aria-expanded': 'false'}, [svg('M5 3l4 4-4 4', 12), 'Advanced: fonts per kind of text']);
         var askRows = el('div', {style: 'display:flex;flex-direction:column;gap:22px'});
+        var themeRow = el('div', {className: 'row', role: 'group', 'aria-label': 'Colours'});
         var error = el('div', {className: 'error', role: 'alert', hidden: true});
         var save = el('button', {type: 'button', className: 'btn primary', text: 'Save'});
         var cancel = el('button', {type: 'button', className: 'btn', text: 'Cancel'});
@@ -427,6 +439,19 @@ if (webview) (function() {
                 askRows.appendChild(el('section', {}, [el('div', {className: 'stack'}, [el('h3', {text: r[1]}), el('span', {className: 'muted', text: r[2]})]), row]));
             });
         }
+        // Colours (#68): the document behind the panel, and the panel itself,
+        // show the choice at once; Automatic means what the host says.
+        function renderTheme() {
+            themeRow.textContent = '';
+            [['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']].forEach(function(o) {
+                themeRow.appendChild(seg(o[1], s.theme === o[0], function() { s.theme = o[0]; renderTheme(); showTheme(); }));
+            });
+        }
+        function showTheme() {
+            var dark = s.theme === 'dark' || (s.theme === 'auto' && m.automaticDark === true);
+            if (m.colours) previewColours(m.colours[dark ? 'dark' : 'light']);
+            scrim.className = 'scrim' + (dark ? ' dark' : '');
+        }
         function check(key, title, help) {
             var input = el('input', {type: 'checkbox', onchange: function() { s[key] = input.checked; }});
             input.checked = !!s[key];
@@ -463,6 +488,10 @@ if (webview) (function() {
                     sizeRow
                 ]),
                 el('section', {}, [advButton, advBody]),
+                el('section', {}, [
+                    el('div', {className: 'stack'}, [el('h3', {text: 'Colours'}), el('span', {className: 'muted', text: m.themeAutomatic + ' Changes show in the document behind this panel.'})]),
+                    themeRow
+                ]),
                 el('div', {className: 'sep'}),
                 askRows,
                 check('askDownloads', 'Ask before showing a downloaded document', 'Documents with the "Mark of the Web" from a browser or mail program.'),
@@ -484,7 +513,8 @@ if (webview) (function() {
                 textFont: s.textFont, textSize: String(s.textSize), headingFont: s.headingFont,
                 codeFont: s.codeFont, codeSize: String(s.codeSize),
                 remoteImages: s.remoteImages, networkFiles: s.networkFiles,
-                askDownloads: s.askDownloads ? 'true' : 'false'
+                askDownloads: s.askDownloads ? 'true' : 'false',
+                theme: s.theme
             };
             // Only the standalone viewer has the register setting.
             if (s.askRegister !== null) msg.askRegister = s.askRegister ? 'true' : 'false';
@@ -504,6 +534,7 @@ if (webview) (function() {
         renderSizes();
         renderAdvanced();
         renderAsk();
+        renderTheme();
         open = {
             host: host, back: document.activeElement,
             saved: function() { close(true); },
@@ -837,6 +868,39 @@ fn font_css(name: &str, stack: &str) -> String {
 }
 
 /// The page's font variables (#50), for its `:root` rule.
+/// The page's colours (#68), as CSS variables so the settings panel can
+/// preview Light and Dark: (name, light, dark).
+const COLOURS: [(&str, &str, &str); 7] = [
+    ("--mdview-bg", "#ffffff", "#1e1e1e"),
+    ("--mdview-text", "#24292e", "#d4d4d4"),
+    ("--mdview-code-bg", "#f6f8fa", "#2d2d2d"),
+    ("--mdview-link", "#0366d6", "#58a6ff"),
+    ("--mdview-border", "#e1e4e8", "#444"),
+    ("--mdview-banner-bg", "#fff8c5", "#3b3420"),
+    ("--mdview-banner-border", "#d4a72c", "#6b5b2a"),
+];
+
+fn colour_variables(dark: bool) -> String {
+    COLOURS
+        .iter()
+        .map(|(name, light, dark_value)| format!("{name}: {};", if dark { dark_value } else { light }))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Both palettes as JSON, for the settings panel's live preview:
+/// `{"light":{"--mdview-bg":"#ffffff",...},"dark":{...}}`.
+pub fn colours_json() -> String {
+    let palette = |dark: bool| {
+        COLOURS
+            .iter()
+            .map(|(name, light, dark_value)| format!(r#""{name}":"{}""#, if dark { dark_value } else { light }))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    format!(r#"{{"light":{{{}}},"dark":{{{}}}}}"#, palette(false), palette(true))
+}
+
 fn font_variables(fonts: &crate::settings::FontSettings) -> String {
     let text_size = if crate::settings::is_font_size(fonts.text_size) { fonts.text_size } else { crate::settings::DEFAULT_TEXT_SIZE };
     let heading = if fonts.heading_font.is_empty() { "var(--mdview-text-font)".to_string() } else { font_css(&fonts.heading_font, DEFAULT_TEXT_STACK) };
@@ -1185,13 +1249,7 @@ pub fn wrap_html(content: &str, dark_mode: bool, remote_images: RemoteImages, ba
     let back_script = BACK_SCRIPT;
     let csp = content_security_policy(&nonce, remote_images);
     let bars = bars_json(bars);
-    let banner_bg = if dark_mode { "#3b3420" } else { "#fff8c5" };
-    let banner_border = if dark_mode { "#6b5b2a" } else { "#d4a72c" };
-    let bg_color = if dark_mode { "#1e1e1e" } else { "#ffffff" };
-    let text_color = if dark_mode { "#d4d4d4" } else { "#24292e" };
-    let code_bg = if dark_mode { "#2d2d2d" } else { "#f6f8fa" };
-    let link_color = if dark_mode { "#58a6ff" } else { "#0366d6" };
-    let border_color = if dark_mode { "#444" } else { "#e1e4e8" };
+    let colour_vars = colour_variables(dark_mode);
     let content = content
         .replace("src=\"/", "src=\"")
         .replace("href=\"/", "href=\"")
@@ -1216,7 +1274,7 @@ document.addEventListener('securitypolicyviolation', function(e) {{
 }});
 </script>
 <style>
-:root {{ zoom: {zoom}; {font_vars} }}
+:root {{ zoom: {zoom}; {font_vars} {colour_vars} }}
 h1, h2, h3, h4, h5, h6 {{ font-family: var(--mdview-heading-font); }}
 #mdview-bars {{
     display: flex;
@@ -1230,9 +1288,9 @@ h1, h2, h3, h4, h5, h6 {{ font-family: var(--mdview-heading-font); }}
     flex-wrap: wrap;
     gap: 8px;
     padding: 6px 10px;
-    border: 1px solid {banner_border};
+    border: 1px solid var(--mdview-banner-border);
     border-radius: 6px;
-    background-color: {banner_bg};
+    background-color: var(--mdview-banner-bg);
     font-size: 13px;
 }}
 .mdview-bar span {{ flex: 1; }}
@@ -1253,20 +1311,20 @@ body {{
     padding: 20px;
     max-width: 900px;
     margin: 0 auto;
-    background-color: {bg_color};
-    color: {text_color};
+    background-color: var(--mdview-bg);
+    color: var(--mdview-text);
 }}
-a {{ color: {link_color}; text-decoration: none; }}
+a {{ color: var(--mdview-link); text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
 code {{
-    background-color: {code_bg};
+    background-color: var(--mdview-code-bg);
     padding: 0.2em 0.4em;
     border-radius: 3px;
     font-family: var(--mdview-code-font);
     font-size: var(--mdview-code-size);
 }}
 pre {{
-    background-color: {code_bg};
+    background-color: var(--mdview-code-bg);
     padding: 16px;
     overflow: auto;
     border-radius: 6px;
@@ -1276,10 +1334,10 @@ pre code {{
     padding: 0;
 }}
 blockquote {{
-    border-left: 4px solid {border_color};
+    border-left: 4px solid var(--mdview-border);
     margin: 0;
     padding-left: 16px;
-    color: {text_color};
+    color: var(--mdview-text);
     opacity: 0.8;
 }}
 table {{
@@ -1287,23 +1345,23 @@ table {{
     width: 100%;
 }}
 th, td {{
-    border: 1px solid {border_color};
+    border: 1px solid var(--mdview-border);
     padding: 8px 12px;
     text-align: left;
 }}
 th {{
-    background-color: {code_bg};
+    background-color: var(--mdview-code-bg);
 }}
 img {{
     max-width: 100%;
 }}
 h1, h2 {{
-    border-bottom: 1px solid {border_color};
+    border-bottom: 1px solid var(--mdview-border);
     padding-bottom: 0.3em;
 }}
 hr {{
     border: none;
-    border-top: 1px solid {border_color};
+    border-top: 1px solid var(--mdview-border);
 }}
 input[type="checkbox"] {{
     margin-right: 0.5em;
@@ -1634,6 +1692,30 @@ mod tests {
             assert!(page.contains(&format!(":root {{ zoom: {css}; ")), "{percent}");
         }
         assert_eq!(zoom_message(125), r#"{"type":"zoom","percent":125}"#);
+    }
+
+    // #68: the page's colours are CSS variables (so the settings panel can
+    // preview them), set from the light or dark palette.
+    #[test]
+    fn test_page_colours_are_variables_from_one_palette() {
+        let light = wrap("", false, RemoteImages::Blocked, &[]);
+        let dark = wrap("", true, RemoteImages::Blocked, &[]);
+        assert!(light.contains("--mdview-bg: #ffffff;") && light.contains("--mdview-text: #24292e;"));
+        assert!(dark.contains("--mdview-bg: #1e1e1e;") && dark.contains("--mdview-text: #d4d4d4;"));
+        assert!(light.contains("background-color: var(--mdview-bg);") && light.contains("color: var(--mdview-link);"));
+        // The page's stylesheet has each colour only in its variable (the
+        // panels' own scripts have their own colours).
+        for page in [&light, &dark] {
+            let style = &page[page.find("<style>").unwrap()..page.find("</style>").unwrap()];
+            for (_, l, d) in COLOURS {
+                assert_eq!(style.matches(l).count() + style.matches(d).count(), 1, "{l}/{d} only in the variables");
+            }
+        }
+        // The panel gets both palettes with the same names.
+        let json = colours_json();
+        for (name, l, d) in COLOURS {
+            assert!(json.contains(&format!(r#""{name}":"{l}""#)) && json.contains(&format!(r#""{name}":"{d}""#)), "{name}");
+        }
     }
 
     // #50: the page's fonts come from the settings as CSS variables; only a

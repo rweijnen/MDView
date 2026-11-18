@@ -376,13 +376,9 @@ fn main() {
                 } else {
                     ("Not a Markdown file", markdown::NOT_MARKDOWN)
                 };
-                let notice = markdown::wrap_html(
-                    &markdown::notice_html(heading, path, reason),
-                    is_windows_dark_mode(),
-                    markdown::RemoteImages::Blocked,
-                    &[],
-                    &page_look(),
-                );
+                let page = StringPage::Notice { heading, path: path.clone(), reason };
+                let notice = page.html();
+                STRING_PAGE.with(|p| *p.borrow_mut() = Some(page));
                 (APP_NAME.to_string(), notice)
             } else {
                 let title = Path::new(path)
@@ -394,25 +390,8 @@ fn main() {
             }
         } else {
             // No file - show welcome screen
-            let dark_mode = is_windows_dark_mode();
-            let welcome_bars = markdown::document_bars(&markdown::PageBars {
-                remote_images: markdown::RemoteImages::Blocked,
-                ask_to_register: ask_to_register(),
-                ask_network_files: false,
-                closed: &[],
-            });
-            let welcome_html = markdown::wrap_html(
-                "<div style=\"text-align: center; margin-top: 100px; color: #888;\">\
-                 <h1>MDView</h1>\
-                 <p>Open a Markdown file using <strong>File &gt; Open</strong> (Ctrl+O)</p>\
-                 <p>or drag and drop a .md file onto this window.</p>\
-                 </div>",
-                dark_mode,
-                markdown::RemoteImages::Blocked,
-                &welcome_bars,
-                &page_look(),
-            );
-            PAGE_BARS.with(|b| *b.borrow_mut() = welcome_bars);
+            let welcome_html = StringPage::Welcome.html();
+            STRING_PAGE.with(|p| *p.borrow_mut() = Some(StringPage::Welcome));
             (APP_NAME.to_string(), welcome_html)
         };
 
@@ -536,11 +515,12 @@ const PREFERRED_APP_MODE_DEFAULT: i32 = 0;
 #[allow(dead_code)]
 const PREFERRED_APP_MODE_ALLOW_DARK: i32 = 1;
 const PREFERRED_APP_MODE_FORCE_DARK: i32 = 2;
-#[allow(dead_code)]
 const PREFERRED_APP_MODE_FORCE_LIGHT: i32 = 3;
 
-/// Enable dark mode for menus using undocumented uxtheme.dll API
-fn set_preferred_app_mode_dark() {
+/// Dark or light popup menus for this process, using the undocumented
+/// uxtheme.dll API. Forced either way, so the choice in Settings (#68) also
+/// wins over Windows.
+fn set_preferred_app_mode(dark: bool) {
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     unsafe {
@@ -552,7 +532,7 @@ fn set_preferred_app_mode_dark() {
             ) {
                 let func: extern "system" fn(i32) -> i32 =
                     std::mem::transmute(set_preferred_app_mode);
-                func(PREFERRED_APP_MODE_FORCE_DARK);
+                func(if dark { PREFERRED_APP_MODE_FORCE_DARK } else { PREFERRED_APP_MODE_FORCE_LIGHT });
             }
             // Flush menu themes to apply the change
             if let Some(flush_menu_themes) = GetProcAddress(
@@ -566,8 +546,9 @@ fn set_preferred_app_mode_dark() {
     }
 }
 
-/// Allow dark mode for a specific window (needed for dark popup menus)
-fn allow_dark_mode_for_window(hwnd: HWND) {
+/// Allow (or no longer allow) dark mode for a specific window (needed for dark
+/// popup menus).
+fn allow_dark_mode_for_window(hwnd: HWND, allow: bool) {
     use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
     unsafe {
@@ -579,9 +560,139 @@ fn allow_dark_mode_for_window(hwnd: HWND) {
             ) {
                 let func: extern "system" fn(isize, bool) -> bool =
                     std::mem::transmute(allow_dark_mode);
-                func(hwnd.0 as isize, true);
+                func(hwnd.0 as isize, allow);
             }
         }
+    }
+}
+
+thread_local! {
+    /// Whether the window's own parts (title bar, menu bar, background) are
+    /// dark now; set by `apply_window_theme`.
+    static WINDOW_DARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A page MDView builds itself and shows with NavigateToString (no document).
+enum StringPage {
+    Welcome,
+    /// #55 / #53: why a file given at start can't be shown.
+    Notice { heading: &'static str, path: String, reason: &'static str },
+}
+
+impl StringPage {
+    /// The page with the current settings (colours, fonts, bars).
+    fn html(&self) -> String {
+        match self {
+            StringPage::Welcome => {
+                let welcome_bars = markdown::document_bars(&markdown::PageBars {
+                    remote_images: markdown::RemoteImages::Blocked,
+                    ask_to_register: ask_to_register(),
+                    ask_network_files: false,
+                    closed: &[],
+                });
+                let html = markdown::wrap_html(
+                    "<div style=\"text-align: center; margin-top: 100px; color: #888;\">\
+                     <h1>MDView</h1>\
+                     <p>Open a Markdown file using <strong>File &gt; Open</strong> (Ctrl+O)</p>\
+                     <p>or drag and drop a .md file onto this window.</p>\
+                     </div>",
+                    dark_mode(),
+                    markdown::RemoteImages::Blocked,
+                    &welcome_bars,
+                    &page_look(),
+                );
+                PAGE_BARS.with(|b| *b.borrow_mut() = welcome_bars);
+                html
+            }
+            StringPage::Notice { heading, path, reason } => markdown::wrap_html(
+                &markdown::notice_html(heading, path, reason),
+                dark_mode(),
+                markdown::RemoteImages::Blocked,
+                &[],
+                &page_look(),
+            ),
+        }
+    }
+}
+
+thread_local! {
+    /// The page shown while there is no document, rebuilt after the settings
+    /// change (#68).
+    static STRING_PAGE: RefCell<Option<StringPage>> = const { RefCell::new(None) };
+}
+
+/// Show the page MDView builds itself again, with the current settings.
+fn show_string_page_again() {
+    let Some(html) = STRING_PAGE.with(|p| p.borrow().as_ref().map(StringPage::html)) else {
+        return;
+    };
+    let html_wide = pwstr_from_str(&html);
+    CONTROLLER.with(|c| {
+        let Some(controller) = c.borrow().as_ref().cloned() else { return };
+        let result = unsafe { controller.CoreWebView2() }.and_then(|webview| {
+            EXPECT_STRING_PAGE.with(|e| e.set(true));
+            unsafe { webview.NavigateToString(PCWSTR(html_wide.as_ptr())) }
+        });
+        if let Err(e) = result {
+            EXPECT_STRING_PAGE.with(|e| e.set(false));
+            let message = messages::Message::error(format!("{APP_NAME} could not show its page again:\n\n{}", e.message()));
+            match MAIN_HWND.with(|h| *h.borrow()) {
+                Some(hwnd) => tell(hwnd, message, None),
+                None => {
+                    message_box(None, &message);
+                }
+            }
+        }
+    });
+}
+
+/// Whether MDView shows dark colours: the choice in Settings (#68), and for
+/// Automatic whether Windows is in dark mode.
+fn dark_mode() -> bool {
+    settings::theme().0.is_dark(is_windows_dark_mode())
+}
+
+fn window_dark() -> bool {
+    WINDOW_DARK.with(|d| d.get())
+}
+
+/// Replace the window class's background brush; returns the old one.
+/// `SetClassLongPtrW` only exists in 64-bit Windows.
+#[cfg(target_pointer_width = "64")]
+unsafe fn set_class_background(hwnd: HWND, brush: HBRUSH) -> usize {
+    unsafe { SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, brush.0 as isize) }
+}
+
+#[cfg(target_pointer_width = "32")]
+unsafe fn set_class_background(hwnd: HWND, brush: HBRUSH) -> usize {
+    unsafe { SetClassLongW(hwnd, GCLP_HBRBACKGROUND, brush.0 as i32) as usize }
+}
+
+/// Give the window's own parts the colours of `dark_mode()`: popup menus, the
+/// title bar, the menu bar and the background. Used at start and after the
+/// colours are changed in Settings.
+fn apply_window_theme(hwnd: HWND) {
+    let dark = dark_mode();
+    WINDOW_DARK.with(|d| d.set(dark));
+    set_preferred_app_mode(dark);
+    allow_dark_mode_for_window(hwnd, dark);
+    unsafe {
+        let use_dark_mode: u32 = dark as u32;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &use_dark_mode as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        let brush = if dark { CreateSolidBrush(COLORREF(DARK_CLIENT)) } else { HBRUSH((COLOR_WINDOW.0 + 1) as _) };
+        let old = set_class_background(hwnd, brush);
+        // A brush MDView created (dark) is deleted; a system colour brush is not.
+        if old != 0 && old != (COLOR_WINDOW.0 + 1) as usize {
+            let _ = DeleteObject(HGDIOBJ(old as *mut std::ffi::c_void));
+        }
+        // Redraw the menu bar (UAH messages) and the frame.
+        let _ = DrawMenuBar(hwnd);
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_FRAME | RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
 }
 
@@ -993,7 +1104,7 @@ fn show_recent_file_tooltip(hwnd: HWND, menu: HMENU, item: u32) {
             if GetMenuItemID(menu, position) == item {
                 let mut rect = RECT::default();
                 if GetMenuItemRect(Some(hwnd), menu, position as u32, &mut rect).is_ok() {
-                    linkstatus::show_at(hwnd, &path, is_windows_dark_mode(), POINT { x: rect.right + 8, y: rect.top });
+                    linkstatus::show_at(hwnd, &path, dark_mode(), POINT { x: rect.right + 8, y: rect.top });
                 }
                 return;
             }
@@ -1397,7 +1508,7 @@ fn create_response_for_virtual_url(
     if !file_path.exists() {
         return create_not_found_response(environment);
     }
-    create_virtual_resource_response(environment, file_path, is_windows_dark_mode())
+    create_virtual_resource_response(environment, file_path, dark_mode())
 }
 
 /// Whether a file the page asks for may be read. Files on another share or a
@@ -1478,12 +1589,12 @@ fn post_to_page(json: &str) -> bool {
 /// File > Settings... or Ctrl+, (#50): the page shows the settings panel.
 fn open_settings() {
     let (page, notes) = settings_page::current(false);
-    post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, is_windows_dark_mode()));
+    post_to_page(&settings_page::show_message(&page, &notes, &fonts::installed(), false, dark_mode(), is_windows_dark_mode()));
 }
 
 /// F1, Help > Keyboard shortcuts or the menu (#59): the page shows the keys.
 fn open_help() {
-    post_to_page(&shortcuts::help_message(false, is_windows_dark_mode()));
+    post_to_page(&shortcuts::help_message(false, dark_mode()));
 }
 
 /// Run a script on the page (the result is not needed).
@@ -1573,8 +1684,15 @@ fn save_settings(msg: &std::collections::HashMap<String, String>) {
     match result {
         Ok(()) => {
             post_to_page(&settings_page::saved_message());
+            // The colours may have changed (#68): the window's own parts now,
+            // the page with the reload.
+            if let Some(hwnd) = MAIN_HWND.with(|h| *h.borrow()) {
+                apply_window_theme(hwnd);
+            }
             if CURRENT_FILE.with(|f| f.borrow().is_some()) {
                 reload_page();
+            } else {
+                show_string_page_again();
             }
         }
         Err(text) => {
@@ -1784,7 +1902,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &std::collections::HashMap
                     resolve_virtual_mdview_url(u).map(std::path::PathBuf::from)
                 }, network_location);
                 let href = msg.get("href").map(String::as_str).unwrap_or_default();
-                linkstatus::show(hwnd, &linkstatus::describe_url(url, href, &action), is_windows_dark_mode());
+                linkstatus::show(hwnd, &linkstatus::describe_url(url, href, &action), dark_mode());
             }
         },
         Some("zoom") => {
@@ -2285,7 +2403,7 @@ const MESSAGE_CONFIRM_MS: u32 = 1500;
 /// so it is never lost. `action` runs when the user answers "yes".
 fn tell(hwnd: HWND, message: messages::Message, action: Option<links::Confirmed>) {
     let id = MESSAGES.with(|m| m.borrow_mut().add(message.clone(), action));
-    if post_to_page(&messages::show_json(id, &message, is_windows_dark_mode())) {
+    if post_to_page(&messages::show_json(id, &message, dark_mode())) {
         unsafe { SetTimer(Some(hwnd), MESSAGE_TIMER + id as usize, MESSAGE_CONFIRM_MS, Some(message_not_confirmed)) };
     } else {
         fall_back_to_message_box(hwnd, id);
@@ -2378,10 +2496,9 @@ fn run_gui(title: &str, html: &str, file_path: Option<&str>) -> windows::core::R
 
 fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::core::Result<()> {
     unsafe {
-        // Enable dark mode for menus BEFORE creating any windows
-        if is_windows_dark_mode() {
-            set_preferred_app_mode_dark();
-        }
+        // Dark or light menus BEFORE creating any windows (#68: as chosen).
+        let dark = dark_mode();
+        set_preferred_app_mode(dark);
 
         // Load recent files from registry
         let recent = load_recent_files();
@@ -2400,7 +2517,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         let icon = LoadIconW(Some(hinstance.into()), PCWSTR(1 as *const u16)).ok();
 
         // Use dark background brush for dark mode
-        let bg_brush = if is_windows_dark_mode() {
+        let bg_brush = if dark {
             CreateSolidBrush(COLORREF(DARK_CLIENT))
         } else {
             HBRUSH((COLOR_WINDOW.0 + 1) as _)
@@ -2465,7 +2582,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         SetTimer(Some(hwnd), WATCH_TIMER, watch::INTERVAL_MS, None);
 
         // Dropping a Markdown file on the window (#54).
-        if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
+        if let Err(e) = droptarget::register(hwnd, DROP_TIMER) {
             message_box(
                 Some(hwnd),
                 &messages::Message::warning(format!("Dropping files on this window will not work:\n\n{e}")),
@@ -2483,23 +2600,8 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         // Update recent files menu
         update_recent_files_menu();
 
-        // Set dark mode title bar and menu if Windows is in dark mode
-        if is_windows_dark_mode() {
-            // Allow dark mode for this window (needed for dark popup menus)
-            allow_dark_mode_for_window(hwnd);
-
-            // Enable immersive dark mode for title bar
-            let use_dark_mode: u32 = 1;
-            let _ = DwmSetWindowAttribute(
-                hwnd,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &use_dark_mode as *const u32 as *const std::ffi::c_void,
-                std::mem::size_of::<u32>() as u32,
-            );
-
-            // Force menu bar redraw to trigger UAH messages
-            let _ = DrawMenuBar(hwnd);
-        }
+        // Title bar, menu bar and background as chosen (#68).
+        apply_window_theme(hwnd);
 
         // Enable rounded corners on Windows 11
         let corner_preference = DWMWCP_ROUND.0;
@@ -2578,8 +2680,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
-/// A Markdown file was dropped on the window (#54): open it.
-const WM_MDVIEW_DROP: u32 = WM_APP + 4;
+/// Collects one drop's reports, then opens or explains it (#54, droptarget.rs).
+const DROP_TIMER: usize = 0x4D44;
 /// Timer that checks the shown document's file for changes (#17).
 const WATCH_TIMER: usize = 0x4D57;
 
@@ -2677,10 +2779,26 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
-                        // WebView2 must not take drops itself: MDView's drop target
-                        // (droptarget.rs) decides what can be dropped (#54).
-                        if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
-                            let _ = controller4.SetAllowExternalDrop(false);
+                        // Over the page WebView2 takes the drag (MDView's OLE drop
+                        // target is not asked there): it reports a dropped file as
+                        // a new-window request for its file: URL, which
+                        // NewWindowRequested hands to droptarget::page_drop (#54).
+                        // Without this, "no" cursor.
+                        match controller.cast::<ICoreWebView2Controller4>() {
+                            Ok(controller4) => {
+                                if let Err(e) = controller4.SetAllowExternalDrop(true) {
+                                    message_box(
+                                        Some(hwnd),
+                                        &messages::Message::warning(format!("Dropping files on the page will not work:\n\n{}", e.message())),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                message_box(
+                                    Some(hwnd),
+                                    &messages::Message::warning(format!("Dropping files on the page will not work (WebView2 is too old):\n\n{}", e.message())),
+                                );
+                            }
                         }
 
                         if let Ok(webview) = controller.CoreWebView2() {
@@ -2804,7 +2922,18 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
+                                            // Never a new window. A file dropped on the
+                                            // page arrives here as its file: URL (#54):
+                                            // MDView opens it (or says it can't).
                                             let _ = args.SetHandled(true);
+                                            let mut uri_ptr = windows::core::PWSTR::null();
+                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                                let uri = uri_ptr.to_string().unwrap_or_default();
+                                                windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.0 as *const _));
+                                                if let (Some(dropped), Some(hwnd)) = (droptarget::page_drop(&uri), MAIN_HWND.with(|h| *h.borrow())) {
+                                                    droptarget::announce(hwnd, DROP_TIMER, dropped);
+                                                }
+                                            }
                                         }
                                         Ok(())
                                     },
@@ -2979,22 +3108,26 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        // UAH messages for dark menu bar
-        dark_menu::WM_UAHDRAWMENU => {
+        // UAH messages for dark menu bar; light: Windows draws it (#68).
+        dark_menu::WM_UAHDRAWMENU if window_dark() => {
             return dark_menu::handle_uah_draw_menu(hwnd, lparam);
         }
-        dark_menu::WM_UAHDRAWMENUITEM => {
+        dark_menu::WM_UAHDRAWMENUITEM if window_dark() => {
             return dark_menu::handle_uah_draw_menu_item(hwnd, lparam);
         }
         WM_NCPAINT | WM_NCACTIVATE => {
             // Let Windows draw first, then paint over the menu bar separator line
             let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-            dark_menu::paint_menu_separator(hwnd);
+            if window_dark() {
+                dark_menu::paint_menu_separator(hwnd);
+            }
             return result;
         }
         WM_ACTIVATE | WM_SIZE => {
             let result = unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
-            dark_menu::paint_menu_separator(hwnd);
+            if window_dark() {
+                dark_menu::paint_menu_separator(hwnd);
+            }
 
             // A link's tooltip belongs to where the mouse was (#60).
             if msg == WM_SIZE || (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
@@ -3046,9 +3179,24 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_MDVIEW_DROP => {
-            if let Some(path) = droptarget::take_dropped() {
-                load_file_into_webview(hwnd, &path.to_string_lossy());
+        WM_TIMER if wparam.0 == DROP_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DROP_TIMER) };
+            match droptarget::take_drop(network_location) {
+                Some(droptarget::Outcome::Open(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
+                Some(droptarget::Outcome::AskNetwork { path, location }) => tell(
+                    hwnd,
+                    messages::Message::confirm(
+                        messages::Tone::Warning,
+                        format!(
+                            "Open this document from a network location?\n\n{}\n\nOpening it connects to {location}. Only open it if you dropped it here yourself or trust this document.",
+                            path.display()
+                        ),
+                        "Open",
+                    ),
+                    Some(links::Confirmed::OpenMarkdown(path)),
+                ),
+                Some(droptarget::Outcome::Tell(text)) => tell(hwnd, messages::Message::warning(text), None),
+                None => {}
             }
             LRESULT(0)
         }
