@@ -10,7 +10,7 @@
 # that file next to wincmd.ini.
 #
 # Usage:
-#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text] [-IniFolder dir] [-CommandFile c.txt -LogFile l.txt]
+#   powershell.exe -NoProfile -File lister-host.ps1 -Dll mdview_wlx.dll -Doc x.md -Seconds 6 -StatusFile s.txt [-Search text] [-IniFolder dir] [-CommandFile c.txt -LogFile l.txt] [-Dark]
 #
 # With -CommandFile and -LogFile it acts like TC on request (#59): each new line of
 # the command file is run once, and the result appended to the log:
@@ -30,7 +30,9 @@ param(
     # Folder TC would report as its ini folder (where wincmd.ini is); default: next to the status file
     [string]$IniFolder,
     [string]$CommandFile,
-    [string]$LogFile
+    [string]$LogFile,
+    # Load like TC in dark mode (lcp_darkmode)
+    [switch]$Dark
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,7 +121,8 @@ public static class ListerHost
         return true;
     }
 
-    public static IntPtr Load(IntPtr parent, string file) { return load(parent, file, 0); }
+    /// flags: lcp_darkmode = 128 when TC is in dark mode.
+    public static IntPtr Load(IntPtr parent, string file, int flags) { return load(parent, file, flags); }
     public static void Close(IntPtr window) { close(window); }
     public static int Search(IntPtr window, string text) { return search(window, text, 0); }
     public static int SearchWith(IntPtr window, string text, int flags) { return search(window, text, flags); }
@@ -157,7 +160,7 @@ $form.Show()
 [void][ListerHost]::ShowWindow($form.Handle, 1)
 [System.Windows.Forms.Application]::DoEvents()
 
-$child = [ListerHost]::Load($form.Handle, (Resolve-Path $Doc).ProviderPath)
+$child = [ListerHost]::Load($form.Handle, (Resolve-Path $Doc).ProviderPath, $(if ($Dark) { 128 } else { 0 }))
 if ($child -eq [IntPtr]::Zero) { Write-Status 'load-failed'; $form.Dispose(); exit 2 }
 Write-Status 'loaded'
 

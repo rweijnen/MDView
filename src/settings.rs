@@ -549,6 +549,65 @@ fn save_zoom_in(store: &Store, percent: u32, failed_before: &AtomicBool) -> Opti
     }
 }
 
+/// Colours of MDView's pages and window (#68).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    /// Follow Windows (standalone viewer) or Total Commander (plugin).
+    Automatic,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// The name saved and used between host and page.
+    pub fn name(self) -> &'static str {
+        match self {
+            Theme::Automatic => "auto",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Theme> {
+        [Theme::Automatic, Theme::Light, Theme::Dark].into_iter().find(|t| t.name() == value)
+    }
+
+    /// Dark or not, given what Automatic means in this program now.
+    pub fn is_dark(self, automatic: bool) -> bool {
+        match self {
+            Theme::Automatic => automatic,
+            Theme::Light => false,
+            Theme::Dark => true,
+        }
+    }
+}
+
+const THEME: &str = "Theme";
+
+/// The saved colours, and a note when the saved value is not one MDView knows
+/// (it is not used; the settings page shows the note).
+pub fn theme() -> (Theme, Option<String>) {
+    theme_in(store())
+}
+
+fn theme_in(store: &Store) -> (Theme, Option<String>) {
+    match read_string_in(store, THEME) {
+        None => (Theme::Automatic, None),
+        Some(value) => match Theme::parse(&value) {
+            Some(theme) => (theme, None),
+            None => (Theme::Automatic, Some(format!("The saved colours \"{value}\" are not auto, light or dark and are not used."))),
+        },
+    }
+}
+
+pub fn set_theme(theme: Theme) -> Result<(), String> {
+    set_theme_in(store(), theme)
+}
+
+fn set_theme_in(store: &Store, theme: Theme) -> Result<(), String> {
+    write_string_in(store, THEME, theme.name())
+}
+
 /// WebView2 data folder (cache, cookies; not settings) for this process.
 ///
 /// A WebView2 data folder can only be used by one host program at a time:
@@ -804,6 +863,42 @@ mod tests {
         assert_eq!(labels, ["Text font", "Text size", "Heading font", "Code font", "Code size"]);
         assert_eq!(labels.len(), FONT_VALUES);
         assert!(failed.iter().all(|(_, e)| e == "no settings folder"));
+    }
+
+    // #68: Automatic follows Windows (viewer) or TC (plugin); Light and Dark
+    // override it.
+    #[test]
+    fn test_theme_overrides_or_follows_automatic() {
+        for automatic in [false, true] {
+            assert_eq!(Theme::Automatic.is_dark(automatic), automatic);
+            assert!(!Theme::Light.is_dark(automatic));
+            assert!(Theme::Dark.is_dark(automatic));
+        }
+        for t in [Theme::Automatic, Theme::Light, Theme::Dark] {
+            assert_eq!(Theme::parse(t.name()), Some(t));
+        }
+        assert_eq!(Theme::parse("Dark"), None, "exact names only");
+        assert_eq!(Theme::parse(""), None);
+    }
+
+    // The theme is saved per program; nothing saved is Automatic, and a value
+    // edited by hand that isn't known is not used and the user is told.
+    #[test]
+    fn test_theme_is_stored_and_unknown_values_are_noted() {
+        let dir = TempFolder::new("theme");
+        let store = ini_store_for(&dir.0);
+        assert_eq!(theme_in(&store), (Theme::Automatic, None), "nothing saved yet");
+        set_theme_in(&store, Theme::Dark).unwrap();
+        assert_eq!(theme_in(&store), (Theme::Dark, None));
+        let text = std::fs::read_to_string(dir.0.join("mdview.ini")).unwrap();
+        assert!(text.contains("Theme=dark"), "{text:?}");
+        write_string_in(&store, THEME, "purple").unwrap();
+        let (theme, note) = theme_in(&store);
+        assert_eq!(theme, Theme::Automatic);
+        assert!(note.unwrap().contains("purple"));
+        let unavailable = Store::Unavailable("no settings folder".to_string());
+        assert_eq!(theme_in(&unavailable), (Theme::Automatic, None));
+        assert_eq!(set_theme_in(&unavailable, Theme::Light).unwrap_err(), "no settings folder");
     }
 
     // A failed save is reported once per run, not for every zoom step.

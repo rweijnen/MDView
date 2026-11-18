@@ -5,6 +5,9 @@ release workflow refuses to publish a version without a section here.
 
 ## v1.0.1
 
+### New
+- Settings: choose the colours, **Automatic**, **Light** or **Dark**. Automatic follows Windows in the standalone viewer and Total Commander's dark mode in the plugin; Light and Dark override it. (#68)
+
 ### Fixes
 - Standalone viewer: a Markdown file dropped on the page now opens (it only worked at the window's edge); other files, or several at once, get a message. In Total Commander, Lister shows that it doesn't accept dropped files. (#54, #71)
 
