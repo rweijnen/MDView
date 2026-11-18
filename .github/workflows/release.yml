@@ -132,7 +132,9 @@ jobs:
             '- `mdview-arm64.exe` - Standalone viewer for Windows on ARM (ARM64)',
             '- `mdview.wlx` - Total Commander plugin (x86)',
             '- `mdview.wlx64` - Total Commander plugin (x64)',
-            '- `pluginst.inf` - Plugin installer configuration'
+            '- `pluginst.inf` - Plugin installer configuration',
+            '',
+            "``MDView-v$version-x64.zip`` and ``MDView-v$version-arm64.zip`` contain only the standalone viewer (``mdview.exe``) for x64 or ARM64, for winget or a plain standalone install."
           ) -join "`n"
           Set-Content -Path release-notes.md -Value $body -NoNewline
           Write-Output $body
@@ -166,6 +168,25 @@ jobs:
         run: |
           Compress-Archive -Path "release\*" -DestinationPath "MDView-v${{ steps.version.outputs.current }}.zip"
 
+      # One zip per architecture with only the standalone viewer, as
+      # mdview.exe in both: for winget (#48) and a plain standalone install.
+      - name: Create standalone ZIPs (x64, ARM64)
+        if: env.IS_RELEASE == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.version.outputs.current }}'
+          foreach ($arch in @(
+              @{ Name = 'x64'; Exe = 'target\release\mdview.exe' },
+              @{ Name = 'arm64'; Exe = 'target\aarch64-pc-windows-msvc\release\mdview.exe' })) {
+            if (-not (Test-Path $arch.Exe)) { Write-Error "The $($arch.Name) viewer was not built: $($arch.Exe) is missing."; exit 1 }
+            $dir = "standalone-$($arch.Name)"
+            New-Item -ItemType Directory -Force -Path $dir | Out-Null
+            Copy-Item $arch.Exe "$dir\mdview.exe"
+            Copy-Item "LICENSE" "$dir\"
+            Compress-Archive -Path "$dir\*" -DestinationPath "MDView-v$version-$($arch.Name).zip"
+          }
+
       - name: Create Release
         if: env.IS_RELEASE == 'true'
         uses: softprops/action-gh-release@v2
@@ -173,8 +194,11 @@ jobs:
           tag_name: v${{ steps.version.outputs.current }}
           name: MDView v${{ steps.version.outputs.current }}
           body_path: release-notes.md
+          fail_on_unmatched_files: true
           files: |
             MDView-v${{ steps.version.outputs.current }}.zip
+            MDView-v${{ steps.version.outputs.current }}-x64.zip
+            MDView-v${{ steps.version.outputs.current }}-arm64.zip
           draft: false
           prerelease: false
         env:

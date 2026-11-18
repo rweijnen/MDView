@@ -3,6 +3,11 @@
 Each release's notes are taken from its section below (`## vX.Y.Z`). The
 release workflow refuses to publish a version without a section here.
 
+## v1.0.1
+
+### New
+- Two extra downloads with only the standalone viewer, `MDView-v1.0.1-x64.zip` and `MDView-v1.0.1-arm64.zip`, for a standalone install and for winget. (#48)
+
 ## v1.0.0
 
 ### New
