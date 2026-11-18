@@ -449,6 +449,18 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
+                        // No drops in Lister (#71): files are opened through TC,
+                        // and a dropped file would only be a navigation that is
+                        // cancelled. With this the cursor shows "no".
+                        match controller.cast::<ICoreWebView2Controller4>() {
+                            Ok(controller4) => {
+                                if let Err(e) = controller4.SetAllowExternalDrop(false) {
+                                    log_debug(&format!("SetAllowExternalDrop(false) failed: {}", e.message()));
+                                }
+                            }
+                            Err(e) => log_debug(&format!("ICoreWebView2Controller4 not available: {}", e.message())),
+                        }
+
                         // Get webview
                         if let Ok(webview) = controller.CoreWebView2() {
                             // Configure settings for a secure, read-only viewer

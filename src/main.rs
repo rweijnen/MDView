@@ -2582,7 +2582,7 @@ fn run_gui_inner(title: &str, html: &str, file_path: Option<&str>) -> windows::c
         SetTimer(Some(hwnd), WATCH_TIMER, watch::INTERVAL_MS, None);
 
         // Dropping a Markdown file on the window (#54).
-        if let Err(e) = droptarget::register(hwnd, WM_MDVIEW_DROP) {
+        if let Err(e) = droptarget::register(hwnd, DROP_TIMER) {
             message_box(
                 Some(hwnd),
                 &messages::Message::warning(format!("Dropping files on this window will not work:\n\n{e}")),
@@ -2680,8 +2680,8 @@ const WM_MDVIEW_LINK: u32 = WM_APP + 1;
 const WM_MDVIEW_NETWORK: u32 = WM_APP + 2;
 /// A right-click in the page: show MDView's menu (#59).
 const WM_MDVIEW_MENU: u32 = WM_APP + 3;
-/// A Markdown file was dropped on the window (#54): open it.
-const WM_MDVIEW_DROP: u32 = WM_APP + 4;
+/// Collects one drop's reports, then opens or explains it (#54, droptarget.rs).
+const DROP_TIMER: usize = 0x4D44;
 /// Timer that checks the shown document's file for changes (#17).
 const WATCH_TIMER: usize = 0x4D57;
 
@@ -2779,10 +2779,26 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                         let _ = GetClientRect(hwnd, &mut rect);
                         let _ = controller.SetBounds(rect);
 
-                        // WebView2 must not take drops itself: MDView's drop target
-                        // (droptarget.rs) decides what can be dropped (#54).
-                        if let Ok(controller4) = controller.cast::<ICoreWebView2Controller4>() {
-                            let _ = controller4.SetAllowExternalDrop(false);
+                        // Over the page WebView2 takes the drag (MDView's OLE drop
+                        // target is not asked there): it reports a dropped file as
+                        // a new-window request for its file: URL, which
+                        // NewWindowRequested hands to droptarget::page_drop (#54).
+                        // Without this, "no" cursor.
+                        match controller.cast::<ICoreWebView2Controller4>() {
+                            Ok(controller4) => {
+                                if let Err(e) = controller4.SetAllowExternalDrop(true) {
+                                    message_box(
+                                        Some(hwnd),
+                                        &messages::Message::warning(format!("Dropping files on the page will not work:\n\n{}", e.message())),
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                message_box(
+                                    Some(hwnd),
+                                    &messages::Message::warning(format!("Dropping files on the page will not work (WebView2 is too old):\n\n{}", e.message())),
+                                );
+                            }
                         }
 
                         if let Ok(webview) = controller.CoreWebView2() {
@@ -2906,7 +2922,18 @@ fn init_webview2_gui(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                 webview2_com::NewWindowRequestedEventHandler::create(Box::new(
                                     move |_webview, args| {
                                         if let Some(args) = args {
+                                            // Never a new window. A file dropped on the
+                                            // page arrives here as its file: URL (#54):
+                                            // MDView opens it (or says it can't).
                                             let _ = args.SetHandled(true);
+                                            let mut uri_ptr = windows::core::PWSTR::null();
+                                            if args.Uri(&mut uri_ptr).is_ok() && !uri_ptr.is_null() {
+                                                let uri = uri_ptr.to_string().unwrap_or_default();
+                                                windows::Win32::System::Com::CoTaskMemFree(Some(uri_ptr.0 as *const _));
+                                                if let (Some(dropped), Some(hwnd)) = (droptarget::page_drop(&uri), MAIN_HWND.with(|h| *h.borrow())) {
+                                                    droptarget::announce(hwnd, DROP_TIMER, dropped);
+                                                }
+                                            }
                                         }
                                         Ok(())
                                     },
@@ -3152,9 +3179,24 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_MDVIEW_DROP => {
-            if let Some(path) = droptarget::take_dropped() {
-                load_file_into_webview(hwnd, &path.to_string_lossy());
+        WM_TIMER if wparam.0 == DROP_TIMER => {
+            let _ = unsafe { KillTimer(Some(hwnd), DROP_TIMER) };
+            match droptarget::take_drop(network_location) {
+                Some(droptarget::Outcome::Open(path)) => load_file_into_webview(hwnd, &path.to_string_lossy()),
+                Some(droptarget::Outcome::AskNetwork { path, location }) => tell(
+                    hwnd,
+                    messages::Message::confirm(
+                        messages::Tone::Warning,
+                        format!(
+                            "Open this document from a network location?\n\n{}\n\nOpening it connects to {location}. Only open it if you dropped it here yourself or trust this document.",
+                            path.display()
+                        ),
+                        "Open",
+                    ),
+                    Some(links::Confirmed::OpenMarkdown(path)),
+                ),
+                Some(droptarget::Outcome::Tell(text)) => tell(hwnd, messages::Message::warning(text), None),
+                None => {}
             }
             LRESULT(0)
         }
