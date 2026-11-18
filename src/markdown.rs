@@ -380,6 +380,7 @@ if (webview) (function() {
         var advBody = el('div', {});
         var advButton = el('button', {type: 'button', className: 'adv', 'aria-expanded': 'false'}, [svg('M5 3l4 4-4 4', 12), 'Advanced: fonts per kind of text']);
         var askRows = el('div', {style: 'display:flex;flex-direction:column;gap:22px'});
+        var themeRow = el('div', {className: 'row', role: 'group', 'aria-label': 'Colours'});
         var error = el('div', {className: 'error', role: 'alert', hidden: true});
         var save = el('button', {type: 'button', className: 'btn primary', text: 'Save'});
         var cancel = el('button', {type: 'button', className: 'btn', text: 'Cancel'});
@@ -427,6 +428,13 @@ if (webview) (function() {
                 askRows.appendChild(el('section', {}, [el('div', {className: 'stack'}, [el('h3', {text: r[1]}), el('span', {className: 'muted', text: r[2]})]), row]));
             });
         }
+        // Colours (#68): shown after saving, not previewed.
+        function renderTheme() {
+            themeRow.textContent = '';
+            [['auto', 'Automatic'], ['light', 'Light'], ['dark', 'Dark']].forEach(function(o) {
+                themeRow.appendChild(seg(o[1], s.theme === o[0], function() { s.theme = o[0]; renderTheme(); }));
+            });
+        }
         function check(key, title, help) {
             var input = el('input', {type: 'checkbox', onchange: function() { s[key] = input.checked; }});
             input.checked = !!s[key];
@@ -463,6 +471,10 @@ if (webview) (function() {
                     sizeRow
                 ]),
                 el('section', {}, [advButton, advBody]),
+                el('section', {}, [
+                    el('div', {className: 'stack'}, [el('h3', {text: 'Colours'}), el('span', {className: 'muted', text: m.themeAutomatic})]),
+                    themeRow
+                ]),
                 el('div', {className: 'sep'}),
                 askRows,
                 check('askDownloads', 'Ask before showing a downloaded document', 'Documents with the "Mark of the Web" from a browser or mail program.'),
@@ -484,7 +496,8 @@ if (webview) (function() {
                 textFont: s.textFont, textSize: String(s.textSize), headingFont: s.headingFont,
                 codeFont: s.codeFont, codeSize: String(s.codeSize),
                 remoteImages: s.remoteImages, networkFiles: s.networkFiles,
-                askDownloads: s.askDownloads ? 'true' : 'false'
+                askDownloads: s.askDownloads ? 'true' : 'false',
+                theme: s.theme
             };
             // Only the standalone viewer has the register setting.
             if (s.askRegister !== null) msg.askRegister = s.askRegister ? 'true' : 'false';
@@ -504,6 +517,7 @@ if (webview) (function() {
         renderSizes();
         renderAdvanced();
         renderAsk();
+        renderTheme();
         open = {
             host: host, back: document.activeElement,
             saved: function() { close(true); },

@@ -9,7 +9,8 @@
 # Never; links to a share ask first), the welcome screen, the remembered zoom
 # (#16), the tooltip that shows where a link goes (#60), and the settings
 # panel (#50: Ctrl+, / File > Settings..., live font preview, Esc, Save,
-# restart, Advanced, Reset, and a store that can't be written), and keys and the
+# restart, Advanced, Reset, and a store that can't be written), the colours
+# (#68: Automatic follows Windows or TC, Light/Dark override), and keys and the
 # right-click menu (#59: F1 help, menu items and actions, Ctrl+P, Ctrl+Home/End;
 # plugin: N/P/1-9 to TC, TC's search flags, Copy/Select all/Print from TC).
 # Uses the clipboard and puts its text back afterwards.
@@ -137,7 +138,7 @@ function Start-PipeProbe($name) {
 
 # ---- registry
 $key = 'HKCU:\Software\MDView'
-$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles', 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize'
+$regNames = 'Left', 'Top', 'Right', 'Bottom', 'ShowCmd', 'DontAskRegister', 'ZoomPercent', 'RemoteImages', 'OpenDownloadedWithoutAsking', 'NetworkFiles', 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize', 'Theme'
 $regBackup = @{}; $regKinds = @{}
 $p0 = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
 foreach ($n in $regNames) { if ($p0 -and $null -ne $p0.$n) { $regBackup[$n] = $p0.$n; $regKinds[$n] = (Get-Item -Path $key).GetValueKind($n) } }
@@ -169,7 +170,7 @@ function Set-TestRegistry($remoteImages) {
     Remove-ItemProperty -Path $key -Name RemoteImages -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name OpenDownloadedWithoutAsking -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $key -Name NetworkFiles -ErrorAction SilentlyContinue
-    foreach ($n in 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
+    foreach ($n in 'Zoom', 'TextFont', 'TextSize', 'HeadingFont', 'CodeFont', 'CodeSize', 'Theme') { Remove-ItemProperty -Path $key -Name $n -ErrorAction SilentlyContinue }
     foreach ($kv in @{ Left = 20; Top = 20; Right = 1000; Bottom = 740; ShowCmd = 1; DontAskRegister = 1 }.GetEnumerator()) {
         Set-ItemProperty -Path $key -Name $kv.Key -Value $kv.Value -Type DWord
     }
@@ -223,7 +224,7 @@ function Set-NetworkFilesSetting($hostKind, $value) {
 # results and the keys it receives in $hostLog (see lister-host.ps1).
 $hostCommands = Join-Path $work 'host-commands.txt'
 $hostLog = Join-Path $work 'host-log.txt'
-function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni) {
+function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni, [switch]$TcDark) {
     Remove-Item $hostCommands, $hostLog -ErrorAction SilentlyContinue
     $savedTemp = $env:TEMP; $savedTmp = $env:TMP; $env:TEMP = $wv2Temp; $env:TMP = $wv2Temp
     try {
@@ -233,7 +234,7 @@ function Start-Viewer($hostKind, $doc, $iniFolder = $tcIni) {
             $p = Start-Process -FilePath "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" -PassThru -WindowStyle Hidden -ArgumentList @(
                 '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$hostScript`"", '-Dll', "`"$Dll`"", '-Doc', "`"$doc`"",
                 '-Seconds', 120, '-StatusFile', "`"$(Join-Path $work 'status.txt')`"", '-IniFolder', "`"$iniFolder`"",
-                '-CommandFile', "`"$hostCommands`"", '-LogFile', "`"$hostLog`"")
+                '-CommandFile', "`"$hostCommands`"", '-LogFile', "`"$hostLog`"") + $(if ($TcDark) { @('-Dark') } else { @() })
         }
     } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     [void]$started.Add($p)
@@ -296,6 +297,10 @@ public delegate bool EnumProc(IntPtr h, IntPtr l);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr m, uint item, System.Text.StringBuilder s, int n, uint flags);
 [DllImport("user32.dll")] public static extern uint GetMenuState(IntPtr m, uint item, uint flags);
 [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, int data, UIntPtr extra);
+[DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int attr, out int value, int size);
+[DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
+[DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
+[DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
 '@
 # Windows only lets a process take the foreground under some conditions; a
 # synthetic F24 tap satisfies them and means nothing to MDView (see focus.ps1).
@@ -1228,6 +1233,102 @@ function Press-DialogButton($d, $name) {
     $alertText = if ($alert) { $alert.Current.Name } else { '' }
     Stop-Viewer $v
     Check "plugin: settings that can't be saved: the panel says what failed and stays open" ([bool]$alert -and $alertText -match 'Text size' -and $alertText -match 'mdview\.ini' -and $alertText -notmatch 'other settings were saved' -and $stillOpen) "alert='$alertText' open=$stillOpen"
+
+    # ---- Colours (#68): Automatic follows Windows (viewer) or TC's dark mode
+    # (plugin, lcp_darkmode); Light and Dark override it. The page's background
+    # is read from the screen, below the short second.md.
+    function Get-PageShade($v) {
+        $hwnd = [IntPtr]$v.Win.Current.NativeWindowHandle
+        [void](Set-Foreground $hwnd)
+        Start-Sleep -Milliseconds 300
+        $r = New-Object Win32.Behaviour+RECT
+        [void][Win32.Behaviour]::GetWindowRect($hwnd, [ref]$r)
+        $dc = [Win32.Behaviour]::GetDC([IntPtr]::Zero)
+        try { $c = [Win32.Behaviour]::GetPixel($dc, [int]($r.L + ($r.R - $r.L) * 0.6), [int]($r.B - 80)) } finally { [void][Win32.Behaviour]::ReleaseDC([IntPtr]::Zero, $dc) }
+        $level = (($c -band 0xFF) + (($c -shr 8) -band 0xFF) + (($c -shr 16) -band 0xFF)) / 3
+        if ($level -lt 80) { 'dark' } elseif ($level -gt 200) { 'light' } else { "unclear ($('{0:X6}' -f $c))" }
+    }
+    # The page reloads after a save: wait until it shows the expected shade.
+    function Wait-PageShade($v, $expected, $seconds = 8) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        do { $shade = Get-PageShade $v; if ($shade -eq $expected) { return $shade }; Start-Sleep -Milliseconds 400 } while ((Get-Date) -lt $deadline)
+        $shade
+    }
+    # The standalone viewer's title bar: DWMWA_USE_IMMERSIVE_DARK_MODE (20).
+    function Get-TitleBarShade($v) {
+        $value = 0
+        $hr = [Win32.Behaviour]::DwmGetWindowAttribute([IntPtr]$v.Win.Current.NativeWindowHandle, 20, [ref]$value, 4)
+        if ($hr -ne 0) { return "unknown (0x$('{0:X8}' -f $hr))" }
+        if ($value) { 'dark' } else { 'light' }
+    }
+    function Set-ThemeSetting($hostKind, $value) {
+        Set-RemoteImagesSetting $hostKind $null
+        if ($null -eq $value) { return }
+        if ($hostKind -eq 'exe') { Set-ItemProperty -Path $key -Name Theme -Value $value -Type String }
+        else { Set-Content -Path $pluginIni -Value "[MDView]`r`nTheme=$value`r`n" -NoNewline }
+    }
+    function Get-ThemeSetting($hostKind) {
+        if ($hostKind -eq 'exe') { return (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).Theme }
+        if (-not (Test-Path $pluginIni)) { return $null }
+        $line = Get-Content $pluginIni | Where-Object { $_ -match '^\s*Theme\s*=' } | Select-Object -First 1
+        if ($line) { ($line -split '=', 2)[1].Trim() } else { $null }
+    }
+    $windowsDark = (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -ErrorAction SilentlyContinue).AppsUseLightTheme -eq 0
+    $windowsShade = if ($windowsDark) { 'dark' } else { 'light' }
+    $notWindows = if ($windowsDark) { 'light' } else { 'dark' }
+
+    # Standalone viewer: nothing saved follows Windows; the opposite choice wins,
+    # also for the title bar.
+    foreach ($case in @(@($null, $windowsShade), @($notWindows, $notWindows), @($windowsShade, $windowsShade))) {
+        Set-ThemeSetting 'exe' $case[0]
+        $v = Start-Viewer 'exe' (Join-Path $work 'second.md')
+        [void](Wait-Element $v $CT::Text '^Second$')
+        $page = Wait-PageShade $v $case[1]; $title = Get-TitleBarShade $v
+        Stop-Viewer $v
+        $label = if ($case[0]) { $case[0] } else { 'nothing saved' }
+        Check "exe: colours with $label (Windows $windowsShade): page and title bar $($case[1])" ($page -eq $case[1] -and $title -eq $case[1]) "page=$page title bar=$title"
+    }
+
+    # Plugin: nothing saved follows TC's flag, both ways; a choice overrides it.
+    foreach ($case in @(@($null, $false, 'light'), @($null, $true, 'dark'), @('dark', $false, 'dark'), @('light', $true, 'light'))) {
+        Set-ThemeSetting 'plugin' $case[0]
+        $v = Start-Viewer 'plugin' (Join-Path $work 'second.md') -TcDark:$case[1]
+        [void](Wait-Element $v $CT::Text '^Second$')
+        $page = Wait-PageShade $v $case[2]
+        Stop-Viewer $v
+        $label = if ($case[0]) { $case[0] } else { 'nothing saved' }
+        $tc = if ($case[1]) { 'dark' } else { 'light' }
+        Check "plugin: colours with $label (TC $tc): page $($case[2])" ($page -eq $case[2]) "page=$page"
+    }
+
+    # The panel: choosing the other colours and saving changes the open window
+    # at once, stores the choice for this program only, and the panel offers
+    # what Automatic means here.
+    foreach ($hostKind in 'exe', 'plugin') {
+        $otherKind = if ($hostKind -eq 'exe') { 'plugin' } else { 'exe' }
+        $start = if ($hostKind -eq 'exe') { $windowsShade } else { 'light' }
+        $target = if ($start -eq 'dark') { 'Light' } else { 'Dark' }
+        $follows = if ($hostKind -eq 'exe') { 'Automatic follows Windows\.' } else { 'Automatic follows Total Commander\.' }
+        Set-ThemeSetting $hostKind $null
+        $v = Start-Viewer $hostKind (Join-Path $work 'second.md')
+        [void](Wait-Element $v $CT::Text '^Second$')
+        $panel = Open-Settings $v
+        $group = if ($panel) { Find-In $panel $CT::Group '^Colours$' } else { $null }
+        $help = if ($panel) { Find-In $panel $CT::Text $follows } else { $null }
+        $choice = if ($group) { Find-In $group $CT::Button "^$target$" } else { $null }
+        if ($choice) { Invoke-Element $choice }
+        $save = if ($panel) { Find-In $panel $CT::Button '^Save$' } else { $null }
+        if ($save) { Invoke-Element $save }
+        $closed = Wait-Gone $v $CT::Window '^Settings$' 8
+        [void](Wait-Element $v $CT::Text '^Second$' 10)
+        $page = Wait-PageShade $v $target.ToLower()
+        $title = if ($hostKind -eq 'exe') { Get-TitleBarShade $v } else { $target.ToLower() }
+        Stop-Viewer $v
+        $stored = Get-ThemeSetting $hostKind; $other = Get-ThemeSetting $otherKind
+        Check "${hostKind}: Colours > $target in the panel changes the open window and is saved for this program" ([bool]$group -and [bool]$help -and $closed -and $page -eq $target.ToLower() -and $title -eq $target.ToLower() -and $stored -eq $target.ToLower() -and $null -eq $other) "group=$([bool]$group) help=$([bool]$help) closed=$closed page=$page title bar=$title Theme=$stored other Theme=$other"
+    }
+    Set-ThemeSetting 'exe' $null
+    Set-ThemeSetting 'plugin' $null
 
     # ---- Messages in the page and Ctrl+click on program links (1.0.0).
     # tool.cmd only writes a marker file next to itself.

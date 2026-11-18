@@ -9,7 +9,7 @@ A fast, lightweight Markdown viewer for Windows. Available as a Total Commander 
 ## Features
 
 - **WebView2 rendering** - Modern HTML rendering with full Markdown support (GUI mode)
-- **Auto dark mode** - Follows Windows appearance settings (GUI mode)
+- **Dark mode** - Follows Windows (the plugin: Total Commander's dark mode), or always Light or Dark as set in Settings (GUI mode)
 - **Rich terminal output** - ANSI colors, clickable hyperlinks, unicode tables (terminal mode)
 - **Clickable links** - Click `.md` links to navigate, external links open in browser; hover a link to see where it goes
 - **Back and forward** - Between documents and headings (Alt+Left / Alt+Right, mouse buttons, "Back to ..." line)
@@ -137,7 +137,7 @@ Press F1 in the viewer for the full list. In Total Commander, Lister's own keys 
 |------|------|--------|
 | File | Open | Open a Markdown file |
 | File | Recent files | The last opened files (full path as a tooltip) |
-| File | Settings... | Fonts, sizes and remembered answers (Ctrl+,) |
+| File | Settings... | Fonts, sizes, colours and remembered answers (Ctrl+,) |
 | File | Register as .md Viewer... | Add MDView to the Open With list |
 | File | Unregister as .md Viewer | Remove MDView from Open With |
 | Edit | Find... | Find in document (Ctrl+F) |

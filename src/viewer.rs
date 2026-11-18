@@ -48,6 +48,8 @@ fn window_class_name() -> U16CString {
 thread_local! {
     static CONTROLLERS: RefCell<HashMap<isize, Rc<ICoreWebView2Controller>>> = RefCell::new(HashMap::new());
     static CURRENT_FILES: RefCell<HashMap<isize, String>> = RefCell::new(HashMap::new());
+    /// Per viewer: whether TC is in dark mode (`lcp_darkmode`); what Automatic
+    /// means in the plugin (#68). Read it through `dark_mode`.
     static DARK_MODES: RefCell<HashMap<isize, bool>> = RefCell::new(HashMap::new());
     /// Links waiting to be handled outside the WebView2 event that reported them.
     static PENDING_LINKS: RefCell<std::collections::VecDeque<(isize, String, bool)>> = RefCell::new(std::collections::VecDeque::new());
@@ -145,6 +147,13 @@ pub fn create_viewer(
 
         Ok(hwnd)
     }
+}
+
+/// Whether this viewer shows dark colours: the saved choice (#68), and for
+/// Automatic whether TC is in dark mode.
+fn dark_mode(hwnd: HWND) -> bool {
+    let tc_dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    crate::settings::theme().0.is_dark(tc_dark)
 }
 
 fn register_window_class() -> windows::core::Result<()> {
@@ -644,7 +653,7 @@ fn init_webview2_sync(hwnd: HWND, html: &str) -> windows::core::Result<()> {
                                     let _ = webview.Navigate(PCWSTR(url_wide.as_ptr()));
                                 } else {
                                     // #53: a page that says why, never an empty window.
-                                    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+                                    let dark = dark_mode(hwnd);
                                     let notice = crate::markdown::wrap_html(
                                         &crate::markdown::notice_html("MDView cannot show this file", &current_file, crate::markdown::NO_ADDRESS),
                                         dark,
@@ -1080,9 +1089,7 @@ fn create_response_for_virtual_url(
         return create_not_found_response(environment);
     }
 
-    let dark_mode =
-        DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
-    create_virtual_resource_response(hwnd, environment, file_path, dark_mode)
+    create_virtual_resource_response(hwnd, environment, file_path, dark_mode(hwnd))
 }
 
 /// Whether a file this viewer's page asks for may be read. Files on another
@@ -1167,14 +1174,14 @@ fn post_to_page(hwnd: HWND, json: &str) -> bool {
 
 /// Ctrl+, (#50): the page shows the settings panel with the plugin's settings.
 fn open_settings(hwnd: HWND) {
-    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    let dark = dark_mode(hwnd);
     let (page, notes) = crate::settings_page::current(true);
     post_to_page(hwnd, &crate::settings_page::show_message(&page, &notes, &crate::fonts::installed(), true, dark));
 }
 
 /// F1 or the menu (#59): the page shows the plugin's keys.
 fn open_help(hwnd: HWND) {
-    let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+    let dark = dark_mode(hwnd);
     post_to_page(hwnd, &crate::shortcuts::help_message(true, dark));
 }
 
@@ -1468,7 +1475,7 @@ fn handle_page_message(hwnd: HWND, source: &str, msg: &HashMap<String, String>) 
                     resolve_virtual_mdview_url(hwnd, u).map(std::path::PathBuf::from)
                 }, |p| network_location(hwnd, p));
                 let href = msg.get("href").map(String::as_str).unwrap_or_default();
-                let dark = DARK_MODES.with(|m| m.borrow().get(&(hwnd.0 as isize)).copied().unwrap_or(false));
+                let dark = dark_mode(hwnd);
                 crate::linkstatus::show(hwnd, &crate::linkstatus::describe_url(url, href, &action), dark);
             }
         },
@@ -1612,7 +1619,7 @@ const MESSAGE_CONFIRM_MS: u32 = 1500;
 fn tell(hwnd: HWND, message: crate::messages::Message, action: Option<crate::links::Confirmed>) {
     let key = hwnd.0 as isize;
     let id = MESSAGES.with(|m| m.borrow_mut().entry(key).or_default().add(message.clone(), action));
-    let dark = DARK_MODES.with(|m| m.borrow().get(&key).copied().unwrap_or(false));
+    let dark = dark_mode(hwnd);
     if post_to_page(hwnd, &crate::messages::show_json(id, &message, dark)) {
         unsafe { SetTimer(Some(hwnd), MESSAGE_TIMER + id as usize, MESSAGE_CONFIRM_MS, Some(message_not_confirmed)) };
     } else {
