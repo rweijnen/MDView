@@ -1544,9 +1544,16 @@ function Press-DialogButton($d, $name) {
         $doc = Find-Element $v $CT::Document '.*'
         $pattern = $null
         if (-not $doc -or -not $doc.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) { return $null }
-        $range = @($pattern.GetSelection())[0]
-        if (-not $range) { return $null }
-        $rects = $range.GetBoundingRectangles()
+        # UI Automation can report a new selection before its rectangle (seen
+        # on the lab VM): wait up to 2 s for it; without one, Y stays -1.
+        $deadline = (Get-Date).AddSeconds(2)
+        do {
+            $range = @($pattern.GetSelection())[0]
+            if (-not $range) { return $null }
+            $rects = $range.GetBoundingRectangles()
+            if ($rects.Count) { break }
+            Start-Sleep -Milliseconds 200
+        } while ((Get-Date) -lt $deadline)
         @{ Text = $range.GetText(-1); Y = $(if ($rects.Count) { [int]$rects[0].Y } else { -1 }) }
     }
 
