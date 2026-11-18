@@ -1956,9 +1956,11 @@ public static class DragTest {
     $txt = [DragTest]::Drag(@((Join-Path $work 'dropped.txt')), $fromX, $fromY, $toX, $toY); $txtFx = [DragTest]::LastEffects
     # A drag that never got any feedback (not even from the drag source's own
     # window) never moved: the machine doesn't deliver the injected mouse input
-    # to the drag loop (seen on the GitHub runner). That says nothing about
-    # MDView, so the drop checks are skipped, with the reason.
-    if ($txt -like 'timeout*' -and -not $txtFx) {
+    # to the drag loop. On the GitHub runner it times out; on the lab VM it can
+    # also end at once with None. Over any window, MDView's "no" included, there
+    # is feedback. That says nothing about MDView, so the drop checks are
+    # skipped, with the reason.
+    if (-not $txtFx) {
         Stop-Viewer $v
         $why = "the test's drag never moved on this machine: $txt"
         Skip 'exe: other files and several files cannot be dropped' $why
